@@ -1,0 +1,45 @@
+services:
+  rstmdb:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: rstmdb:latest
+    container_name: rstmdb
+    restart: unless-stopped
+    ports:
+      - "7401:7401"
+    volumes:
+      - rstmdb-data:/data
+      # Optional: Mount config file
+      - ./config.dev.yaml:/config/config.yaml:ro
+      # Optional: Mount TLS certificates
+      # - ./certs:/certs:ro
+    environment:
+      RUST_LOG: info
+      RSTMDB_BIND: 0.0.0.0:7401
+      RSTMDB_DATA: /data
+      # Optional: Enable authentication
+      # RSTMDB_AUTH_REQUIRED: "true"
+      # RSTMDB_AUTH_TOKEN_HASH: "sha256-hash-of-your-token"
+      # Optional: Use config file
+      RSTMDB_CONFIG: /config/config.yaml
+      # Optional: Compaction settings
+      # RSTMDB_COMPACT_ENABLED: "true"
+      # RSTMDB_COMPACT_EVENTS: "10000"
+      # RSTMDB_COMPACT_SIZE_MB: "100"
+    healthcheck:
+      test: ["CMD", "rstmdb-cli", "-s", "127.0.0.1:7401", "ping"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+        reservations:
+          memory: 128M
+
+volumes:
+  rstmdb-data:
+    driver: local

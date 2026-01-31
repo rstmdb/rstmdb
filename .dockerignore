@@ -1,0 +1,47 @@
+# Build artifacts
+target/
+*.rs.bk
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Git
+.git/
+.gitignore
+
+# Documentation
+docs/
+*.md
+!README.md
+
+# Docker
+Dockerfile*
+docker-compose*.yml
+.dockerignore
+
+# CI/CD
+.github/
+.gitlab-ci.yml
+.travis.yml
+
+# Test data
+test_data/
+*.tmp
+
+# Certificates (mount these, don't bake in)
+certs/
+*.pem
+*.crt
+*.key
+
+# Config files with secrets
+config*.yaml
+!config.example.yaml
+
+# Misc
+.DS_Store
+Thumbs.db

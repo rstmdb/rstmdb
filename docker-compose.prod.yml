@@ -1,0 +1,65 @@
+# Production docker-compose with TLS and authentication
+#
+# Usage:
+#   1. Generate TLS certificates in ./certs/
+#   2. Generate auth token hash: echo -n "your-secret-token" | sha256sum
+#   3. Update RSTMDB_AUTH_TOKEN_HASH with the hash
+#   4. Run: docker compose -f docker-compose.prod.yml up -d
+
+services:
+  rstmdb:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: rstmdb:latest
+    container_name: rstmdb
+    restart: always
+    ports:
+      - "7401:7401"
+    volumes:
+      - rstmdb-data:/data
+      - ./certs:/certs:ro
+    environment:
+      RUST_LOG: info
+      RSTMDB_BIND: 0.0.0.0:7401
+      RSTMDB_DATA: /data
+      # Authentication
+      RSTMDB_AUTH_REQUIRED: "true"
+      RSTMDB_AUTH_TOKEN_HASH: "${RSTMDB_AUTH_TOKEN_HASH:?Set RSTMDB_AUTH_TOKEN_HASH}"
+      # TLS
+      RSTMDB_TLS_ENABLED: "true"
+      RSTMDB_TLS_CERT: /certs/server-cert.pem
+      RSTMDB_TLS_KEY: /certs/server-key.pem
+      # Optional: Enable mTLS (mutual TLS)
+      # RSTMDB_TLS_REQUIRE_CLIENT_CERT: "true"
+      # RSTMDB_TLS_CLIENT_CA: /certs/ca-cert.pem
+      # Compaction
+      RSTMDB_COMPACT_ENABLED: "true"
+      RSTMDB_COMPACT_EVENTS: "10000"
+      RSTMDB_COMPACT_SIZE_MB: "100"
+      RSTMDB_COMPACT_INTERVAL: "300"
+      # Performance
+      RSTMDB_FSYNC_POLICY: every_write
+    healthcheck:
+      test: ["CMD", "rstmdb-cli", "-s", "127.0.0.1:7401", "--tls", "-k", "ping"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+          cpus: "2"
+        reservations:
+          memory: 256M
+          cpus: "0.5"
+    logging:
+      driver: json-file
+      options:
+        max-size: "100m"
+        max-file: "3"
+
+volumes:
+  rstmdb-data:
+    driver: local
