@@ -271,8 +271,7 @@ fn format_bytes(bytes: u64) -> String {
 
 /// Parses a JSON argument (either inline JSON or @file.json).
 fn parse_json_arg(arg: &str) -> Result<Value, Box<dyn std::error::Error>> {
-    if arg.starts_with('@') {
-        let path = &arg[1..];
+    if let Some(path) = arg.strip_prefix('@') {
         let content = std::fs::read_to_string(path)?;
         Ok(serde_json::from_str(&content)?)
     } else {

@@ -88,6 +88,21 @@ impl WalOffset {
     }
 }
 
+/// I/O statistics for the WAL.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct WalStats {
+    /// Total bytes written to WAL.
+    pub bytes_written: u64,
+    /// Total bytes read from WAL.
+    pub bytes_read: u64,
+    /// Total write operations.
+    pub writes: u64,
+    /// Total read operations.
+    pub reads: u64,
+    /// Total fsync operations.
+    pub fsyncs: u64,
+}
+
 /// Write-Ahead Log.
 pub struct Wal {
     config: WalConfig,
@@ -101,6 +116,12 @@ pub struct Wal {
     writes_since_sync: AtomicU64,
     /// Is the WAL closed?
     closed: AtomicBool,
+    /// I/O statistics counters.
+    stats_bytes_written: AtomicU64,
+    stats_bytes_read: AtomicU64,
+    stats_writes: AtomicU64,
+    stats_reads: AtomicU64,
+    stats_fsyncs: AtomicU64,
 }
 
 impl Wal {
@@ -116,6 +137,11 @@ impl Wal {
             next_sequence: AtomicU64::new(1),
             writes_since_sync: AtomicU64::new(0),
             closed: AtomicBool::new(false),
+            stats_bytes_written: AtomicU64::new(0),
+            stats_bytes_read: AtomicU64::new(0),
+            stats_writes: AtomicU64::new(0),
+            stats_reads: AtomicU64::new(0),
+            stats_fsyncs: AtomicU64::new(0),
         };
 
         // Recover existing segments
@@ -222,15 +248,22 @@ impl Wal {
         let segment_id = segment.id();
         let offset = segment.append(&record)?;
 
+        // Update I/O statistics
+        self.stats_bytes_written
+            .fetch_add(record_size as u64, Ordering::Relaxed);
+        self.stats_writes.fetch_add(1, Ordering::Relaxed);
+
         // Handle fsync policy
         let writes = self.writes_since_sync.fetch_add(1, Ordering::Relaxed) + 1;
         match self.config.fsync_policy {
             FsyncPolicy::EveryWrite => {
                 segment.sync()?;
+                self.stats_fsyncs.fetch_add(1, Ordering::Relaxed);
                 self.writes_since_sync.store(0, Ordering::Relaxed);
             }
             FsyncPolicy::EveryN(n) if writes >= n as u64 => {
                 segment.sync()?;
+                self.stats_fsyncs.fetch_add(1, Ordering::Relaxed);
                 self.writes_since_sync.store(0, Ordering::Relaxed);
             }
             _ => {}
@@ -244,9 +277,21 @@ impl Wal {
         let mut current = self.current_segment.lock();
         if let Some(segment) = current.as_mut() {
             segment.sync()?;
+            self.stats_fsyncs.fetch_add(1, Ordering::Relaxed);
         }
         self.writes_since_sync.store(0, Ordering::Relaxed);
         Ok(())
+    }
+
+    /// Returns the current I/O statistics.
+    pub fn stats(&self) -> WalStats {
+        WalStats {
+            bytes_written: self.stats_bytes_written.load(Ordering::Relaxed),
+            bytes_read: self.stats_bytes_read.load(Ordering::Relaxed),
+            writes: self.stats_writes.load(Ordering::Relaxed),
+            reads: self.stats_reads.load(Ordering::Relaxed),
+            fsyncs: self.stats_fsyncs.load(Ordering::Relaxed),
+        }
     }
 
     /// Returns the next sequence number that will be assigned.
@@ -263,6 +308,7 @@ impl Wal {
         let segments = self.segments.read();
         let mut results = Vec::new();
         let mut remaining = limit.unwrap_or(usize::MAX);
+        let mut bytes_read = 0u64;
 
         for (&seg_id, segment) in segments.range(from.segment_id()..) {
             if remaining == 0 {
@@ -278,6 +324,7 @@ impl Wal {
                     continue;
                 }
 
+                bytes_read += record.disk_size() as u64;
                 let entry: WalEntry = serde_json::from_slice(&record.payload)?;
                 results.push((record.header.sequence, wal_offset, entry));
 
@@ -287,6 +334,11 @@ impl Wal {
                 }
             }
         }
+
+        // Update I/O statistics
+        self.stats_bytes_read
+            .fetch_add(bytes_read, Ordering::Relaxed);
+        self.stats_reads.fetch_add(1, Ordering::Relaxed);
 
         Ok(results)
     }

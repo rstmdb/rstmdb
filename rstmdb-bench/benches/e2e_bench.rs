@@ -69,8 +69,9 @@ fn bench_ping_latency(c: &mut Criterion) {
     group.throughput(Throughput::Elements(1));
 
     group.bench_function("ping", |b| {
-        b.to_async(&rt)
-            .iter(|| async { black_box(setup.client.ping().await.unwrap()) });
+        b.to_async(&rt).iter(|| async {
+            setup.client.ping().await.unwrap();
+        });
     });
 
     group.finish();

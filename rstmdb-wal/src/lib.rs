@@ -17,7 +17,7 @@ pub mod wal;
 pub use entry::{WalEntry, WalEntryType, WalRecord};
 pub use error::WalError;
 pub use segment::{Segment, SegmentId};
-pub use wal::{FsyncPolicy, Wal, WalConfig, WalOffset, WalReader, WalWriter};
+pub use wal::{FsyncPolicy, Wal, WalConfig, WalOffset, WalReader, WalStats, WalWriter};
 
 /// Default segment size (64 MiB).
 pub const DEFAULT_SEGMENT_SIZE: u64 = 64 * 1024 * 1024;

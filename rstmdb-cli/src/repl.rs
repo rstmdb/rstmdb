@@ -196,7 +196,7 @@ async fn execute_repl_command(
             }
             let machine = args[0];
             let version: u32 = args[1].parse()?;
-            let instance_id = args.get(2).map(|s| *s);
+            let instance_id = args.get(2).copied();
             let ctx = args.get(3).map(|s| serde_json::from_str(s)).transpose()?;
 
             let result = client

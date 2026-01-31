@@ -180,10 +180,17 @@ impl CommandHandler {
             let machine_count: usize = machines.values().map(|versions| versions.len()).sum();
             metrics.machines_total.set(machine_count as f64);
 
-            // Update WAL entries count
-            if let Some(offset) = self.engine.wal().latest_offset() {
-                metrics.wal_entries.set(offset.as_u64() as f64);
-            }
+            // Update WAL metrics
+            let wal = self.engine.wal();
+            // next_sequence is 1-based, so subtract 1 to get actual entry count
+            let entry_count = wal.next_sequence().saturating_sub(1);
+            metrics.wal_entries.set(entry_count as f64);
+            metrics.wal_segments.set(wal.segment_ids().len() as f64);
+            metrics.wal_size_bytes.set(wal.total_size() as f64);
+
+            // Update WAL I/O counters
+            let wal_stats = wal.stats();
+            metrics.update_wal_stats(wal_stats);
         }
     }
 

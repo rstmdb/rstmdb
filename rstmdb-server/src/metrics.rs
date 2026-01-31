@@ -2,6 +2,7 @@
 //!
 //! This module provides:
 //! - Metrics registry with counters, gauges, and histograms
+//! - Process metrics (CPU, memory, file descriptors)
 //! - HTTP server to expose metrics at `/metrics` endpoint
 
 use http_body_util::Full;
@@ -10,10 +11,14 @@ use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
+use parking_lot::Mutex;
+#[cfg(target_os = "linux")]
+use prometheus::process_collector::ProcessCollector;
 use prometheus::{
     Counter, CounterVec, Encoder, Gauge, GaugeVec, HistogramOpts, HistogramVec, Opts, Registry,
     TextEncoder,
 };
+use rstmdb_wal::WalStats;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::TcpListener;
@@ -46,12 +51,35 @@ pub struct Metrics {
     pub machines_total: Gauge,
     /// WAL entry count.
     pub wal_entries: Gauge,
+    /// WAL segment count.
+    pub wal_segments: Gauge,
+    /// WAL total size in bytes.
+    pub wal_size_bytes: Gauge,
+    /// Total bytes written to WAL.
+    pub wal_bytes_written_total: Counter,
+    /// Total bytes read from WAL.
+    pub wal_bytes_read_total: Counter,
+    /// Total WAL write operations.
+    pub wal_writes_total: Counter,
+    /// Total WAL read operations.
+    pub wal_reads_total: Counter,
+    /// Total WAL fsync operations.
+    pub wal_fsyncs_total: Counter,
+    /// Last reported WAL stats (for computing counter deltas).
+    last_wal_stats: Arc<Mutex<WalStats>>,
 }
 
 impl Metrics {
     /// Creates a new Metrics instance with all metrics registered.
     pub fn new() -> Result<Self, prometheus::Error> {
         let registry = Registry::new();
+
+        // Register process collector for CPU, memory, and file descriptor metrics (Linux only)
+        #[cfg(target_os = "linux")]
+        {
+            let process_collector = ProcessCollector::for_self();
+            registry.register(Box::new(process_collector))?;
+        }
 
         // Connections
         let connections_total = Counter::with_opts(Opts::new(
@@ -125,12 +153,52 @@ impl Metrics {
         ))?;
         registry.register(Box::new(machines_total.clone()))?;
 
-        // WAL
+        // WAL metrics
         let wal_entries = Gauge::with_opts(Opts::new(
             "rstmdb_wal_entries",
             "Number of entries in the WAL",
         ))?;
         registry.register(Box::new(wal_entries.clone()))?;
+
+        let wal_segments =
+            Gauge::with_opts(Opts::new("rstmdb_wal_segments", "Number of WAL segments"))?;
+        registry.register(Box::new(wal_segments.clone()))?;
+
+        let wal_size_bytes = Gauge::with_opts(Opts::new(
+            "rstmdb_wal_size_bytes",
+            "Total size of WAL on disk in bytes",
+        ))?;
+        registry.register(Box::new(wal_size_bytes.clone()))?;
+
+        let wal_bytes_written_total = Counter::with_opts(Opts::new(
+            "rstmdb_wal_bytes_written_total",
+            "Total bytes written to WAL",
+        ))?;
+        registry.register(Box::new(wal_bytes_written_total.clone()))?;
+
+        let wal_bytes_read_total = Counter::with_opts(Opts::new(
+            "rstmdb_wal_bytes_read_total",
+            "Total bytes read from WAL",
+        ))?;
+        registry.register(Box::new(wal_bytes_read_total.clone()))?;
+
+        let wal_writes_total = Counter::with_opts(Opts::new(
+            "rstmdb_wal_writes_total",
+            "Total WAL write operations",
+        ))?;
+        registry.register(Box::new(wal_writes_total.clone()))?;
+
+        let wal_reads_total = Counter::with_opts(Opts::new(
+            "rstmdb_wal_reads_total",
+            "Total WAL read operations",
+        ))?;
+        registry.register(Box::new(wal_reads_total.clone()))?;
+
+        let wal_fsyncs_total = Counter::with_opts(Opts::new(
+            "rstmdb_wal_fsyncs_total",
+            "Total WAL fsync operations",
+        ))?;
+        registry.register(Box::new(wal_fsyncs_total.clone()))?;
 
         Ok(Self {
             registry,
@@ -144,7 +212,51 @@ impl Metrics {
             instances_total,
             machines_total,
             wal_entries,
+            wal_segments,
+            wal_size_bytes,
+            wal_bytes_written_total,
+            wal_bytes_read_total,
+            wal_writes_total,
+            wal_reads_total,
+            wal_fsyncs_total,
+            last_wal_stats: Arc::new(Mutex::new(WalStats::default())),
         })
+    }
+
+    /// Updates WAL I/O counters from the given stats.
+    ///
+    /// This computes the delta from the last reported stats and increments
+    /// the counters accordingly.
+    pub fn update_wal_stats(&self, stats: WalStats) {
+        let mut last = self.last_wal_stats.lock();
+
+        // Compute deltas (handle potential counter reset)
+        let bytes_written_delta = stats.bytes_written.saturating_sub(last.bytes_written);
+        let bytes_read_delta = stats.bytes_read.saturating_sub(last.bytes_read);
+        let writes_delta = stats.writes.saturating_sub(last.writes);
+        let reads_delta = stats.reads.saturating_sub(last.reads);
+        let fsyncs_delta = stats.fsyncs.saturating_sub(last.fsyncs);
+
+        // Update counters
+        if bytes_written_delta > 0 {
+            self.wal_bytes_written_total
+                .inc_by(bytes_written_delta as f64);
+        }
+        if bytes_read_delta > 0 {
+            self.wal_bytes_read_total.inc_by(bytes_read_delta as f64);
+        }
+        if writes_delta > 0 {
+            self.wal_writes_total.inc_by(writes_delta as f64);
+        }
+        if reads_delta > 0 {
+            self.wal_reads_total.inc_by(reads_delta as f64);
+        }
+        if fsyncs_delta > 0 {
+            self.wal_fsyncs_total.inc_by(fsyncs_delta as f64);
+        }
+
+        // Update last known stats
+        *last = stats;
     }
 
     /// Encodes all metrics in Prometheus text format.
@@ -289,7 +401,7 @@ mod tests {
     #[test]
     fn test_metrics_default() {
         let metrics = Metrics::default();
-        assert!(metrics.encode().len() > 0);
+        assert!(!metrics.encode().is_empty());
     }
 
     #[test]
