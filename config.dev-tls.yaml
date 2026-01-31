@@ -1,0 +1,40 @@
+# rstmdb Server Configuration (TLS enabled)
+#
+# Start server with: RSTMDB_CONFIG=config.dev-tls.yaml ./target/release/rstmdb
+#
+# Connect with: rstmdb-cli --tls --ca-cert ./dev-certs/ca-cert.pem -t my-secret-token ping
+
+# Network settings
+network:
+  bind_addr: "127.0.0.1:7401"
+  idle_timeout_secs: 300
+  max_connections: 1000
+
+# TLS settings
+tls:
+  enabled: true
+  cert_path: "./dev-certs/server-cert.pem"
+  key_path: "./dev-certs/server-key.pem"
+  # For mTLS (uncomment to require client certificates):
+  require_client_cert: true
+  client_ca_path: "./dev-certs/ca-cert.pem"
+
+# Authentication settings
+auth:
+  required: true
+  token_hashes:
+    # Hash of "my-secret-token"
+    - "ea5add57437cbf20af59034d7ed17968dcc56767b41965fcc5b376d45db8b4a3"
+
+# Storage settings
+storage:
+  data_dir: "./data"
+  wal_segment_size_mb: 64
+  fsync_policy: every_write
+
+# Automatic compaction settings
+compaction:
+  enabled: true
+  events_threshold: 10000
+  size_threshold_mb: 100
+  min_interval_secs: 60

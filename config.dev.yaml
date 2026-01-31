@@ -1,0 +1,62 @@
+# rstmdb Server Configuration
+#
+# Copy this file to config.yaml and customize as needed.
+# Start server with: RSTMDB_CONFIG=config.yaml cargo run
+#
+# Environment variables override config file values.
+
+# Network settings
+network:
+  # Address to bind to
+  bind_addr: "127.0.0.1:7401"
+
+  # Idle connection timeout in seconds
+  idle_timeout_secs: 300
+
+  # Maximum concurrent connections
+  max_connections: 1000
+
+# Authentication settings
+auth:
+  # Require authentication for all commands (except HELLO, AUTH, PING, BYE)
+  required: true
+
+  # Token hashes (SHA-256). Generate with: rstmdb-cli hash-token <your-token>
+  token_hashes:
+    # Hash of "my-secret-token"
+    - "ea5add57437cbf20af59034d7ed17968dcc56767b41965fcc5b376d45db8b4a3"
+
+  # Or load from external secrets file (one hash per line, # for comments)
+  # secrets_file: "/etc/rstmdb/tokens.secret"
+
+# Storage settings
+storage:
+  # Data directory (WAL and snapshots stored here)
+  data_dir: "./data"
+
+  # WAL segment size in megabytes
+  # Smaller = more frequent rotation, faster compaction
+  # Larger = better write performance
+  wal_segment_size_mb: 64
+
+  # Fsync policy for durability vs performance tradeoff
+  # Options:
+  #   every_write  - safest, fsync after every write
+  #   every_n: 100 - fsync after every N writes
+  #   every_ms: 100 - fsync every N milliseconds
+  #   never        - fastest, no fsync (data loss on crash)
+  fsync_policy: every_write
+
+# Automatic compaction settings
+compaction:
+  # Enable automatic compaction
+  enabled: true
+
+  # Compact after this many events (0 = disabled)
+  events_threshold: 10000
+
+  # Compact when WAL exceeds this size in MB (0 = disabled)
+  size_threshold_mb: 100
+
+  # Minimum interval between auto-compactions in seconds
+  min_interval_secs: 60

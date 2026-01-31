@@ -1,0 +1,27 @@
+# rstmdb Production Configuration
+#
+# Optimized for production workloads.
+# Adjust based on your hardware and requirements.
+
+network:
+  bind_addr: "0.0.0.0:7401"
+  idle_timeout_secs: 600
+  max_connections: 10000
+
+auth:
+  required: true
+  # Load token hashes from external secrets file
+  secrets_file: "/etc/rstmdb/tokens.secret"
+
+storage:
+  data_dir: "/var/lib/rstmdb"
+  wal_segment_size_mb: 128
+  # Balanced durability - fsync every 100ms
+  fsync_policy:
+    every_ms: 100
+
+compaction:
+  enabled: true
+  events_threshold: 50000
+  size_threshold_mb: 500
+  min_interval_secs: 300

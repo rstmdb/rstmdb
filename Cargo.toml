@@ -1,0 +1,94 @@
+[package]
+name = "rstmdb"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "A state machine database with WAL durability"
+
+[[bin]]
+name = "rstmdb"
+path = "src/main.rs"
+
+[dependencies]
+rstmdb-core.workspace = true
+rstmdb-server.workspace = true
+rstmdb-storage.workspace = true
+rstmdb-wal.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[workspace]
+resolver = "2"
+members = [
+    "rstmdb-protocol",
+    "rstmdb-wal",
+    "rstmdb-core",
+    "rstmdb-storage",
+    "rstmdb-server",
+    "rstmdb-client",
+    "rstmdb-cli",
+    "rstmdb-bench",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/zombocoder/rstmdb"
+
+[workspace.dependencies]
+# Internal crates
+rstmdb-protocol = { path = "rstmdb-protocol" }
+rstmdb-wal = { path = "rstmdb-wal" }
+rstmdb-core = { path = "rstmdb-core" }
+rstmdb-storage = { path = "rstmdb-storage" }
+rstmdb-server = { path = "rstmdb-server" }
+rstmdb-client = { path = "rstmdb-client" }
+rstmdb-cli = { path = "rstmdb-cli" }
+
+# Async runtime
+tokio = { version = "1.36", features = ["full"] }
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serde_yaml = "0.9"
+
+# Error handling
+thiserror = "1.0"
+
+# Checksums
+crc32c = "0.6"
+
+# Cryptography
+sha2 = "0.10"
+hex = "0.4"
+
+# TLS
+rustls = "0.23"
+tokio-rustls = "0.26"
+rustls-pemfile = "2.1"
+webpki-roots = "0.26"
+pin-project-lite = "0.2"
+
+# Utilities
+bytes = "1.5"
+uuid = { version = "1.7", features = ["v4", "serde"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+parking_lot = "0.12"
+dashmap = "5.5"
+chrono = { version = "0.4", features = ["serde"] }
+
+# CLI
+clap = { version = "4.5", features = ["derive", "env"] }
+rustyline = "12.0"
+home = "=0.5.9"
+colored = "2.1"
+
+# Testing
+proptest = "1.4"
+tempfile = "3.10"
+tokio-test = "0.4"
+criterion = { version = "0.5", features = ["async_tokio"] }

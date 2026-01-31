@@ -1,0 +1,38 @@
+[package]
+name = "rstmdb-bench"
+description = "Benchmarks for rstmdb"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+rstmdb-protocol.workspace = true
+rstmdb-wal.workspace = true
+rstmdb-core.workspace = true
+rstmdb-storage.workspace = true
+rstmdb-server.workspace = true
+rstmdb-client.workspace = true
+tokio.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
+criterion.workspace = true
+bytes.workspace = true
+futures = "0.3"
+crc32c.workspace = true
+
+[[bench]]
+name = "wal_bench"
+harness = false
+
+[[bench]]
+name = "protocol_bench"
+harness = false
+
+[[bench]]
+name = "engine_bench"
+harness = false
+
+[[bench]]
+name = "e2e_bench"
+harness = false
