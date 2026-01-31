@@ -4,6 +4,7 @@ use crate::auth::TokenValidator;
 use crate::broadcast::{EventBroadcaster, EventFilter, InstanceEvent};
 use crate::config::AuthConfig;
 use crate::error::ServerError;
+use crate::metrics::Metrics;
 use crate::session::{Session, SessionState, WireMode};
 use rstmdb_core::instance::InstanceSnapshot;
 use rstmdb_core::StateMachineEngine;
@@ -54,6 +55,8 @@ pub struct CommandHandler {
     auth_required: bool,
     /// Event broadcaster for watch subscriptions.
     broadcaster: Option<Arc<EventBroadcaster>>,
+    /// Metrics for request tracking.
+    metrics: Option<Arc<Metrics>>,
 }
 
 impl CommandHandler {
@@ -66,6 +69,7 @@ impl CommandHandler {
             token_validator: None,
             auth_required: false,
             broadcaster: None,
+            metrics: None,
         }
     }
 
@@ -84,6 +88,7 @@ impl CommandHandler {
             token_validator,
             auth_required: auth_config.required,
             broadcaster: None,
+            metrics: None,
         }
     }
 
@@ -100,6 +105,7 @@ impl CommandHandler {
             token_validator: None,
             auth_required: false,
             broadcaster: None,
+            metrics: None,
         })
     }
 
@@ -123,6 +129,7 @@ impl CommandHandler {
             token_validator,
             auth_required: auth_config.required,
             broadcaster: None,
+            metrics: None,
         })
     }
 
@@ -135,6 +142,7 @@ impl CommandHandler {
             token_validator: None,
             auth_required: false,
             broadcaster: None,
+            metrics: None,
         }
     }
 
@@ -144,9 +152,39 @@ impl CommandHandler {
         self
     }
 
+    /// Sets the metrics instance.
+    pub fn with_metrics(mut self, metrics: Arc<Metrics>) -> Self {
+        self.metrics = Some(metrics);
+        self
+    }
+
     /// Returns a reference to the broadcaster, if set.
     pub fn broadcaster(&self) -> Option<&Arc<EventBroadcaster>> {
         self.broadcaster.as_ref()
+    }
+
+    /// Returns a reference to the metrics, if set.
+    pub fn metrics(&self) -> Option<&Arc<Metrics>> {
+        self.metrics.as_ref()
+    }
+
+    /// Updates gauge metrics from current engine state.
+    pub fn update_gauge_metrics(&self) {
+        if let Some(ref metrics) = self.metrics {
+            // Update instances count
+            let instances = self.engine.get_all_instances();
+            metrics.instances_total.set(instances.len() as f64);
+
+            // Update machines count
+            let machines = self.engine.list_machines();
+            let machine_count: usize = machines.values().map(|versions| versions.len()).sum();
+            metrics.machines_total.set(machine_count as f64);
+
+            // Update WAL entries count
+            if let Some(offset) = self.engine.wal().latest_offset() {
+                metrics.wal_entries.set(offset.as_u64() as f64);
+            }
+        }
     }
 
     /// Returns whether authentication is required for an operation.
@@ -168,8 +206,26 @@ impl CommandHandler {
     pub fn handle(&self, session: &mut Session, request: &Request) -> Response {
         session.record_request();
 
+        let op_name = Self::operation_name(&request.op);
+
+        // Start timing for metrics
+        let timer = self.metrics.as_ref().map(|m| {
+            m.request_duration
+                .with_label_values(&[op_name])
+                .start_timer()
+        });
+
         // AUTH ENFORCEMENT: Check if command requires authentication
         if self.requires_auth(&request.op) && !session.is_authenticated() {
+            // Record metrics
+            if let Some(ref metrics) = self.metrics {
+                metrics.requests_total.with_label_values(&[op_name]).inc();
+                metrics
+                    .errors_total
+                    .with_label_values(&["UNAUTHORIZED"])
+                    .inc();
+            }
+            drop(timer); // Observation happens on drop
             return Response::error(
                 &request.id,
                 ResponseError::new(
@@ -201,12 +257,68 @@ impl CommandHandler {
             Operation::Unwatch => self.handle_unwatch(session, &request.params),
         };
 
+        // Record metrics
+        if let Some(ref metrics) = self.metrics {
+            metrics.requests_total.with_label_values(&[op_name]).inc();
+            if let Err(ref e) = result {
+                let error_code = Self::error_code_name(e.error_code());
+                metrics.errors_total.with_label_values(&[error_code]).inc();
+            }
+        }
+        drop(timer); // Observation happens on drop
+
         match result {
             Ok(value) => Response::ok(&request.id, value),
             Err(e) => Response::error(
                 &request.id,
                 ResponseError::new(e.error_code(), e.to_string()),
             ),
+        }
+    }
+
+    /// Returns the string name for an operation.
+    fn operation_name(op: &Operation) -> &'static str {
+        match op {
+            Operation::Hello => "HELLO",
+            Operation::Auth => "AUTH",
+            Operation::Ping => "PING",
+            Operation::Bye => "BYE",
+            Operation::Info => "INFO",
+            Operation::PutMachine => "PUT_MACHINE",
+            Operation::GetMachine => "GET_MACHINE",
+            Operation::ListMachines => "LIST_MACHINES",
+            Operation::CreateInstance => "CREATE_INSTANCE",
+            Operation::GetInstance => "GET_INSTANCE",
+            Operation::DeleteInstance => "DELETE_INSTANCE",
+            Operation::ApplyEvent => "APPLY_EVENT",
+            Operation::Batch => "BATCH",
+            Operation::SnapshotInstance => "SNAPSHOT_INSTANCE",
+            Operation::WalRead => "WAL_READ",
+            Operation::Compact => "COMPACT",
+            Operation::WatchInstance => "WATCH_INSTANCE",
+            Operation::WatchAll => "WATCH_ALL",
+            Operation::Unwatch => "UNWATCH",
+        }
+    }
+
+    /// Returns the string name for an error code.
+    fn error_code_name(code: ErrorCode) -> &'static str {
+        match code {
+            ErrorCode::UnsupportedProtocol => "UNSUPPORTED_PROTOCOL",
+            ErrorCode::BadRequest => "BAD_REQUEST",
+            ErrorCode::Unauthorized => "UNAUTHORIZED",
+            ErrorCode::AuthFailed => "AUTH_FAILED",
+            ErrorCode::NotFound => "NOT_FOUND",
+            ErrorCode::MachineNotFound => "MACHINE_NOT_FOUND",
+            ErrorCode::MachineVersionExists => "MACHINE_VERSION_EXISTS",
+            ErrorCode::InstanceNotFound => "INSTANCE_NOT_FOUND",
+            ErrorCode::InstanceExists => "INSTANCE_EXISTS",
+            ErrorCode::InvalidTransition => "INVALID_TRANSITION",
+            ErrorCode::GuardFailed => "GUARD_FAILED",
+            ErrorCode::Conflict => "CONFLICT",
+            ErrorCode::WalIoError => "WAL_IO_ERROR",
+            ErrorCode::InternalError => "INTERNAL_ERROR",
+            ErrorCode::RateLimited => "RATE_LIMITED",
         }
     }
 
@@ -323,6 +435,9 @@ impl CommandHandler {
             .engine
             .put_machine(&p.machine, p.version, &p.definition)?;
 
+        // Update gauge metrics
+        self.update_gauge_metrics();
+
         let result = PutMachineResult {
             machine: p.machine,
             version: p.version,
@@ -380,6 +495,9 @@ impl CommandHandler {
             p.idempotency_key.as_deref(),
         )?;
 
+        // Update gauge metrics
+        self.update_gauge_metrics();
+
         let result = CreateInstanceResult {
             instance_id: instance.id,
             state: instance.state,
@@ -415,6 +533,9 @@ impl CommandHandler {
         let idempotency_key = params["idempotency_key"].as_str();
 
         let wal_offset = self.engine.delete_instance(instance_id, idempotency_key)?;
+
+        // Update gauge metrics
+        self.update_gauge_metrics();
 
         Ok(json!({
             "instance_id": instance_id,
@@ -455,6 +576,9 @@ impl CommandHandler {
                     ctx: result.ctx.clone(),
                 });
             }
+
+            // Update gauge metrics after successful apply
+            self.update_gauge_metrics();
         }
 
         let apply_result = ApplyEventResult {
@@ -688,6 +812,14 @@ impl CommandHandler {
 
         session.add_instance_subscription(subscription_id.clone(), p.instance_id.clone());
 
+        // Update subscription metrics
+        if let Some(ref metrics) = self.metrics {
+            metrics
+                .subscriptions_active
+                .with_label_values(&["instance"])
+                .inc();
+        }
+
         let result = WatchInstanceResult {
             subscription_id,
             instance_id: p.instance_id,
@@ -763,6 +895,14 @@ impl CommandHandler {
 
         session.add_all_subscription(subscription_id.clone());
 
+        // Update subscription metrics
+        if let Some(ref metrics) = self.metrics {
+            metrics
+                .subscriptions_active
+                .with_label_values(&["all"])
+                .inc();
+        }
+
         // Get current WAL head offset
         let wal_offset = self
             .engine
@@ -783,8 +923,27 @@ impl CommandHandler {
         let p: UnwatchParams = serde_json::from_value(params.clone())
             .map_err(|e| ServerError::InvalidRequest(e.to_string()))?;
 
-        // Remove from session
-        let removed = session.remove_subscription(&p.subscription_id);
+        // Remove from session and get type for metrics
+        let removed_type = session.remove_subscription(&p.subscription_id);
+
+        // Update subscription metrics
+        if let Some(ref metrics) = self.metrics {
+            match &removed_type {
+                Some(crate::session::SessionSubscriptionType::Instance { .. }) => {
+                    metrics
+                        .subscriptions_active
+                        .with_label_values(&["instance"])
+                        .dec();
+                }
+                Some(crate::session::SessionSubscriptionType::All) => {
+                    metrics
+                        .subscriptions_active
+                        .with_label_values(&["all"])
+                        .dec();
+                }
+                None => {}
+            }
+        }
 
         // Also remove from broadcaster if present
         if let Some(broadcaster) = &self.broadcaster {
@@ -793,7 +952,7 @@ impl CommandHandler {
 
         let result = UnwatchResult {
             subscription_id: p.subscription_id,
-            removed,
+            removed: removed_type.is_some(),
         };
 
         Ok(serde_json::to_value(result)?)

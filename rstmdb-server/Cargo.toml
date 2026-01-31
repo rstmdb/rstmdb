@@ -27,6 +27,10 @@ rustls.workspace = true
 tokio-rustls.workspace = true
 rustls-pemfile.workspace = true
 pin-project-lite.workspace = true
+prometheus = { version = "0.13", features = ["process"] }
+hyper = { version = "1.4", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
 
 [dev-dependencies]
 tempfile.workspace = true

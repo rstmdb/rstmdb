@@ -204,13 +204,9 @@ impl Session {
             .insert(subscription_id, SessionSubscriptionType::All);
     }
 
-    /// Removes a subscription.
-    pub fn remove_subscription(&self, subscription_id: &str) -> bool {
-        self.subscriptions
-            .lock()
-            .unwrap()
-            .remove(subscription_id)
-            .is_some()
+    /// Removes a subscription and returns the type if it existed.
+    pub fn remove_subscription(&self, subscription_id: &str) -> Option<SessionSubscriptionType> {
+        self.subscriptions.lock().unwrap().remove(subscription_id)
     }
 
     /// Gets the instance_id for a subscription, if it's an instance subscription.
@@ -286,10 +282,10 @@ mod tests {
         );
         assert_eq!(session.get_subscription_instance("sub-2"), None); // All subscription
 
-        assert!(session.remove_subscription("sub-1"));
+        assert!(session.remove_subscription("sub-1").is_some());
         assert_eq!(session.subscriptions().len(), 1);
 
         // Can't remove twice
-        assert!(!session.remove_subscription("sub-1"));
+        assert!(session.remove_subscription("sub-1").is_none());
     }
 }

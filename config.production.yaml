@@ -25,3 +25,14 @@ compaction:
   events_threshold: 50000
   size_threshold_mb: 500
   min_interval_secs: 300
+
+tls:
+  enabled: true
+  cert_path: "/etc/rstmdb/certs/server.crt"
+  key_path: "/etc/rstmdb/certs/server.key"
+  require_client_cert: false
+  # client_ca_path: "/etc/rstmdb/certs/ca.crt"
+
+metrics:
+  enabled: true
+  bind_addr: "0.0.0.0:9090"

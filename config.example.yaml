@@ -76,3 +76,12 @@ compaction:
 
   # Minimum interval between auto-compactions in seconds
   min_interval_secs: 60
+
+# Prometheus metrics settings
+metrics:
+  # Enable metrics HTTP server
+  enabled: false
+
+  # Address to bind the metrics server to
+  # Metrics available at http://<bind_addr>/metrics
+  bind_addr: "0.0.0.0:9090"

@@ -3,10 +3,13 @@
 //! A TCP-based state machine database with WAL durability and snapshot compaction.
 
 use rstmdb_core::StateMachineEngine;
-use rstmdb_server::{tls, CompactionManager, Config, Server, ServerConfig};
+use rstmdb_server::{
+    run_metrics_server, tls, CompactionManager, Config, Metrics, Server, ServerConfig,
+};
 use rstmdb_storage::SnapshotStore;
 use rstmdb_wal::{FsyncPolicy, WalConfig};
 use std::sync::Arc;
+use tokio::sync::broadcast;
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
@@ -109,11 +112,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Create snapshot store
     let snapshot_store = Arc::new(SnapshotStore::open(&snapshot_dir)?);
 
-    // Configure server with snapshot, auth, and TLS support
+    // Create metrics if enabled
+    let (metrics, shutdown_tx) = if config.metrics.enabled {
+        let metrics = Arc::new(Metrics::new()?);
+        let (shutdown_tx, _) = broadcast::channel::<()>(1);
+        tracing::info!("  Metrics: enabled at {}", config.metrics.bind_addr);
+        (Some(metrics), Some(shutdown_tx))
+    } else {
+        tracing::info!("  Metrics: disabled");
+        (None, None)
+    };
+
+    // Configure server with snapshot, auth, TLS, and metrics support
     let mut server_config = ServerConfig::new(config.network.bind_addr);
     server_config.auth_required = config.auth.required;
     if let Some(acceptor) = tls_acceptor {
         server_config = server_config.with_tls(acceptor);
+    }
+    if let Some(ref m) = metrics {
+        server_config = server_config.with_metrics(m.clone());
     }
     let server = Arc::new(Server::with_snapshots_and_auth(
         server_config,
@@ -148,14 +165,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         })
     };
 
+    // Spawn metrics server if enabled
+    let metrics_handle = if let (Some(ref m), Some(ref tx)) = (&metrics, &shutdown_tx) {
+        let metrics_clone = m.clone();
+        let shutdown_rx = tx.subscribe();
+        let metrics_addr = config.metrics.bind_addr;
+        Some(tokio::spawn(async move {
+            if let Err(e) = run_metrics_server(metrics_addr, metrics_clone, shutdown_rx).await {
+                tracing::error!("Metrics server error: {}", e);
+            }
+        }))
+    } else {
+        None
+    };
+
     // Spawn shutdown signal handler
     let shutdown_server = server.clone();
     let shutdown_compaction = compaction_manager.clone();
+    let shutdown_metrics = shutdown_tx;
     tokio::spawn(async move {
         tokio::signal::ctrl_c().await.ok();
         tracing::info!("Received shutdown signal, stopping server...");
         shutdown_server.shutdown();
         shutdown_compaction.shutdown();
+        if let Some(tx) = shutdown_metrics {
+            let _ = tx.send(());
+        }
     });
 
     // Run server (blocks until shutdown)
@@ -163,6 +198,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Wait for compaction manager to stop
     let _ = compaction_handle.await;
+
+    // Wait for metrics server to stop
+    if let Some(handle) = metrics_handle {
+        let _ = handle.await;
+    }
 
     // Sync WAL before exit
     if let Err(e) = engine.wal().sync() {

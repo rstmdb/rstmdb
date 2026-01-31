@@ -24,6 +24,8 @@ pub struct Config {
     pub auth: AuthConfig,
     /// TLS configuration.
     pub tls: TlsConfig,
+    /// Metrics configuration.
+    pub metrics: MetricsConfig,
 }
 
 impl Config {
@@ -67,6 +69,7 @@ impl Config {
         self.compaction.apply_env_overrides();
         self.auth.apply_env_overrides();
         self.tls.apply_env_overrides();
+        self.metrics.apply_env_overrides();
     }
 
     /// Loads secrets from external file if configured.
@@ -400,6 +403,40 @@ impl TlsConfig {
         }
 
         Ok(())
+    }
+}
+
+/// Metrics configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MetricsConfig {
+    /// Enable metrics HTTP server.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Address to bind the metrics server to.
+    #[serde(with = "socket_addr_serde")]
+    pub bind_addr: SocketAddr,
+}
+
+impl Default for MetricsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            bind_addr: "0.0.0.0:9090".parse().unwrap(),
+        }
+    }
+}
+
+impl MetricsConfig {
+    fn apply_env_overrides(&mut self) {
+        if let Ok(enabled) = std::env::var("RSTMDB_METRICS_ENABLED") {
+            self.enabled = enabled == "1" || enabled.to_lowercase() == "true";
+        }
+        if let Ok(addr) = std::env::var("RSTMDB_METRICS_BIND") {
+            if let Ok(parsed) = addr.parse() {
+                self.bind_addr = parsed;
+            }
+        }
     }
 }
 

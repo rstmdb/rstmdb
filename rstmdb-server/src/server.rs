@@ -4,6 +4,7 @@ use crate::broadcast::{EventBroadcaster, EventFilter, InstanceEvent};
 use crate::config::AuthConfig;
 use crate::error::ServerError;
 use crate::handler::CommandHandler;
+use crate::metrics::Metrics;
 use crate::session::{Session, SessionState, WireMode};
 use crate::stream::MaybeTlsStream;
 use bytes::BytesMut;
@@ -33,6 +34,8 @@ pub struct ServerConfig {
     pub max_connections: usize,
     /// TLS acceptor (if TLS is enabled).
     pub tls_acceptor: Option<Arc<TlsAcceptor>>,
+    /// Metrics instance (if metrics are enabled).
+    pub metrics: Option<Arc<Metrics>>,
 }
 
 impl std::fmt::Debug for ServerConfig {
@@ -43,6 +46,7 @@ impl std::fmt::Debug for ServerConfig {
             .field("auth_required", &self.auth_required)
             .field("max_connections", &self.max_connections)
             .field("tls_enabled", &self.tls_acceptor.is_some())
+            .field("metrics_enabled", &self.metrics.is_some())
             .finish()
     }
 }
@@ -55,6 +59,7 @@ impl Default for ServerConfig {
             auth_required: false,
             max_connections: 1000,
             tls_acceptor: None,
+            metrics: None,
         }
     }
 }
@@ -73,9 +78,20 @@ impl ServerConfig {
         self
     }
 
+    /// Sets the metrics instance.
+    pub fn with_metrics(mut self, metrics: Arc<Metrics>) -> Self {
+        self.metrics = Some(metrics);
+        self
+    }
+
     /// Returns whether TLS is enabled.
     pub fn tls_enabled(&self) -> bool {
         self.tls_acceptor.is_some()
+    }
+
+    /// Returns whether metrics are enabled.
+    pub fn metrics_enabled(&self) -> bool {
+        self.metrics.is_some()
     }
 }
 
@@ -113,7 +129,10 @@ impl Server {
     pub fn new(config: ServerConfig, engine: Arc<StateMachineEngine>) -> Self {
         let (shutdown_tx, _) = broadcast::channel(1);
         let broadcaster = Arc::new(EventBroadcaster::new(DEFAULT_BROADCAST_CAPACITY));
-        let handler = CommandHandler::new(engine).with_broadcaster(broadcaster.clone());
+        let mut handler = CommandHandler::new(engine).with_broadcaster(broadcaster.clone());
+        if let Some(ref metrics) = config.metrics {
+            handler = handler.with_metrics(metrics.clone());
+        }
         Self {
             config,
             handler: Arc::new(handler),
@@ -132,8 +151,11 @@ impl Server {
     ) -> Self {
         let (shutdown_tx, _) = broadcast::channel(1);
         let broadcaster = Arc::new(EventBroadcaster::new(DEFAULT_BROADCAST_CAPACITY));
-        let handler =
+        let mut handler =
             CommandHandler::with_auth(engine, auth_config).with_broadcaster(broadcaster.clone());
+        if let Some(ref metrics) = config.metrics {
+            handler = handler.with_metrics(metrics.clone());
+        }
         Self {
             config,
             handler: Arc::new(handler),
@@ -152,8 +174,11 @@ impl Server {
     ) -> Result<Self, ServerError> {
         let (shutdown_tx, _) = broadcast::channel(1);
         let broadcaster = Arc::new(EventBroadcaster::new(DEFAULT_BROADCAST_CAPACITY));
-        let handler = CommandHandler::with_snapshots(engine, snapshot_dir)?
+        let mut handler = CommandHandler::with_snapshots(engine, snapshot_dir)?
             .with_broadcaster(broadcaster.clone());
+        if let Some(ref metrics) = config.metrics {
+            handler = handler.with_metrics(metrics.clone());
+        }
         Ok(Self {
             config,
             handler: Arc::new(handler),
@@ -173,8 +198,12 @@ impl Server {
     ) -> Result<Self, ServerError> {
         let (shutdown_tx, _) = broadcast::channel(1);
         let broadcaster = Arc::new(EventBroadcaster::new(DEFAULT_BROADCAST_CAPACITY));
-        let handler = CommandHandler::with_snapshots_and_auth(engine, snapshot_dir, auth_config)?
-            .with_broadcaster(broadcaster.clone());
+        let mut handler =
+            CommandHandler::with_snapshots_and_auth(engine, snapshot_dir, auth_config)?
+                .with_broadcaster(broadcaster.clone());
+        if let Some(ref metrics) = config.metrics {
+            handler = handler.with_metrics(metrics.clone());
+        }
         Ok(Self {
             config,
             handler: Arc::new(handler),
@@ -218,6 +247,12 @@ impl Server {
                             self.stats.connections_total.fetch_add(1, Ordering::Relaxed);
                             self.stats.connections_active.fetch_add(1, Ordering::Relaxed);
 
+                            // Update metrics if enabled
+                            if let Some(ref metrics) = self.config.metrics {
+                                metrics.connections_total.inc();
+                                metrics.connections_active.inc();
+                            }
+
                             let tls_acceptor = self.config.tls_acceptor.clone();
                             let handler = self.handler.clone();
                             let broadcaster = self.broadcaster.clone();
@@ -242,7 +277,7 @@ impl Server {
                                     addr,
                                     handler,
                                     broadcaster,
-                                    config,
+                                    config.clone(),
                                     &mut conn_shutdown,
                                 )
                                 .await;
@@ -253,6 +288,12 @@ impl Server {
                                 }
 
                                 stats.connections_active.fetch_sub(1, Ordering::Relaxed);
+
+                                // Update metrics if enabled
+                                if let Some(ref metrics) = config.metrics {
+                                    metrics.connections_active.dec();
+                                }
+
                                 tracing::info!("Client disconnected: {}", addr);
                             });
                         }
@@ -323,7 +364,7 @@ impl Server {
                 Some(forwarded) = event_rx.recv() => {
                     let stream_event = StreamEvent {
                         msg_type: "event".to_string(),
-                        subscription_id: forwarded.subscription_id,
+                        subscription_id: forwarded.subscription_id.clone(),
                         instance_id: forwarded.event.instance_id,
                         machine: forwarded.event.machine,
                         version: forwarded.event.version,
@@ -343,6 +384,17 @@ impl Server {
                             BytesMut::from(&bytes[..])
                         }
                     };
+
+                    // Update events forwarded metric
+                    if let Some(ref metrics) = config.metrics {
+                        // Determine subscription type from session
+                        let sub_type = if session.get_subscription_instance(&forwarded.subscription_id).is_some() {
+                            "instance"
+                        } else {
+                            "all"
+                        };
+                        metrics.events_forwarded_total.with_label_values(&[sub_type]).inc();
+                    }
 
                     tracing::debug!("[{}] Sending stream event: {} bytes", addr, event_bytes.len());
                     stream.write_all(&event_bytes).await?;

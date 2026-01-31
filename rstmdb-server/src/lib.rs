@@ -17,6 +17,7 @@ pub mod compaction;
 pub mod config;
 pub mod error;
 pub mod handler;
+pub mod metrics;
 pub mod server;
 pub mod session;
 pub mod stream;
@@ -25,8 +26,11 @@ pub mod tls;
 pub use auth::TokenValidator;
 pub use broadcast::{EventBroadcaster, EventFilter, InstanceEvent, Subscription, SubscriptionType};
 pub use compaction::CompactionManager;
-pub use config::{AuthConfig, CompactionConfig, Config, NetworkConfig, StorageConfig, TlsConfig};
+pub use config::{
+    AuthConfig, CompactionConfig, Config, MetricsConfig, NetworkConfig, StorageConfig, TlsConfig,
+};
 pub use error::ServerError;
 pub use handler::CommandHandler;
+pub use metrics::{run_metrics_server, Metrics};
 pub use server::{Server, ServerConfig};
 pub use session::Session;

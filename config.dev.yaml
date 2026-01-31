@@ -60,3 +60,30 @@ compaction:
 
   # Minimum interval between auto-compactions in seconds
   min_interval_secs: 60
+
+# TLS settings
+tls:
+  # Enable TLS encryption
+  enabled: false
+
+  # Path to PEM-encoded server certificate file
+  # cert_path: "/etc/rstmdb/certs/server.crt"
+
+  # Path to PEM-encoded private key file
+  # key_path: "/etc/rstmdb/certs/server.key"
+
+  # Require client certificate authentication (mTLS)
+  require_client_cert: false
+
+  # Path to PEM-encoded CA certificate(s) for verifying client certs
+  # Required if require_client_cert is true
+  # client_ca_path: "/etc/rstmdb/certs/ca.crt"
+
+# Prometheus metrics settings
+metrics:
+  # Enable metrics HTTP server
+  enabled: true
+
+  # Address to bind the metrics server to
+  # Metrics available at http://<bind_addr>/metrics
+  bind_addr: "0.0.0.0:9090"
