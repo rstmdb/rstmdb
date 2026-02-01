@@ -272,6 +272,33 @@ ctx.items > 0
 !ctx.cancelled
 ```
 
+## Monitoring
+
+rstmdb exposes Prometheus metrics on port 9090 by default.
+
+### Grafana Dashboard
+
+[![Grafana Dashboard](https://img.shields.io/badge/Grafana-Dashboard-orange?logo=grafana)](https://grafana.com/grafana/dashboards/24778)
+
+Import the official dashboard: **[rstmdb Dashboard #24778](https://grafana.com/grafana/dashboards/24778)**
+
+**Includes:**
+- Request rate and latency (p50/p90/p99)
+- Error rates by code
+- Active connections and subscriptions
+- WAL size, throughput, and I/O operations
+- Instance and machine counts
+- System resources (CPU, memory, file descriptors)
+
+### Prometheus Configuration
+
+```yaml
+scrape_configs:
+  - job_name: 'rstmdb'
+    static_configs:
+      - targets: ['localhost:9090']
+```
+
 ## Architecture
 
 ```
