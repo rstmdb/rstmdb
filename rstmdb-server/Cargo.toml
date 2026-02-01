@@ -4,6 +4,9 @@ description = "TCP server for rstmdb - connection handling, command dispatch, se
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+keywords = ["server", "tcp", "database", "rstmdb"]
+categories = ["database", "network-programming"]
 
 [dependencies]
 rstmdb-protocol.workspace = true

@@ -4,6 +4,9 @@ description = "State machine engine for rstmdb - definitions, transitions, guard
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+keywords = ["state-machine", "fsm", "event-sourcing", "rstmdb"]
+categories = ["data-structures"]
 
 [dependencies]
 rstmdb-wal.workspace = true

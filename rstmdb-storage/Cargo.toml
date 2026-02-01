@@ -4,6 +4,9 @@ description = "Storage layer for rstmdb - snapshots, instance persistence, index
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+keywords = ["storage", "persistence", "snapshots", "rstmdb"]
+categories = ["database"]
 
 [dependencies]
 rstmdb-wal.workspace = true

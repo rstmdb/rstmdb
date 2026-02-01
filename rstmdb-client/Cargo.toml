@@ -4,6 +4,9 @@ description = "Client library for rstmdb - connection pooling, async API"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+keywords = ["client", "async", "database", "rstmdb"]
+categories = ["database", "asynchronous"]
 
 [dependencies]
 rstmdb-protocol.workspace = true

@@ -4,6 +4,9 @@ description = "Wire protocol implementation for rstmdb - framing, messages, seri
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+keywords = ["protocol", "wire-format", "serialization", "rstmdb"]
+categories = ["encoding"]
 
 [dependencies]
 serde.workspace = true
