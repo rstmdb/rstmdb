@@ -2,7 +2,8 @@
 name = "rstmdb"
 version = "0.1.0"
 edition = "2021"
-license = "Apache-2.0"
+license = "BSL-1.1"
+license-file = "LICENSE"
 description = "A state machine database with WAL durability"
 readme = "README.md"
 homepage = "https://github.com/rstmdb/rstmdb"
@@ -17,7 +18,7 @@ path = "src/main.rs"
 # Debian package configuration
 [package.metadata.deb]
 maintainer = "rstmdb maintainers"
-copyright = "2024, rstmdb contributors"
+copyright = "2026, rstmdb authors. Licensed under BSL-1.1"
 extended-description = """\
 rstmdb is a state machine database with Write-Ahead Log (WAL) durability. \
 It provides a TCP-based command protocol (RCP) for managing versioned state \
@@ -63,7 +64,7 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-license = "Apache-2.0"
+license = "BSL-1.1"
 repository = "https://github.com/rstmdb/rstmdb"
 
 [workspace.dependencies]

@@ -242,6 +242,10 @@ All PRs must pass the CI pipeline:
 
 Maintainers aim to review PRs within a few days. Complex changes may take longer.
 
+## License
+
+By contributing, you agree that your contributions will be licensed under the Business Source License 1.1 (BSL-1.1). The BSL converts to Apache 2.0 four years after each release. See [LICENSE](./LICENSE) for details.
+
 ## Questions?
 
 - Open an issue for bugs or feature requests

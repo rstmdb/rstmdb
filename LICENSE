@@ -1,0 +1,99 @@
+Business Source License 1.1
+
+License text copyright (c) 2017 MariaDB Corporation Ab.
+All rights reserved.
+
+Additional work copyright (c) 2026 rstmdb authors.
+
+-------------------------------------------------------------------------------
+
+Parameters
+
+Licensor:
+    rstmdb authors
+
+Licensed Work:
+    rstmdb — a deterministic, versioned state machine database
+    with WAL-backed durability and a TCP command protocol.
+
+The Licensed Work is © 2026 rstmdb authors.
+
+Change Date:
+    Four (4) years from the date of each Licensed Work version release.
+
+Change License:
+    Apache License, Version 2.0
+
+Additional Use Grant:
+    You may use the Licensed Work free of charge for:
+      - development and testing,
+      - non-production environments,
+      - evaluation and research purposes,
+      - production use on no more than ONE (1) node.
+
+    You may NOT:
+      - use the Licensed Work in production on more than one (1) node,
+      - offer the Licensed Work as a hosted or managed service
+        (including SaaS, PaaS, DBaaS, or similar),
+      - embed the Licensed Work into a commercial product or service
+        provided to third parties,
+    without obtaining a commercial license from the Licensor.
+
+-------------------------------------------------------------------------------
+
+Terms
+
+The Business Source License (this document, or the "License") is not an
+Open Source license. However, the Licensed Work will eventually be made
+available under an Open Source License, as stated below.
+
+1. Grant of Rights
+
+Subject to the terms and conditions of this License, the Licensor hereby
+grants you a non-exclusive, non-transferable, non-sublicensable license
+to copy, modify, create derivative works of, and redistribute the
+Licensed Work, subject to the limitations described herein.
+
+2. Restrictions
+
+Any use of the Licensed Work outside the scope of the Additional Use
+Grant requires a separate commercial license agreement with the
+Licensor.
+
+You may not circumvent, remove, or bypass any technical or contractual
+limitations imposed by this License.
+
+3. Change Date
+
+On the Change Date, the Licensor will make the Licensed Work available
+under the Change License, and this License will no longer apply.
+
+4. Change License
+
+On or after the Change Date, the Licensed Work will be governed by the
+Apache License, Version 2.0.
+
+5. Redistribution
+
+You may redistribute copies of the Licensed Work, provided that:
+  - this License is included with the Licensed Work,
+  - all copyright notices are preserved,
+  - no additional rights are granted beyond those provided by this License.
+
+6. Disclaimer of Warranty
+
+THE LICENSED WORK IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, AND NONINFRINGEMENT.
+
+7. Limitation of Liability
+
+IN NO EVENT SHALL THE LICENSOR BE LIABLE FOR ANY CLAIM, DAMAGES, OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT, OR OTHERWISE, ARISING
+FROM, OUT OF, OR IN CONNECTION WITH THE LICENSED WORK OR THE USE OR OTHER
+DEALINGS IN THE LICENSED WORK.
+
+-------------------------------------------------------------------------------
+
+For commercial licensing, enterprise features, or support, contact:
+licensing@rstmdb.com
