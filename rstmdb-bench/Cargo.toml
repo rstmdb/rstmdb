@@ -3,7 +3,7 @@ name = "rstmdb-bench"
 description = "Benchmarks for rstmdb"
 version.workspace = true
 edition.workspace = true
-license.workspace = true
+license-file = "../LICENSE"
 publish = false
 
 [dependencies]

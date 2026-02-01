@@ -3,8 +3,8 @@ name = "rstmdb-cli"
 description = "Command-line interface for rstmdb"
 version.workspace = true
 edition.workspace = true
-license.workspace = true
 repository.workspace = true
+license-file = "../LICENSE"
 keywords = ["cli", "command-line", "database", "rstmdb"]
 categories = ["command-line-utilities"]
 

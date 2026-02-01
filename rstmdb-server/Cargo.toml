@@ -3,8 +3,8 @@ name = "rstmdb-server"
 description = "TCP server for rstmdb - connection handling, command dispatch, sessions"
 version.workspace = true
 edition.workspace = true
-license.workspace = true
 repository.workspace = true
+license-file = "../LICENSE"
 keywords = ["server", "tcp", "database", "rstmdb"]
 categories = ["database", "network-programming"]
 
