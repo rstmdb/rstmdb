@@ -4,10 +4,39 @@ version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
 description = "A state machine database with WAL durability"
+readme = "README.md"
+homepage = "https://github.com/rstmdb/rstmdb"
+repository = "https://github.com/rstmdb/rstmdb"
+keywords = ["state-machine", "database", "wal", "event-sourcing"]
+categories = ["database", "data-structures"]
 
 [[bin]]
 name = "rstmdb"
 path = "src/main.rs"
+
+# Debian package configuration
+[package.metadata.deb]
+maintainer = "rstmdb maintainers"
+copyright = "2024, rstmdb contributors"
+extended-description = """\
+rstmdb is a state machine database with Write-Ahead Log (WAL) durability. \
+It provides a TCP-based command protocol (RCP) for managing versioned state \
+machine definitions, creating instances, and applying events with guard conditions."""
+section = "database"
+priority = "optional"
+assets = [
+    ["target/release/rstmdb", "usr/bin/", "755"],
+]
+conf-files = []
+
+# RPM package configuration
+[package.metadata.generate-rpm]
+assets = [
+    { source = "target/release/rstmdb", dest = "/usr/bin/rstmdb", mode = "0755" },
+]
+
+[package.metadata.generate-rpm.requires]
+# No runtime dependencies
 
 [dependencies]
 rstmdb-core.workspace = true
@@ -35,7 +64,7 @@ members = [
 version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
-repository = "https://github.com/zombocoder/rstmdb"
+repository = "https://github.com/rstmdb/rstmdb"
 
 [workspace.dependencies]
 # Internal crates
