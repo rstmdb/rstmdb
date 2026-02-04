@@ -155,7 +155,7 @@ Look for issues labeled `good-first-issue` in the issue tracker. These are typic
 2. Add handler in `rstmdb-server/src/handler.rs`
 3. Update client in `rstmdb-client/src/client.rs`
 4. Add CLI command if user-facing
-5. Update `docs/protocol.md` and `docs/RCP_SPECIFICATION.md`
+5. Update `docs/protocol.md`
 6. Add integration tests
 
 ### Adding a Client Library

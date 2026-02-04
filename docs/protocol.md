@@ -2,8 +2,6 @@
 
 RCP (rstmdb Command Protocol) is a TCP-based, command-oriented protocol for interacting with the rstmdb server.
 
-For the complete specification, see [RCP_SPECIFICATION.md](./RCP_SPECIFICATION.md).
-
 ## Quick Reference
 
 ### Connection
