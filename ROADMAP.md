@@ -53,9 +53,9 @@
 
 Expand ecosystem with official client libraries:
 
-- [ ] **Python client** - Specification exists, implementation pending
+- [x] **Python client** - Specification exists, implementation pending
+- [x] **TypeScript/Node.js client** - For JavaScript ecosystems
 - [ ] **Go client** - Native Go implementation
-- [ ] **TypeScript/Node.js client** - For JavaScript ecosystems
 
 ### Phase 2: High Availability
 
