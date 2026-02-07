@@ -605,11 +605,7 @@ impl CommandHandler {
         let offset = p.offset.unwrap_or(0) as usize;
         let limit = p.limit.unwrap_or(100) as usize;
 
-        let paginated: Vec<_> = filtered
-            .into_iter()
-            .skip(offset)
-            .take(limit)
-            .collect();
+        let paginated: Vec<_> = filtered.into_iter().skip(offset).take(limit).collect();
 
         let has_more = (offset + paginated.len()) < total as usize;
 

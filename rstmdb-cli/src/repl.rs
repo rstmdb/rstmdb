@@ -128,7 +128,8 @@ pub async fn run(
                                 "{}: {}\n{}\n",
                                 "Error".red(),
                                 e,
-                                "Hint: Use 'reconnect' command to reconnect to the server.".yellow()
+                                "Hint: Use 'reconnect' command to reconnect to the server."
+                                    .yellow()
                             );
                         } else {
                             println!("{}: {}\n", "Error".red(), e);
@@ -227,7 +228,9 @@ async fn execute_repl_command(
 
         "get-machine" | "gm" => {
             if args.len() < 2 {
-                return Ok(CommandResult::Output("Usage: get-machine <name> <version>".to_string()));
+                return Ok(CommandResult::Output(
+                    "Usage: get-machine <name> <version>".to_string(),
+                ));
             }
             let name = args[0];
             let version: u32 = args[1].parse()?;
@@ -254,7 +257,8 @@ async fn execute_repl_command(
                         if let Ok(machine) = client.get_machine(name, latest as u32).await {
                             let def = &machine.definition;
                             let states = def["states"].as_array().map(|a| a.len()).unwrap_or(0);
-                            let transitions = def["transitions"].as_array().map(|a| a.len()).unwrap_or(0);
+                            let transitions =
+                                def["transitions"].as_array().map(|a| a.len()).unwrap_or(0);
 
                             output.push_str(&format!(
                                 "  {} v{} ({} states, {} transitions)\n",
@@ -264,7 +268,11 @@ async fn execute_repl_command(
                                 transitions.to_string().yellow()
                             ));
                         } else {
-                            output.push_str(&format!("  {} [versions: {:?}]\n", name.cyan(), versions));
+                            output.push_str(&format!(
+                                "  {} [versions: {:?}]\n",
+                                name.cyan(),
+                                versions
+                            ));
                         }
                     } else {
                         output.push_str(&format!("  {} [no versions]\n", name.cyan()));
@@ -301,7 +309,9 @@ async fn execute_repl_command(
 
         "get" | "g" => {
             if args.is_empty() {
-                return Ok(CommandResult::Output("Usage: get <instance_id>".to_string()));
+                return Ok(CommandResult::Output(
+                    "Usage: get <instance_id>".to_string(),
+                ));
             }
             let result = client.get_instance(args[0]).await?;
             Ok(CommandResult::Output(format!(
@@ -318,7 +328,9 @@ async fn execute_repl_command(
             let machine = args.first().copied();
             let state = args.get(1).copied();
 
-            let result = client.list_instances(machine, state, Some(50), None).await?;
+            let result = client
+                .list_instances(machine, state, Some(50), None)
+                .await?;
 
             if result.instances.is_empty() {
                 return Ok(CommandResult::Output("No instances".yellow().to_string()));
@@ -328,7 +340,11 @@ async fn execute_repl_command(
                 "{} ({} total{})\n",
                 "Instances".bold().cyan(),
                 result.total,
-                if result.has_more { ", showing first 50" } else { "" }
+                if result.has_more {
+                    ", showing first 50"
+                } else {
+                    ""
+                }
             );
 
             for inst in &result.instances {
@@ -346,10 +362,16 @@ async fn execute_repl_command(
 
         "delete" | "d" => {
             if args.is_empty() {
-                return Ok(CommandResult::Output("Usage: delete <instance_id>".to_string()));
+                return Ok(CommandResult::Output(
+                    "Usage: delete <instance_id>".to_string(),
+                ));
             }
             client.delete_instance(args[0], None).await?;
-            Ok(CommandResult::Output(format!("{} {}", "Deleted".green(), args[0].cyan())))
+            Ok(CommandResult::Output(format!(
+                "{} {}",
+                "Deleted".green(),
+                args[0].cyan()
+            )))
         }
 
         "apply" | "a" => {

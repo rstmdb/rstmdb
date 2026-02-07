@@ -78,7 +78,8 @@ pub async fn execute(client: &Client, cmd: Commands) -> Result<String, Box<dyn s
                         if let Ok(machine) = client.get_machine(name, latest as u32).await {
                             let def = &machine.definition;
                             let states = def["states"].as_array().map(|a| a.len()).unwrap_or(0);
-                            let transitions = def["transitions"].as_array().map(|a| a.len()).unwrap_or(0);
+                            let transitions =
+                                def["transitions"].as_array().map(|a| a.len()).unwrap_or(0);
 
                             output.push_str(&format!(
                                 "  {} v{} ({} states, {} transitions)\n",
@@ -88,7 +89,11 @@ pub async fn execute(client: &Client, cmd: Commands) -> Result<String, Box<dyn s
                                 transitions.to_string().yellow()
                             ));
                         } else {
-                            output.push_str(&format!("  {} [versions: {:?}]\n", name.cyan(), versions));
+                            output.push_str(&format!(
+                                "  {} [versions: {:?}]\n",
+                                name.cyan(),
+                                versions
+                            ));
                         }
                     } else {
                         output.push_str(&format!("  {} [no versions]\n", name.cyan()));
