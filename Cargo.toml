@@ -1,8 +1,8 @@
 [package]
 name = "rstmdb"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
-license-file = "LICENSE"
+license-file = "BSL-1.1"
 description = "A state machine database with WAL durability"
 readme = "README.md"
 homepage = "https://github.com/rstmdb/rstmdb"
@@ -24,9 +24,7 @@ It provides a TCP-based command protocol (RCP) for managing versioned state \
 machine definitions, creating instances, and applying events with guard conditions."""
 section = "database"
 priority = "optional"
-assets = [
-    ["target/release/rstmdb", "usr/bin/", "755"],
-]
+assets = [["target/release/rstmdb", "usr/bin/", "755"]]
 conf-files = []
 
 # RPM package configuration
