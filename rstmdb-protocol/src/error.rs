@@ -57,6 +57,7 @@ pub enum ErrorCode {
     NotFound,
     MachineNotFound,
     MachineVersionExists,
+    MachineVersionLimitExceeded,
     InstanceNotFound,
     InstanceExists,
 
@@ -91,6 +92,7 @@ impl fmt::Display for ErrorCode {
             ErrorCode::NotFound => write!(f, "NOT_FOUND"),
             ErrorCode::MachineNotFound => write!(f, "MACHINE_NOT_FOUND"),
             ErrorCode::MachineVersionExists => write!(f, "MACHINE_VERSION_EXISTS"),
+            ErrorCode::MachineVersionLimitExceeded => write!(f, "MACHINE_VERSION_LIMIT_EXCEEDED"),
             ErrorCode::InstanceNotFound => write!(f, "INSTANCE_NOT_FOUND"),
             ErrorCode::InstanceExists => write!(f, "INSTANCE_EXISTS"),
             ErrorCode::InvalidTransition => write!(f, "INVALID_TRANSITION"),
@@ -141,6 +143,10 @@ mod tests {
         assert_eq!(
             format!("{}", ErrorCode::MachineVersionExists),
             "MACHINE_VERSION_EXISTS"
+        );
+        assert_eq!(
+            format!("{}", ErrorCode::MachineVersionLimitExceeded),
+            "MACHINE_VERSION_LIMIT_EXCEEDED"
         );
         assert_eq!(
             format!("{}", ErrorCode::InstanceNotFound),

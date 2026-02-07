@@ -156,6 +156,33 @@ impl Client {
         Ok(serde_json::from_value(result)?)
     }
 
+    /// Lists instances with optional filtering and pagination.
+    pub async fn list_instances(
+        &self,
+        machine: Option<&str>,
+        state: Option<&str>,
+        limit: Option<u32>,
+        offset: Option<u32>,
+    ) -> Result<ListInstancesResult, ClientError> {
+        let mut params = json!({});
+
+        if let Some(m) = machine {
+            params["machine"] = json!(m);
+        }
+        if let Some(s) = state {
+            params["state"] = json!(s);
+        }
+        if let Some(l) = limit {
+            params["limit"] = json!(l);
+        }
+        if let Some(o) = offset {
+            params["offset"] = json!(o);
+        }
+
+        let result = self.request(Operation::ListInstances, params).await?;
+        Ok(serde_json::from_value(result)?)
+    }
+
     /// Deletes an instance.
     pub async fn delete_instance(
         &self,
@@ -238,6 +265,11 @@ impl Client {
         }
 
         self.request(Operation::WalRead, params).await
+    }
+
+    /// Gets WAL statistics.
+    pub async fn wal_stats(&self) -> Result<Value, ClientError> {
+        self.request(Operation::WalStats, json!({})).await
     }
 
     // =========================================================================

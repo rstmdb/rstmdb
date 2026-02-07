@@ -27,6 +27,7 @@ pub enum Operation {
     // Instance lifecycle
     CreateInstance,
     GetInstance,
+    ListInstances,
     DeleteInstance,
 
     // Events
@@ -36,6 +37,7 @@ pub enum Operation {
     // Snapshots and WAL
     SnapshotInstance,
     WalRead,
+    WalStats,
     Compact,
 
     // Subscriptions
@@ -357,6 +359,43 @@ pub struct GetInstanceResult {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_event_id: Option<String>,
     pub last_wal_offset: u64,
+}
+
+/// Parameters for LIST_INSTANCES request.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ListInstancesParams {
+    /// Filter by machine name.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub machine: Option<String>,
+    /// Filter by current state.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub state: Option<String>,
+    /// Maximum number of instances to return.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+    /// Number of instances to skip (for pagination).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub offset: Option<u32>,
+}
+
+/// Instance summary for list responses (excludes ctx for efficiency).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InstanceSummary {
+    pub id: String,
+    pub machine: String,
+    pub version: u32,
+    pub state: String,
+    pub created_at: i64,
+    pub updated_at: i64,
+    pub last_wal_offset: u64,
+}
+
+/// Result for LIST_INSTANCES response.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ListInstancesResult {
+    pub instances: Vec<InstanceSummary>,
+    pub total: u64,
+    pub has_more: bool,
 }
 
 /// Parameters for APPLY_EVENT request.

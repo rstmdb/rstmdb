@@ -202,6 +202,8 @@ pub struct StorageConfig {
     pub wal_segment_size_mb: u64,
     /// Fsync policy.
     pub fsync_policy: FsyncPolicy,
+    /// Maximum number of versions per machine (0 = unlimited).
+    pub max_machine_versions: u32,
 }
 
 /// Fsync policy for WAL writes.
@@ -224,6 +226,7 @@ impl Default for StorageConfig {
             data_dir: PathBuf::from("./data"),
             wal_segment_size_mb: 64,
             fsync_policy: FsyncPolicy::EveryWrite,
+            max_machine_versions: 0, // unlimited
         }
     }
 }
@@ -254,6 +257,12 @@ impl StorageConfig {
                 }
                 _ => FsyncPolicy::EveryWrite,
             };
+        }
+
+        if let Ok(max) = std::env::var("RSTMDB_MAX_MACHINE_VERSIONS") {
+            if let Ok(n) = max.parse() {
+                self.max_machine_versions = n;
+            }
         }
     }
 
@@ -496,6 +505,7 @@ mod tests {
         let config = Config::default();
         assert_eq!(config.network.bind_addr.port(), 7401);
         assert_eq!(config.storage.wal_segment_size(), 64 * 1024 * 1024);
+        assert_eq!(config.storage.max_machine_versions, 0); // unlimited by default
         assert!(config.compaction.enabled);
     }
 

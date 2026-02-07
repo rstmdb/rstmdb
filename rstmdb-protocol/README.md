@@ -54,12 +54,14 @@ let response: Response = response_frame.into_response()?;
 
 The protocol supports the following command types:
 
-- `PING` / `PONG` - Connection health checks
-- `AUTH` - Authentication with username/password
-- `SM.CREATE` / `SM.GET` / `SM.LIST` - State machine management
-- `INST.CREATE` / `INST.GET` / `INST.LIST` - Instance management
-- `EVENT.APPLY` - Apply events to instances
-- `HISTORY` - Query event history
+- `HELLO` / `PING` / `BYE` - Session management
+- `AUTH` - Authentication with bearer token
+- `INFO` - Server capabilities and limits
+- `PUT_MACHINE` / `GET_MACHINE` / `LIST_MACHINES` - Machine definition management
+- `CREATE_INSTANCE` / `GET_INSTANCE` / `LIST_INSTANCES` / `DELETE_INSTANCE` - Instance lifecycle
+- `APPLY_EVENT` / `BATCH` - Event operations
+- `SNAPSHOT_INSTANCE` / `WAL_READ` / `WAL_STATS` / `COMPACT` - Storage & WAL
+- `WATCH_INSTANCE` / `WATCH_ALL` / `UNWATCH` - Streaming subscriptions
 
 ## License
 

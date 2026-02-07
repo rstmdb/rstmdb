@@ -46,6 +46,10 @@ storage:
   #   never        - fastest, no fsync (data loss on crash)
   fsync_policy: every_write
 
+  # Maximum number of versions per state machine (0 = unlimited)
+  # When limit is reached, new versions will be rejected
+  max_machine_versions: 0
+
 # TLS settings
 tls:
   # Enable TLS

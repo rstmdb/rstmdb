@@ -31,6 +31,7 @@ storage:
   data_dir: "./data"
   wal_segment_size_mb: 64
   fsync_policy: every_write
+  max_machine_versions: 0
 
 # Automatic compaction settings
 compaction:

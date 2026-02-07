@@ -67,13 +67,13 @@ repository = "https://github.com/rstmdb/rstmdb"
 
 [workspace.dependencies]
 # Internal crates
-rstmdb-protocol = { version = "0.1.0", path = "rstmdb-protocol" }
+rstmdb-protocol = { version = "0.1.1", path = "rstmdb-protocol" }
 rstmdb-wal = { version = "0.1.0", path = "rstmdb-wal" }
-rstmdb-core = { version = "0.1.0", path = "rstmdb-core" }
+rstmdb-core = { version = "0.1.1", path = "rstmdb-core" }
 rstmdb-storage = { version = "0.1.0", path = "rstmdb-storage" }
-rstmdb-server = { version = "0.1.0", path = "rstmdb-server" }
-rstmdb-client = { version = "0.1.0", path = "rstmdb-client" }
-rstmdb-cli = { version = "0.1.0", path = "rstmdb-cli" }
+rstmdb-server = { version = "0.1.1", path = "rstmdb-server" }
+rstmdb-client = { version = "0.1.1", path = "rstmdb-client" }
+rstmdb-cli = { version = "0.1.1", path = "rstmdb-cli" }
 
 # Async runtime
 tokio = { version = "1.36", features = ["full"] }

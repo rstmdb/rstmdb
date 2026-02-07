@@ -1285,7 +1285,7 @@ dependencies = [
 
 [[package]]
 name = "rstmdb-cli"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "clap",
  "colored",
@@ -1303,7 +1303,7 @@ dependencies = [
 
 [[package]]
 name = "rstmdb-client"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bytes",
  "pin-project-lite",
@@ -1323,7 +1323,7 @@ dependencies = [
 
 [[package]]
 name = "rstmdb-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "crc32c",
  "dashmap",
@@ -1339,7 +1339,7 @@ dependencies = [
 
 [[package]]
 name = "rstmdb-protocol"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bytes",
  "chrono",
@@ -1353,7 +1353,7 @@ dependencies = [
 
 [[package]]
 name = "rstmdb-server"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bytes",
  "dashmap",
