@@ -89,10 +89,19 @@ auth:
     - username: admin
       password_hash: "$argon2id$..."
 
+storage:
+  max_machine_versions: 10  # Limit versions per machine (0 = unlimited)
+
 limits:
   max_connections: 1000
   idle_timeout_secs: 300
 ```
+
+### Environment Variable Overrides
+
+Configuration values can be overridden via environment variables:
+
+- `RSTMDB_MAX_MACHINE_VERSIONS` - Maximum versions per state machine
 
 ## Prometheus Metrics
 

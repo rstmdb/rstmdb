@@ -72,11 +72,12 @@ Client                              Server
 
 ### Instance Lifecycle
 
-| Operation         | Description                                  |
-| ----------------- | -------------------------------------------- |
-| `CREATE_INSTANCE` | Create a new state machine instance          |
-| `GET_INSTANCE`    | Get current state and context of an instance |
-| `DELETE_INSTANCE` | Soft-delete an instance                      |
+| Operation         | Description                                       |
+| ----------------- | ------------------------------------------------- |
+| `CREATE_INSTANCE` | Create a new state machine instance               |
+| `GET_INSTANCE`    | Get current state and context of an instance      |
+| `LIST_INSTANCES`  | List instances with optional filtering/pagination |
+| `DELETE_INSTANCE` | Soft-delete an instance                           |
 
 ### Events
 
@@ -91,6 +92,7 @@ Client                              Server
 | ------------------- | ------------------------------------------------- |
 | `SNAPSHOT_INSTANCE` | Force snapshot creation for an instance           |
 | `WAL_READ`          | Read WAL entries from offset (supports streaming) |
+| `WAL_STATS`         | Get WAL statistics (entry count, size, I/O stats) |
 | `COMPACT`           | Trigger WAL compaction                            |
 
 ### Streaming
@@ -160,6 +162,7 @@ Client                              Server
 | `NOT_FOUND`              | Resource    | No        | Generic not found            |
 | `MACHINE_NOT_FOUND`      | Resource    | No        | Machine definition not found |
 | `MACHINE_VERSION_EXISTS` | Resource    | No        | Version already exists       |
+| `MACHINE_VERSION_LIMIT`  | Resource    | No        | Max versions per machine exceeded |
 | `INSTANCE_NOT_FOUND`     | Resource    | No        | Instance not found           |
 | `INSTANCE_EXISTS`        | Resource    | No        | Instance already exists      |
 | `INVALID_TRANSITION`     | State       | No        | Transition not allowed       |

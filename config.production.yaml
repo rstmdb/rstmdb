@@ -20,6 +20,10 @@ storage:
   fsync_policy:
     every_ms: 100
 
+  # Maximum number of versions per state machine (0 = unlimited)
+  # When limit is reached, new versions will be rejected
+  max_machine_versions: 0
+
 compaction:
   enabled: true
   events_threshold: 50000

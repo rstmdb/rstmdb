@@ -53,6 +53,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!("Starting rstmdb server");
     tracing::info!("  Bind address: {}", config.network.bind_addr);
     tracing::info!("  Data directory: {}", config.storage.data_dir.display());
+    if config.storage.max_machine_versions > 0 {
+        tracing::info!(
+            "  Max machine versions: {}",
+            config.storage.max_machine_versions
+        );
+    }
 
     // Log auth config
     if config.auth.required {
@@ -126,6 +132,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Configure server with snapshot, auth, TLS, and metrics support
     let mut server_config = ServerConfig::new(config.network.bind_addr);
     server_config.auth_required = config.auth.required;
+    server_config.max_machine_versions = config.storage.max_machine_versions;
     if let Some(acceptor) = tls_acceptor {
         server_config = server_config.with_tls(acceptor);
     }

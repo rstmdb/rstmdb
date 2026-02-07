@@ -60,6 +60,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let instance = client.get_instance(instance_id).await?;
     println!("Current state: {}", instance.current_state);
 
+    // List instances with filtering
+    let result = client.list_instances(
+        Some("order"),  // filter by machine
+        Some("paid"),   // filter by state
+        Some(50),       // limit
+        None            // offset
+    ).await?;
+    println!("Found {} instances", result.total);
+
+    // Get WAL statistics
+    let stats = client.wal_stats().await?;
+    println!("WAL entries: {}", stats["entry_count"]);
+
     Ok(())
 }
 ```

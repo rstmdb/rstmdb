@@ -53,6 +53,8 @@ pub struct CommandHandler {
     token_validator: Option<TokenValidator>,
     /// Whether authentication is required.
     auth_required: bool,
+    /// Maximum number of versions per machine (0 = unlimited).
+    max_machine_versions: u32,
     /// Event broadcaster for watch subscriptions.
     broadcaster: Option<Arc<EventBroadcaster>>,
     /// Metrics for request tracking.
@@ -68,6 +70,7 @@ impl CommandHandler {
             info: ServerInfo::default(),
             token_validator: None,
             auth_required: false,
+            max_machine_versions: 0,
             broadcaster: None,
             metrics: None,
         }
@@ -87,6 +90,7 @@ impl CommandHandler {
             info: ServerInfo::default(),
             token_validator,
             auth_required: auth_config.required,
+            max_machine_versions: 0,
             broadcaster: None,
             metrics: None,
         }
@@ -104,6 +108,7 @@ impl CommandHandler {
             info: ServerInfo::default(),
             token_validator: None,
             auth_required: false,
+            max_machine_versions: 0,
             broadcaster: None,
             metrics: None,
         })
@@ -128,6 +133,7 @@ impl CommandHandler {
             info: ServerInfo::default(),
             token_validator,
             auth_required: auth_config.required,
+            max_machine_versions: 0,
             broadcaster: None,
             metrics: None,
         })
@@ -141,6 +147,7 @@ impl CommandHandler {
             info,
             token_validator: None,
             auth_required: false,
+            max_machine_versions: 0,
             broadcaster: None,
             metrics: None,
         }
@@ -155,6 +162,12 @@ impl CommandHandler {
     /// Sets the metrics instance.
     pub fn with_metrics(mut self, metrics: Arc<Metrics>) -> Self {
         self.metrics = Some(metrics);
+        self
+    }
+
+    /// Sets the maximum number of versions per machine (0 = unlimited).
+    pub fn with_max_machine_versions(mut self, max: u32) -> Self {
+        self.max_machine_versions = max;
         self
     }
 
@@ -253,11 +266,13 @@ impl CommandHandler {
             Operation::ListMachines => self.handle_list_machines(&request.params),
             Operation::CreateInstance => self.handle_create_instance(&request.params),
             Operation::GetInstance => self.handle_get_instance(&request.params),
+            Operation::ListInstances => self.handle_list_instances(&request.params),
             Operation::DeleteInstance => self.handle_delete_instance(&request.params),
             Operation::ApplyEvent => self.handle_apply_event(&request.params),
             Operation::Batch => self.handle_batch(session, &request.params),
             Operation::SnapshotInstance => self.handle_snapshot_instance(&request.params),
             Operation::WalRead => self.handle_wal_read(&request.params),
+            Operation::WalStats => self.handle_wal_stats(),
             Operation::Compact => self.handle_compact(&request.params),
             Operation::WatchInstance => self.handle_watch_instance_cmd(session, &request.params),
             Operation::WatchAll => self.handle_watch_all_cmd(session, &request.params),
@@ -296,11 +311,13 @@ impl CommandHandler {
             Operation::ListMachines => "LIST_MACHINES",
             Operation::CreateInstance => "CREATE_INSTANCE",
             Operation::GetInstance => "GET_INSTANCE",
+            Operation::ListInstances => "LIST_INSTANCES",
             Operation::DeleteInstance => "DELETE_INSTANCE",
             Operation::ApplyEvent => "APPLY_EVENT",
             Operation::Batch => "BATCH",
             Operation::SnapshotInstance => "SNAPSHOT_INSTANCE",
             Operation::WalRead => "WAL_READ",
+            Operation::WalStats => "WAL_STATS",
             Operation::Compact => "COMPACT",
             Operation::WatchInstance => "WATCH_INSTANCE",
             Operation::WatchAll => "WATCH_ALL",
@@ -318,6 +335,7 @@ impl CommandHandler {
             ErrorCode::NotFound => "NOT_FOUND",
             ErrorCode::MachineNotFound => "MACHINE_NOT_FOUND",
             ErrorCode::MachineVersionExists => "MACHINE_VERSION_EXISTS",
+            ErrorCode::MachineVersionLimitExceeded => "MACHINE_VERSION_LIMIT_EXCEEDED",
             ErrorCode::InstanceNotFound => "INSTANCE_NOT_FOUND",
             ErrorCode::InstanceExists => "INSTANCE_EXISTS",
             ErrorCode::InvalidTransition => "INVALID_TRANSITION",
@@ -438,6 +456,22 @@ impl CommandHandler {
         let p: PutMachineParams = serde_json::from_value(params.clone())
             .map_err(|e| ServerError::InvalidRequest(e.to_string()))?;
 
+        // Check if version limit would be exceeded
+        if self.max_machine_versions > 0 {
+            let versions = self.engine.get_machine_versions(&p.machine);
+            // Only check if this is a new version (not an update to existing)
+            if !versions.contains(&p.version)
+                && versions.len() >= self.max_machine_versions as usize
+            {
+                return Err(ServerError::MachineVersionLimitExceeded(format!(
+                    "machine '{}' already has {} versions (limit: {})",
+                    p.machine,
+                    versions.len(),
+                    self.max_machine_versions
+                )));
+            }
+        }
+
         let (checksum, created) = self
             .engine
             .put_machine(&p.machine, p.version, &p.definition)?;
@@ -471,7 +505,7 @@ impl CommandHandler {
 
     fn handle_list_machines(&self, _params: &Value) -> Result<Value, ServerError> {
         let machines = self.engine.list_machines();
-        let items: Vec<_> = machines
+        let mut items: Vec<_> = machines
             .into_iter()
             .map(|(name, versions)| {
                 json!({
@@ -480,6 +514,13 @@ impl CommandHandler {
                 })
             })
             .collect();
+
+        // Sort machines alphabetically by name
+        items.sort_by(|a, b| {
+            let name_a = a["machine"].as_str().unwrap_or("");
+            let name_b = b["machine"].as_str().unwrap_or("");
+            name_a.cmp(name_b)
+        });
 
         Ok(json!({
             "items": items,
@@ -527,6 +568,69 @@ impl CommandHandler {
             ctx: instance.ctx,
             last_event_id: instance.last_event_id,
             last_wal_offset: instance.last_wal_offset,
+        };
+
+        Ok(serde_json::to_value(result)?)
+    }
+
+    fn handle_list_instances(&self, params: &Value) -> Result<Value, ServerError> {
+        let p: ListInstancesParams = serde_json::from_value(params.clone())
+            .map_err(|e| ServerError::InvalidRequest(e.to_string()))?;
+
+        let all_instances = self.engine.get_all_instances();
+
+        // Apply filters
+        let filtered: Vec<_> = all_instances
+            .into_iter()
+            .filter(|i| {
+                // Filter by machine if specified
+                if let Some(ref machine) = p.machine {
+                    if &i.machine != machine {
+                        return false;
+                    }
+                }
+                // Filter by state if specified
+                if let Some(ref state) = p.state {
+                    if &i.state != state {
+                        return false;
+                    }
+                }
+                true
+            })
+            .collect();
+
+        let total = filtered.len() as u64;
+
+        // Apply pagination
+        let offset = p.offset.unwrap_or(0) as usize;
+        let limit = p.limit.unwrap_or(100) as usize;
+
+        let paginated: Vec<_> = filtered
+            .into_iter()
+            .skip(offset)
+            .take(limit)
+            .collect();
+
+        let has_more = (offset + paginated.len()) < total as usize;
+
+        // Convert to summaries (without ctx for efficiency)
+        let instances: Vec<InstanceSummary> = paginated
+            .into_iter()
+            .map(|i| InstanceSummary {
+                id: i.id,
+                machine: i.machine,
+                version: i.version,
+                state: i.state,
+                created_at: i.created_at,
+                updated_at: i.updated_at,
+                last_wal_offset: i.last_wal_offset,
+            })
+            .collect();
+
+        let result = ListInstancesResult {
+            instances,
+            total,
+            has_more,
         };
 
         Ok(serde_json::to_value(result)?)
@@ -763,6 +867,31 @@ impl CommandHandler {
         Ok(json!({
             "records": records,
             "next_offset": next_offset,
+        }))
+    }
+
+    fn handle_wal_stats(&self) -> Result<Value, ServerError> {
+        let wal = self.engine.wal();
+        let stats = wal.stats();
+        let segment_ids = wal.segment_ids();
+        let total_size = wal.total_size();
+        let next_sequence = wal.next_sequence();
+        // Entry count is next_sequence - 1 (sequence starts at 1)
+        let entry_count = next_sequence.saturating_sub(1);
+        let latest_offset = wal.latest_offset().map(|o| o.as_u64());
+
+        Ok(json!({
+            "entry_count": entry_count,
+            "segment_count": segment_ids.len(),
+            "total_size_bytes": total_size,
+            "latest_offset": latest_offset,
+            "io_stats": {
+                "bytes_written": stats.bytes_written,
+                "bytes_read": stats.bytes_read,
+                "writes": stats.writes,
+                "reads": stats.reads,
+                "fsyncs": stats.fsyncs,
+            }
         }))
     }
 
@@ -1171,6 +1300,42 @@ mod tests {
     }
 
     #[test]
+    fn test_list_machines_sorted_alphabetically() {
+        let (_dir, handler, mut session) = test_handler();
+
+        // Create machines in non-alphabetical order
+        let machines = ["zebra", "apple", "mango", "banana"];
+        for name in machines {
+            let put_request = Request::new("1", Operation::PutMachine).with_params(json!({
+                "machine": name,
+                "version": 1,
+                "definition": {
+                    "states": ["pending", "done"],
+                    "initial": "pending",
+                    "transitions": [{"from": "pending", "event": "COMPLETE", "to": "done"}]
+                }
+            }));
+            handler.handle(&mut session, &put_request);
+        }
+
+        // List machines
+        let request = Request::new("2", Operation::ListMachines);
+        let response = handler.handle(&mut session, &request);
+
+        assert!(response.is_ok());
+        let result = response.result.unwrap();
+        let items = result["items"].as_array().unwrap();
+
+        // Verify they are sorted alphabetically
+        let names: Vec<&str> = items
+            .iter()
+            .map(|item| item["machine"].as_str().unwrap())
+            .collect();
+
+        assert_eq!(names, vec!["apple", "banana", "mango", "zebra"]);
+    }
+
+    #[test]
     fn test_get_machine_not_found() {
         let (_dir, handler, mut session) = test_handler();
 
@@ -1193,6 +1358,92 @@ mod tests {
         let response = handler.handle(&mut session, &request);
 
         assert!(response.is_error());
+    }
+
+    #[test]
+    fn test_list_instances() {
+        let (_dir, handler, mut session) = test_handler();
+
+        // Setup: put machine
+        let put_request = Request::new("1", Operation::PutMachine).with_params(json!({
+            "machine": "order",
+            "version": 1,
+            "definition": {
+                "states": ["created", "paid"],
+                "initial": "created",
+                "transitions": [{"from": "created", "event": "PAY", "to": "paid"}]
+            }
+        }));
+        handler.handle(&mut session, &put_request);
+
+        // Create multiple instances
+        for i in 1..=5 {
+            let create_request = Request::new(format!("{}", i + 1), Operation::CreateInstance)
+                .with_params(json!({
+                    "instance_id": format!("order-{}", i),
+                    "machine": "order",
+                    "version": 1
+                }));
+            handler.handle(&mut session, &create_request);
+        }
+
+        // Apply event to some instances to change their state
+        for i in 1..=3 {
+            let apply_request = Request::new(format!("{}", i + 10), Operation::ApplyEvent)
+                .with_params(json!({
+                    "instance_id": format!("order-{}", i),
+                    "event": "PAY"
+                }));
+            handler.handle(&mut session, &apply_request);
+        }
+
+        // List all instances
+        let list_request = Request::new("20", Operation::ListInstances);
+        let response = handler.handle(&mut session, &list_request);
+        assert!(response.is_ok());
+        let result = response.result.unwrap();
+        assert_eq!(result["total"], 5);
+        assert_eq!(result["instances"].as_array().unwrap().len(), 5);
+
+        // Filter by state = "paid"
+        let list_request = Request::new("21", Operation::ListInstances).with_params(json!({
+            "state": "paid"
+        }));
+        let response = handler.handle(&mut session, &list_request);
+        assert!(response.is_ok());
+        let result = response.result.unwrap();
+        assert_eq!(result["total"], 3);
+
+        // Filter by state = "created"
+        let list_request = Request::new("22", Operation::ListInstances).with_params(json!({
+            "state": "created"
+        }));
+        let response = handler.handle(&mut session, &list_request);
+        assert!(response.is_ok());
+        let result = response.result.unwrap();
+        assert_eq!(result["total"], 2);
+
+        // Test pagination
+        let list_request = Request::new("23", Operation::ListInstances).with_params(json!({
+            "limit": 2
+        }));
+        let response = handler.handle(&mut session, &list_request);
+        assert!(response.is_ok());
+        let result = response.result.unwrap();
+        assert_eq!(result["total"], 5);
+        assert_eq!(result["instances"].as_array().unwrap().len(), 2);
+        assert_eq!(result["has_more"], true);
+
+        // Test offset
+        let list_request = Request::new("24", Operation::ListInstances).with_params(json!({
+            "limit": 2,
+            "offset": 4
+        }));
+        let response = handler.handle(&mut session, &list_request);
+        assert!(response.is_ok());
+        let result = response.result.unwrap();
+        assert_eq!(result["instances"].as_array().unwrap().len(), 1);
+        assert_eq!(result["has_more"], false);
     }
 
     #[test]
@@ -1357,6 +1608,34 @@ mod tests {
     }
 
     #[test]
+    fn test_wal_stats() {
+        let (_dir, handler, mut session) = test_handler();
+
+        // Setup: create some WAL entries
+        let put_request = Request::new("1", Operation::PutMachine).with_params(json!({
+            "machine": "stats_test",
+            "version": 1,
+            "definition": {
+                "states": ["init"],
+                "initial": "init",
+                "transitions": []
+            }
+        }));
+        handler.handle(&mut session, &put_request);
+
+        let request = Request::new("2", Operation::WalStats);
+        let response = handler.handle(&mut session, &request);
+
+        assert!(response.is_ok());
+        let result = response.result.unwrap();
+        assert!(result["entry_count"].as_u64().unwrap() >= 1);
+        assert!(result["segment_count"].as_u64().is_some());
+        assert!(result["total_size_bytes"].as_u64().is_some());
+        assert!(result["io_stats"]["writes"].as_u64().is_some());
+        assert!(result["io_stats"]["fsyncs"].as_u64().is_some());
+    }
+
+    #[test]
     fn test_watch_and_unwatch() {
         let (_dir, handler, mut session) = test_handler_with_broadcaster();
 
@@ -1492,6 +1771,75 @@ mod tests {
         }));
         let response = handler.handle(&mut session, &apply_request);
         assert!(response.is_error());
+    }
+
+    #[test]
+    fn test_max_machine_versions_limit() {
+        let dir = TempDir::new().unwrap();
+        let config = WalConfig::new(dir.path())
+            .with_segment_size(4096)
+            .with_fsync_policy(FsyncPolicy::EveryWrite);
+        let engine = Arc::new(StateMachineEngine::new(config).unwrap());
+        let handler = CommandHandler::new(engine).with_max_machine_versions(2);
+        let mut session = Session::new(
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 12345),
+            false,
+        );
+
+        // Create version 1
+        let request = Request::new("1", Operation::PutMachine).with_params(json!({
+            "machine": "limited",
+            "version": 1,
+            "definition": {
+                "states": ["init"],
+                "initial": "init",
+                "transitions": []
+            }
+        }));
+        let response = handler.handle(&mut session, &request);
+        assert!(response.is_ok());
+
+        // Create version 2
+        let request = Request::new("2", Operation::PutMachine).with_params(json!({
+            "machine": "limited",
+            "version": 2,
+            "definition": {
+                "states": ["init"],
+                "initial": "init",
+                "transitions": []
+            }
+        }));
+        let response = handler.handle(&mut session, &request);
+        assert!(response.is_ok());
+
+        // Create version 3 should fail (limit is 2)
+        let request = Request::new("3", Operation::PutMachine).with_params(json!({
+            "machine": "limited",
+            "version": 3,
+            "definition": {
+                "states": ["init"],
+                "initial": "init",
+                "transitions": []
+            }
+        }));
+        let response = handler.handle(&mut session, &request);
+        assert!(response.is_error());
+
+        // But re-submitting existing version 1 with same definition should work (idempotent)
+        let request = Request::new("4", Operation::PutMachine).with_params(json!({
+            "machine": "limited",
+            "version": 1,
+            "definition": {
+                "states": ["init"],
+                "initial": "init",
+                "transitions": []
+            }
+        }));
+        let response = handler.handle(&mut session, &request);
+        assert!(response.is_ok());
+        // Check that created=false (idempotent)
+        let result = response.result.unwrap();
+        assert_eq!(result["created"], false);
     }
 
     #[test]

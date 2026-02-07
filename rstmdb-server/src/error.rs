@@ -33,6 +33,9 @@ pub enum ServerError {
     #[error("invalid request: {0}")]
     InvalidRequest(String),
 
+    #[error("machine version limit exceeded: {0}")]
+    MachineVersionLimitExceeded(String),
+
     #[error("server shutting down")]
     ShuttingDown,
 
@@ -66,6 +69,7 @@ impl ServerError {
             ServerError::NotAuthenticated => ErrorCode::Unauthorized,
             ServerError::AuthFailed(_) => ErrorCode::AuthFailed,
             ServerError::InvalidRequest(_) => ErrorCode::BadRequest,
+            ServerError::MachineVersionLimitExceeded(_) => ErrorCode::MachineVersionLimitExceeded,
             ServerError::ShuttingDown => ErrorCode::InternalError,
             ServerError::TlsConfig(_) => ErrorCode::InternalError,
             ServerError::TlsHandshake(_) => ErrorCode::InternalError,

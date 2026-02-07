@@ -262,6 +262,24 @@ impl StateMachineEngine {
         result
     }
 
+    /// Gets all versions for a specific machine.
+    pub fn get_machine_versions(&self, name: &str) -> Vec<u32> {
+        let mut versions: Vec<u32> = self
+            .definitions
+            .iter()
+            .filter_map(|entry| {
+                let (n, v) = entry.key();
+                if n == name {
+                    Some(*v)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        versions.sort();
+        versions
+    }
+
     // =========================================================================
     // Instance Management
     // =========================================================================

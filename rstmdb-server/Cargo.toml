@@ -1,7 +1,7 @@
 [package]
 name = "rstmdb-server"
 description = "TCP server for rstmdb - connection handling, command dispatch, sessions"
-version.workspace = true
+version = "0.1.1"
 edition.workspace = true
 repository.workspace = true
 license-file = "../LICENSE"

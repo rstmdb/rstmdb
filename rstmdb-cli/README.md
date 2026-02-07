@@ -79,7 +79,7 @@ SM.DELETE <id>                   # Delete state machine
 ```
 INST.CREATE <sm_id> <data>       # Create instance
 INST.GET <id>                    # Get instance details
-INST.LIST [sm_id]                # List instances
+INST.LIST [machine] [state]      # List instances with optional filters
 INST.DELETE <id>                 # Delete instance
 ```
 
@@ -88,6 +88,13 @@ INST.DELETE <id>                 # Delete instance
 ```
 EVENT.APPLY <inst_id> <event> [payload]   # Apply event
 HISTORY <inst_id>                          # Get event history
+```
+
+### WAL Operations
+
+```
+WAL [from] [limit]               # Read WAL entries
+WAL-STATS                        # Show WAL statistics
 ```
 
 ## Configuration
