@@ -2,7 +2,7 @@
 name = "rstmdb"
 version = "0.1.1"
 edition = "2021"
-license-file = "BSL-1.1"
+license = "BSL-1.1"
 description = "A state machine database with WAL durability"
 readme = "README.md"
 homepage = "https://github.com/rstmdb/rstmdb"
