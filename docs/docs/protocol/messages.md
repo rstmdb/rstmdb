@@ -25,8 +25,8 @@ All requests have these fields:
 |-------|------|----------|-------------|
 | `type` | string | Yes | Always `"request"` |
 | `id` | string | Yes | Unique request identifier |
-| `op` | string | Yes | Operation name |
-| `params` | object | No | Operation parameters |
+| `op` | string | Yes | Operation name (`SCREAMING_SNAKE_CASE`) |
+| `params` | object | No | Operation parameters (defaults to `{}`) |
 
 ### Operation List
 
@@ -66,7 +66,9 @@ All requests have these fields:
   "result": { /* operation result */ },
   "meta": {
     "server_time": "2024-01-15T10:30:00Z",
-    "wal_offset": 12345
+    "leader": true,
+    "wal_offset": 12345,
+    "trace_id": "abc-123"
   }
 }
 ```
@@ -77,7 +79,7 @@ All requests have these fields:
 | `id` | string | Matches request id |
 | `status` | string | `"ok"` for success |
 | `result` | object | Operation result |
-| `meta` | object | Response metadata |
+| `meta` | object | Response metadata (optional, omitted if empty) |
 
 ### Error Response
 
@@ -97,30 +99,28 @@ All requests have these fields:
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `error.code` | string | Machine-readable error code |
+| `error.code` | string | Machine-readable error code (`SCREAMING_SNAKE_CASE`) |
 | `error.message` | string | Human-readable description |
 | `error.retryable` | boolean | Whether retry may succeed |
 | `error.details` | object | Additional error context |
 
 ## Event Messages
 
-Sent asynchronously for active subscriptions:
+Sent asynchronously for active subscriptions. Event fields are **top-level** (not nested inside an `event` object):
 
 ```json
 {
   "type": "event",
   "subscription_id": "sub-123",
-  "event": {
-    "instance_id": "order-001",
-    "machine": "order",
-    "version": 1,
-    "event": "PAY",
-    "from_state": "pending",
-    "to_state": "paid",
-    "payload": {"amount": 99.99},
-    "timestamp": "2024-01-15T10:30:00Z",
-    "wal_offset": 12345
-  }
+  "instance_id": "order-001",
+  "machine": "order",
+  "version": 1,
+  "event": "PAY",
+  "from_state": "pending",
+  "to_state": "paid",
+  "payload": {"amount": 99.99},
+  "ctx": {"customer": "alice", "amount": 99.99},
+  "wal_offset": 12345
 }
 ```
 
@@ -128,7 +128,15 @@ Sent asynchronously for active subscriptions:
 |-------|------|-------------|
 | `type` | string | Always `"event"` |
 | `subscription_id` | string | Subscription identifier |
-| `event` | object | Event details |
+| `instance_id` | string | Affected instance |
+| `machine` | string | Machine name |
+| `version` | integer | Machine version |
+| `event` | string | Event name that triggered the transition |
+| `from_state` | string | State before transition |
+| `to_state` | string | State after transition |
+| `payload` | object | Event payload (null if absent) |
+| `ctx` | object | Instance context after transition (only if `include_ctx: true`) |
+| `wal_offset` | integer | WAL offset of this event |
 
 ## Detailed Operation Messages
 
@@ -143,7 +151,8 @@ Sent asynchronously for active subscriptions:
   "params": {
     "protocol_version": 1,
     "client_name": "my-app",
-    "client_version": "1.0.0"
+    "wire_modes": ["binary_json", "jsonl"],
+    "features": ["idempotency", "batch", "wal_read"]
   }
 }
 ```
@@ -156,12 +165,16 @@ Sent asynchronously for active subscriptions:
   "status": "ok",
   "result": {
     "protocol_version": 1,
-    "server_version": "0.1.0",
-    "auth_required": false,
-    "features": ["subscriptions", "batch"]
+    "wire_mode": "binary_json",
+    "server_name": "rstmdb",
+    "server_version": "0.1.1",
+    "features": ["idempotency", "batch", "wal_read"]
   }
 }
 ```
+
+- `wire_modes` is a priority-ordered list; the server picks the first supported mode.
+- `features` are intersection-negotiated (server returns supported subset).
 
 ### AUTH
 
@@ -172,6 +185,7 @@ Sent asynchronously for active subscriptions:
   "id": "2",
   "op": "AUTH",
   "params": {
+    "method": "bearer",
     "token": "secret-token"
   }
 }
@@ -189,6 +203,8 @@ Sent asynchronously for active subscriptions:
 }
 ```
 
+- Only `"bearer"` method is currently supported.
+
 ### PUT_MACHINE
 
 **Request:**
@@ -198,7 +214,7 @@ Sent asynchronously for active subscriptions:
   "id": "3",
   "op": "PUT_MACHINE",
   "params": {
-    "name": "order",
+    "machine": "order",
     "version": 1,
     "definition": {
       "states": ["pending", "paid", "shipped"],
@@ -207,7 +223,8 @@ Sent asynchronously for active subscriptions:
         {"from": "pending", "event": "PAY", "to": "paid"},
         {"from": "paid", "event": "SHIP", "to": "shipped"}
       ]
-    }
+    },
+    "checksum": "optional-sha256-hex"
   }
 }
 ```
@@ -219,12 +236,15 @@ Sent asynchronously for active subscriptions:
   "id": "3",
   "status": "ok",
   "result": {
-    "name": "order",
+    "machine": "order",
     "version": 1,
+    "stored_checksum": "a1b2c3...",
     "created": true
   }
 }
 ```
+
+- `created: false` when re-submitting an identical definition (idempotent).
 
 ### CREATE_INSTANCE
 
@@ -235,10 +255,10 @@ Sent asynchronously for active subscriptions:
   "id": "4",
   "op": "CREATE_INSTANCE",
   "params": {
+    "instance_id": "order-001",
     "machine": "order",
     "version": 1,
-    "id": "order-001",
-    "context": {"customer": "alice"},
+    "initial_ctx": {"customer": "alice"},
     "idempotency_key": "create-order-001"
   }
 }
@@ -251,15 +271,15 @@ Sent asynchronously for active subscriptions:
   "id": "4",
   "status": "ok",
   "result": {
-    "id": "order-001",
-    "machine": "order",
-    "version": 1,
+    "instance_id": "order-001",
     "state": "pending",
-    "context": {"customer": "alice"},
-    "created": true
+    "wal_offset": 1
   }
 }
 ```
+
+- `instance_id` is optional — a UUID v4 is auto-generated if omitted.
+- `initial_ctx` is optional (defaults to `{}`).
 
 ### APPLY_EVENT
 
@@ -273,6 +293,9 @@ Sent asynchronously for active subscriptions:
     "instance_id": "order-001",
     "event": "PAY",
     "payload": {"amount": 99.99},
+    "expected_state": "pending",
+    "expected_wal_offset": 1,
+    "event_id": "evt-unique-id",
     "idempotency_key": "pay-order-001"
   }
 }
@@ -285,19 +308,21 @@ Sent asynchronously for active subscriptions:
   "id": "5",
   "status": "ok",
   "result": {
-    "previous_state": "pending",
-    "current_state": "paid",
-    "transition": {
-      "from": "pending",
-      "event": "PAY",
-      "to": "paid"
-    }
-  },
-  "meta": {
-    "wal_offset": 12345
+    "from_state": "pending",
+    "to_state": "paid",
+    "ctx": {
+      "customer": "alice",
+      "amount": 99.99
+    },
+    "wal_offset": 5,
+    "applied": true,
+    "event_id": "evt-unique-id"
   }
 }
 ```
+
+- `applied: false` means the event was a duplicate idempotency key replay.
+- `expected_state` and `expected_wal_offset` enable optimistic concurrency.
 
 ### WATCH_ALL
 
@@ -310,6 +335,7 @@ Sent asynchronously for active subscriptions:
   "params": {
     "machines": ["order"],
     "to_states": ["shipped", "delivered"],
+    "include_ctx": true,
     "from_offset": 0
   }
 }
@@ -322,23 +348,26 @@ Sent asynchronously for active subscriptions:
   "id": "6",
   "status": "ok",
   "result": {
-    "subscription_id": "sub-abc123"
+    "subscription_id": "sub-abc123",
+    "wal_offset": 42
   }
 }
 ```
 
-**Subsequent events:**
+**Subsequent events (top-level fields, not nested):**
 ```json
 {
   "type": "event",
   "subscription_id": "sub-abc123",
-  "event": {
-    "instance_id": "order-001",
-    "event": "SHIP",
-    "from_state": "paid",
-    "to_state": "shipped",
-    "timestamp": "2024-01-15T10:30:00Z"
-  }
+  "instance_id": "order-001",
+  "machine": "order",
+  "version": 1,
+  "event": "SHIP",
+  "from_state": "paid",
+  "to_state": "shipped",
+  "payload": {},
+  "ctx": {"customer": "alice", "amount": 99.99},
+  "wal_offset": 43
 }
 ```
 
@@ -351,8 +380,8 @@ Sent asynchronously for active subscriptions:
   "id": "7",
   "op": "BATCH",
   "params": {
-    "mode": "atomic",
-    "operations": [
+    "mode": "best_effort",
+    "ops": [
       {
         "op": "APPLY_EVENT",
         "params": {"instance_id": "order-001", "event": "PAY"}
@@ -374,12 +403,15 @@ Sent asynchronously for active subscriptions:
   "status": "ok",
   "result": {
     "results": [
-      {"status": "ok", "result": {"current_state": "paid"}},
-      {"status": "ok", "result": {"current_state": "paid"}}
+      {"status": "ok", "result": {"from_state": "pending", "to_state": "paid", "ctx": {}, "wal_offset": 10, "applied": true}},
+      {"status": "ok", "result": {"from_state": "pending", "to_state": "paid", "ctx": {}, "wal_offset": 11, "applied": true}}
     ]
   }
 }
 ```
+
+- Batch operations array field is `ops` (not `operations`).
+- Max ops per batch: 100 (server default).
 
 ## Request ID Requirements
 

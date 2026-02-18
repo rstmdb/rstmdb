@@ -24,7 +24,7 @@ Reads entries from the Write-Ahead Log.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `from_offset` | integer | No | Starting offset (default: 0) |
+| `from_offset` | integer | Yes | Starting offset |
 | `limit` | integer | No | Max entries (default: 100, max: 1000) |
 
 ### Response
@@ -33,57 +33,67 @@ Reads entries from the Write-Ahead Log.
 {
   "status": "ok",
   "result": {
-    "entries": [
+    "records": [
       {
-        "offset": 1,
-        "type": "PutMachine",
-        "timestamp": "2024-01-15T10:00:00Z",
-        "data": {
-          "name": "order",
+        "sequence": 1,
+        "offset": 0,
+        "entry": {
+          "type": "put_machine",
+          "machine": "order",
           "version": 1,
+          "definition_hash": "a1b2c3...",
           "definition": {...}
         }
       },
       {
-        "offset": 2,
-        "type": "CreateInstance",
-        "timestamp": "2024-01-15T10:01:00Z",
-        "data": {
-          "id": "order-001",
+        "sequence": 2,
+        "offset": 1,
+        "entry": {
+          "type": "create_instance",
+          "instance_id": "order-001",
           "machine": "order",
           "version": 1,
-          "context": {}
+          "initial_state": "pending",
+          "initial_ctx": {}
         }
       },
       {
-        "offset": 3,
-        "type": "ApplyEvent",
-        "timestamp": "2024-01-15T10:02:00Z",
-        "data": {
+        "sequence": 3,
+        "offset": 2,
+        "entry": {
+          "type": "apply_event",
           "instance_id": "order-001",
           "event": "PAY",
           "from_state": "pending",
           "to_state": "paid",
-          "payload": {"amount": 99.99}
+          "payload": {"amount": 99.99},
+          "ctx": {"customer": "alice", "amount": 99.99}
         }
       }
     ],
-    "next_offset": 101,
-    "has_more": true
+    "next_offset": 3
   }
 }
 ```
+
+### Record Fields
+
+| Field | Description |
+|-------|-------------|
+| `sequence` | Monotonically increasing sequence number |
+| `offset` | WAL offset |
+| `entry` | Entry payload with `type` discriminator |
 
 ### Entry Types
 
 | Type | Description |
 |------|-------------|
-| `PutMachine` | Machine definition registration |
-| `CreateInstance` | Instance creation |
-| `ApplyEvent` | Event application |
-| `DeleteInstance` | Instance deletion |
-| `Snapshot` | Snapshot marker |
-| `Checkpoint` | Recovery checkpoint |
+| `put_machine` | Machine definition registration |
+| `create_instance` | Instance creation |
+| `apply_event` | Event application |
+| `delete_instance` | Instance deletion |
+| `snapshot` | Snapshot marker |
+| `checkpoint` | Recovery checkpoint |
 
 ### Pagination
 
@@ -91,7 +101,7 @@ Use `next_offset` for pagination:
 
 ```json
 // First page
-{"op": "WAL_READ", "params": {"limit": 100}}
+{"op": "WAL_READ", "params": {"from_offset": 0, "limit": 100}}
 // Response: next_offset = 100
 
 // Second page
@@ -119,41 +129,38 @@ Returns WAL statistics.
 {
   "status": "ok",
   "result": {
-    "current_offset": 50000,
-    "first_offset": 1000,
+    "entry_count": 50000,
     "segment_count": 3,
     "total_size_bytes": 157286400,
-    "segments": [
-      {
-        "id": 1,
-        "first_offset": 1000,
-        "last_offset": 20000,
-        "size_bytes": 67108864
-      },
-      {
-        "id": 2,
-        "first_offset": 20001,
-        "last_offset": 40000,
-        "size_bytes": 67108864
-      },
-      {
-        "id": 3,
-        "first_offset": 40001,
-        "last_offset": 50000,
-        "size_bytes": 23068672
-      }
-    ]
+    "latest_offset": 49999,
+    "io_stats": {
+      "bytes_written": 157286400,
+      "bytes_read": 52428800,
+      "writes": 50000,
+      "reads": 10000,
+      "fsyncs": 50000
+    }
   }
 }
 ```
 
 | Field | Description |
 |-------|-------------|
-| `current_offset` | Latest WAL offset |
-| `first_offset` | Oldest available offset |
+| `entry_count` | Total number of WAL entries |
 | `segment_count` | Number of segment files |
-| `total_size_bytes` | Total WAL size |
-| `segments` | Per-segment details |
+| `total_size_bytes` | Total WAL size on disk |
+| `latest_offset` | Latest (highest) WAL offset |
+| `io_stats` | I/O statistics |
+
+### I/O Statistics
+
+| Field | Description |
+|-------|-------------|
+| `bytes_written` | Total bytes written to WAL |
+| `bytes_read` | Total bytes read from WAL |
+| `writes` | Number of write operations |
+| `reads` | Number of read operations |
+| `fsyncs` | Number of fsync operations |
 
 ---
 
@@ -182,14 +189,22 @@ Creates a snapshot of a specific instance.
 {
   "status": "ok",
   "result": {
-    "snapshot_id": "snap-abc123",
     "instance_id": "order-001",
+    "snapshot_id": "snap-abc123",
     "wal_offset": 12345,
-    "state": "paid",
-    "created_at": "2024-01-15T10:30:00Z"
+    "size_bytes": 1024,
+    "checksum": "a1b2c3..."
   }
 }
 ```
+
+| Field | Description |
+|-------|-------------|
+| `instance_id` | Instance that was snapshotted |
+| `snapshot_id` | Unique snapshot identifier |
+| `wal_offset` | WAL offset at time of snapshot |
+| `size_bytes` | Snapshot size (only if snapshot store configured) |
+| `checksum` | SHA-256 of snapshot data (only if snapshot store configured) |
 
 ### Errors
 
@@ -207,9 +222,16 @@ Triggers WAL compaction.
 
 ```json
 {
-  "op": "COMPACT"
+  "op": "COMPACT",
+  "params": {
+    "force_snapshot": false
+  }
 }
 ```
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `force_snapshot` | boolean | No | Re-snapshot all instances even if unchanged (default: `false`) |
 
 ### Response
 
@@ -217,17 +239,26 @@ Triggers WAL compaction.
 {
   "status": "ok",
   "result": {
-    "started": true,
-    "previous_size_bytes": 314572800,
-    "previous_segment_count": 5,
-    "compaction_id": "compact-xyz789"
+    "snapshots_created": 5,
+    "segments_deleted": 2,
+    "bytes_reclaimed": 134217728,
+    "total_snapshots": 10,
+    "wal_segments": 1
   }
 }
 ```
 
+| Field | Description |
+|-------|-------------|
+| `snapshots_created` | Number of new snapshots created |
+| `segments_deleted` | Number of old WAL segments removed |
+| `bytes_reclaimed` | Disk space freed |
+| `total_snapshots` | Total snapshots after compaction |
+| `wal_segments` | Remaining WAL segment count |
+
 ### Compaction Process
 
-1. Create snapshot of all instances
+1. Create snapshot of all instances (or only changed ones unless `force_snapshot`)
 2. Record snapshot offset in WAL
 3. Delete segments before snapshot offset
 4. Update segment index
@@ -235,14 +266,16 @@ Triggers WAL compaction.
 ```
 Before:
   [Seg 1] [Seg 2] [Seg 3] [Seg 4] [Seg 5]
-                    ↑
+                    ^
                  snapshot
 
 After:
                   [Seg 3'] [Seg 4] [Seg 5]
-                    ↑
+                    ^
                  snapshot
 ```
+
+Requires a snapshot store to be configured on the server.
 
 ### Automatic Compaction
 
@@ -270,15 +303,17 @@ offset=0
 while true; do
   result=$(rstmdb-cli wal-read --from-offset $offset --limit 1000 --json)
 
-  entries=$(echo "$result" | jq '.entries')
-  echo "$entries" >> wal-backup.json
+  records=$(echo "$result" | jq '.records')
+  echo "$records" >> wal-backup.json
 
-  has_more=$(echo "$result" | jq '.has_more')
-  if [ "$has_more" = "false" ]; then
+  next=$(echo "$result" | jq '.next_offset')
+  count=$(echo "$records" | jq 'length')
+
+  if [ "$count" -lt 1000 ]; then
     break
   fi
 
-  offset=$(echo "$result" | jq '.next_offset')
+  offset=$next
 done
 ```
 
@@ -314,11 +349,11 @@ async function replayWAL(client, handler) {
       limit: 1000
     });
 
-    for (const entry of result.entries) {
-      await handler(entry);
+    for (const record of result.records) {
+      await handler(record.entry);
     }
 
-    if (!result.has_more) {
+    if (result.records.length < 1000) {
       break;
     }
 
@@ -326,11 +361,11 @@ async function replayWAL(client, handler) {
   }
 }
 
-// Example: Count events by type
+// Example: Count entries by type
 const counts = {};
 await replayWAL(client, (entry) => {
   counts[entry.type] = (counts[entry.type] || 0) + 1;
 });
 console.log(counts);
-// {PutMachine: 5, CreateInstance: 1000, ApplyEvent: 5000}
+// {put_machine: 5, create_instance: 1000, apply_event: 5000}
 ```

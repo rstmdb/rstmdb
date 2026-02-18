@@ -22,11 +22,11 @@ Complete reference for all rstmdb API commands.
 ### Session Management
 
 ```json
-// HELLO - Handshake
-{"op": "HELLO", "params": {"protocol_version": 1}}
+// HELLO - Handshake (must be first message)
+{"op": "HELLO", "params": {"protocol_version": 1, "wire_modes": ["binary_json"]}}
 
 // AUTH - Authenticate
-{"op": "AUTH", "params": {"token": "secret"}}
+{"op": "AUTH", "params": {"method": "bearer", "token": "secret"}}
 
 // PING - Health check
 {"op": "PING"}
@@ -43,16 +43,16 @@ Complete reference for all rstmdb API commands.
 ```json
 // PUT_MACHINE - Register machine
 {"op": "PUT_MACHINE", "params": {
-  "name": "order",
+  "machine": "order",
   "version": 1,
   "definition": {"states": [...], "initial": "...", "transitions": [...]}
 }}
 
 // GET_MACHINE - Get machine
-{"op": "GET_MACHINE", "params": {"name": "order", "version": 1}}
+{"op": "GET_MACHINE", "params": {"machine": "order", "version": 1}}
 
 // LIST_MACHINES - List all machines
-{"op": "LIST_MACHINES", "params": {"limit": 100, "offset": 0}}
+{"op": "LIST_MACHINES"}
 ```
 
 ### Instance Operations
@@ -62,12 +62,12 @@ Complete reference for all rstmdb API commands.
 {"op": "CREATE_INSTANCE", "params": {
   "machine": "order",
   "version": 1,
-  "id": "order-001",
-  "context": {"customer": "alice"}
+  "instance_id": "order-001",
+  "initial_ctx": {"customer": "alice"}
 }}
 
 // GET_INSTANCE
-{"op": "GET_INSTANCE", "params": {"id": "order-001"}}
+{"op": "GET_INSTANCE", "params": {"instance_id": "order-001"}}
 
 // LIST_INSTANCES
 {"op": "LIST_INSTANCES", "params": {
@@ -77,7 +77,7 @@ Complete reference for all rstmdb API commands.
 }}
 
 // DELETE_INSTANCE
-{"op": "DELETE_INSTANCE", "params": {"id": "order-001"}}
+{"op": "DELETE_INSTANCE", "params": {"instance_id": "order-001"}}
 ```
 
 ### Event Operations
@@ -92,8 +92,8 @@ Complete reference for all rstmdb API commands.
 
 // BATCH
 {"op": "BATCH", "params": {
-  "mode": "atomic",
-  "operations": [
+  "mode": "best_effort",
+  "ops": [
     {"op": "APPLY_EVENT", "params": {...}},
     {"op": "APPLY_EVENT", "params": {...}}
   ]
@@ -104,12 +104,13 @@ Complete reference for all rstmdb API commands.
 
 ```json
 // WATCH_INSTANCE
-{"op": "WATCH_INSTANCE", "params": {"instance_id": "order-001"}}
+{"op": "WATCH_INSTANCE", "params": {"instance_id": "order-001", "include_ctx": true}}
 
 // WATCH_ALL
 {"op": "WATCH_ALL", "params": {
   "machines": ["order"],
-  "to_states": ["shipped"]
+  "to_states": ["shipped"],
+  "include_ctx": true
 }}
 
 // UNWATCH
@@ -120,24 +121,27 @@ Complete reference for all rstmdb API commands.
 
 ```json
 // WAL_READ
-{"op": "WAL_READ", "params": {"limit": 100, "from_offset": 0}}
+{"op": "WAL_READ", "params": {"from_offset": 0, "limit": 100}}
 
 // WAL_STATS
 {"op": "WAL_STATS"}
 
+// SNAPSHOT_INSTANCE
+{"op": "SNAPSHOT_INSTANCE", "params": {"instance_id": "order-001"}}
+
 // COMPACT
-{"op": "COMPACT"}
+{"op": "COMPACT", "params": {"force_snapshot": false}}
 ```
 
 ## Common Parameters
 
 ### Pagination
 
-Many list operations support pagination:
+List operations support pagination:
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
-| `limit` | integer | Maximum items to return (default: 100, max: 1000) |
+| `limit` | integer | Maximum items to return (default: 100) |
 | `offset` | integer | Number of items to skip |
 
 ### Idempotency
@@ -155,14 +159,15 @@ Idempotency keys:
 
 ## Response Metadata
 
-All responses include metadata:
+Responses may include optional metadata:
 
 ```json
 {
   "meta": {
     "server_time": "2024-01-15T10:30:00Z",
+    "leader": true,
     "wal_offset": 12345,
-    "request_duration_ms": 5
+    "trace_id": "abc-123"
   }
 }
 ```
@@ -170,5 +175,8 @@ All responses include metadata:
 | Field | Description |
 |-------|-------------|
 | `server_time` | Server timestamp (ISO 8601) |
+| `leader` | Whether this node is the leader |
 | `wal_offset` | WAL position after operation |
-| `request_duration_ms` | Processing time in milliseconds |
+| `trace_id` | Request trace identifier |
+
+Meta is omitted if empty.

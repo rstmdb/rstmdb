@@ -16,10 +16,10 @@ Creates a new instance of a state machine.
 {
   "op": "CREATE_INSTANCE",
   "params": {
+    "instance_id": "order-001",
     "machine": "order",
     "version": 1,
-    "id": "order-001",
-    "context": {
+    "initial_ctx": {
       "customer": "alice",
       "total": 99.99
     },
@@ -30,10 +30,10 @@ Creates a new instance of a state machine.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
+| `instance_id` | string | No | Unique instance ID (auto-generated UUID if omitted) |
 | `machine` | string | Yes | Machine name |
 | `version` | integer | Yes | Machine version |
-| `id` | string | Yes | Unique instance ID |
-| `context` | object | No | Initial context (default: {}) |
+| `initial_ctx` | object | No | Initial context (default: `{}`) |
 | `idempotency_key` | string | No | Deduplication key |
 
 ### Response
@@ -42,24 +42,18 @@ Creates a new instance of a state machine.
 {
   "status": "ok",
   "result": {
-    "id": "order-001",
-    "machine": "order",
-    "version": 1,
+    "instance_id": "order-001",
     "state": "pending",
-    "context": {
-      "customer": "alice",
-      "total": 99.99
-    },
-    "created": true,
-    "created_at": "2024-01-15T10:30:00Z"
+    "wal_offset": 1
   }
 }
 ```
 
 | Field | Description |
 |-------|-------------|
-| `created` | True if newly created, false if idempotent duplicate |
+| `instance_id` | Instance ID (provided or auto-generated) |
 | `state` | Initial state from machine definition |
+| `wal_offset` | WAL offset of the creation event |
 
 ### Errors
 
@@ -80,14 +74,14 @@ Retrieves an instance's current state and context.
 {
   "op": "GET_INSTANCE",
   "params": {
-    "id": "order-001"
+    "instance_id": "order-001"
   }
 }
 ```
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `id` | string | Yes | Instance ID |
+| `instance_id` | string | Yes | Instance ID |
 
 ### Response
 
@@ -95,27 +89,28 @@ Retrieves an instance's current state and context.
 {
   "status": "ok",
   "result": {
-    "id": "order-001",
     "machine": "order",
     "version": 1,
     "state": "paid",
-    "context": {
+    "ctx": {
       "customer": "alice",
       "total": 99.99,
       "payment_id": "pay-123"
     },
-    "created_at": "2024-01-15T10:30:00Z",
-    "updated_at": "2024-01-15T11:00:00Z",
-    "wal_offset": 12345
+    "last_event_id": "evt-xyz",
+    "last_wal_offset": 5
   }
 }
 ```
 
 | Field | Description |
 |-------|-------------|
+| `machine` | Machine name |
+| `version` | Machine version |
 | `state` | Current state |
-| `context` | Current context |
-| `wal_offset` | WAL position of last update |
+| `ctx` | Current context |
+| `last_event_id` | ID of last applied event (if set) |
+| `last_wal_offset` | WAL offset of last update |
 
 ### Errors
 
@@ -136,7 +131,6 @@ Lists instances with optional filtering.
   "op": "LIST_INSTANCES",
   "params": {
     "machine": "order",
-    "version": 1,
     "state": "pending",
     "limit": 100,
     "offset": 0
@@ -147,7 +141,6 @@ Lists instances with optional filtering.
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `machine` | string | No | Filter by machine name |
-| `version` | integer | No | Filter by machine version |
 | `state` | string | No | Filter by current state |
 | `limit` | integer | No | Max items (default: 100) |
 | `offset` | integer | No | Skip items (default: 0) |
@@ -164,16 +157,18 @@ Lists instances with optional filtering.
         "machine": "order",
         "version": 1,
         "state": "pending",
-        "created_at": "2024-01-15T10:30:00Z",
-        "updated_at": "2024-01-15T10:30:00Z"
+        "created_at": 1705312200,
+        "updated_at": 1705312201,
+        "last_wal_offset": 5
       },
       {
         "id": "order-002",
         "machine": "order",
         "version": 1,
         "state": "pending",
-        "created_at": "2024-01-15T10:35:00Z",
-        "updated_at": "2024-01-15T10:35:00Z"
+        "created_at": 1705312500,
+        "updated_at": 1705312500,
+        "last_wal_offset": 8
       }
     ],
     "total": 50,
@@ -196,14 +191,16 @@ Soft-deletes an instance.
 {
   "op": "DELETE_INSTANCE",
   "params": {
-    "id": "order-001"
+    "instance_id": "order-001",
+    "idempotency_key": "optional-key"
   }
 }
 ```
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `id` | string | Yes | Instance ID |
+| `instance_id` | string | Yes | Instance ID |
+| `idempotency_key` | string | No | Deduplication key |
 
 ### Response
 
@@ -211,7 +208,9 @@ Soft-deletes an instance.
 {
   "status": "ok",
   "result": {
-    "deleted": true
+    "instance_id": "order-001",
+    "deleted": true,
+    "wal_offset": 10
   }
 }
 ```
@@ -242,8 +241,8 @@ Soft-deletes an instance.
   "params": {
     "machine": "order",
     "version": 1,
-    "id": "order-2024-001",
-    "context": {
+    "instance_id": "order-2024-001",
+    "initial_ctx": {
       "customer": {
         "id": "cust-123",
         "name": "Alice Smith",
@@ -302,12 +301,12 @@ Soft-deletes an instance.
   "params": {
     "machine": "order",
     "version": 1,
-    "id": "order-001",
-    "context": {},
+    "instance_id": "order-001",
+    "initial_ctx": {},
     "idempotency_key": "create-order-001-abc123"
   }
 }
-// Response: {"result": {"created": true}}
+// Response: {"result": {"instance_id": "order-001", "state": "pending", "wal_offset": 1}}
 
 // Retry with same key - returns same result
 {
@@ -315,10 +314,10 @@ Soft-deletes an instance.
   "params": {
     "machine": "order",
     "version": 1,
-    "id": "order-001",
-    "context": {},
+    "instance_id": "order-001",
+    "initial_ctx": {},
     "idempotency_key": "create-order-001-abc123"
   }
 }
-// Response: {"result": {"created": false}}  // Cached result
+// Response: cached result from first call
 ```

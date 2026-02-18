@@ -8,7 +8,7 @@ Commands for managing client sessions.
 
 ## HELLO
 
-Initiates a connection and negotiates protocol version.
+Initiates a connection and negotiates protocol version and wire mode.
 
 **Must be the first command sent on a new connection.**
 
@@ -20,8 +20,8 @@ Initiates a connection and negotiates protocol version.
   "params": {
     "protocol_version": 1,
     "client_name": "my-app",
-    "client_version": "1.0.0",
-    "features": ["subscriptions"]
+    "wire_modes": ["binary_json", "jsonl"],
+    "features": ["idempotency", "batch", "wal_read"]
   }
 }
 ```
@@ -30,7 +30,7 @@ Initiates a connection and negotiates protocol version.
 |-----------|------|----------|-------------|
 | `protocol_version` | integer | Yes | Requested protocol version |
 | `client_name` | string | No | Client application name |
-| `client_version` | string | No | Client version |
+| `wire_modes` | string[] | No | Preferred wire modes (priority-ordered) |
 | `features` | string[] | No | Requested features |
 
 ### Response
@@ -40,14 +40,10 @@ Initiates a connection and negotiates protocol version.
   "status": "ok",
   "result": {
     "protocol_version": 1,
-    "server_version": "0.1.0",
-    "auth_required": true,
-    "features": ["subscriptions", "batch"],
-    "limits": {
-      "max_frame_size": 16777216,
-      "max_instances_per_list": 1000,
-      "max_subscriptions": 100
-    }
+    "wire_mode": "binary_json",
+    "server_name": "rstmdb",
+    "server_version": "0.1.1",
+    "features": ["idempotency", "batch", "wal_read"]
   }
 }
 ```
@@ -55,10 +51,10 @@ Initiates a connection and negotiates protocol version.
 | Field | Description |
 |-------|-------------|
 | `protocol_version` | Negotiated version |
+| `wire_mode` | Selected wire mode from client's priority list |
+| `server_name` | Server name |
 | `server_version` | Server version string |
-| `auth_required` | Whether AUTH is required |
-| `features` | Available features |
-| `limits` | Server limits |
+| `features` | Intersection of requested and available features |
 
 ### Errors
 
@@ -78,6 +74,7 @@ Authenticates the session with a bearer token.
 {
   "op": "AUTH",
   "params": {
+    "method": "bearer",
     "token": "your-secret-token"
   }
 }
@@ -85,6 +82,7 @@ Authenticates the session with a bearer token.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
+| `method` | string | Yes | Authentication method (only `"bearer"` supported) |
 | `token` | string | Yes | Bearer token |
 
 ### Response
@@ -93,8 +91,7 @@ Authenticates the session with a bearer token.
 {
   "status": "ok",
   "result": {
-    "authenticated": true,
-    "permissions": ["read", "write", "admin"]
+    "authenticated": true
   }
 }
 ```
@@ -114,6 +111,8 @@ Tokens are validated against SHA-256 hashes stored in the server config:
 rstmdb-cli hash-token my-secret-token
 # Output: 9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08
 ```
+
+Multiple tokens can be configured simultaneously. Tokens can also be loaded from a secrets file via the `secrets_file` config option.
 
 ---
 
@@ -165,33 +164,24 @@ Returns server information and capabilities.
 {
   "status": "ok",
   "result": {
-    "version": "0.1.0",
+    "server_name": "rstmdb",
+    "server_version": "0.1.1",
     "protocol_version": 1,
-    "uptime_secs": 3600,
-    "features": ["subscriptions", "batch", "tls"],
-    "stats": {
-      "connections": 10,
-      "machines": 5,
-      "instances": 1000,
-      "wal_offset": 50000,
-      "wal_size_bytes": 10485760
-    },
-    "config": {
-      "auth_required": true,
-      "max_connections": 1000,
-      "fsync_policy": "every_write"
-    }
+    "features": ["idempotency", "batch", "wal_read"],
+    "max_frame_bytes": 16777216,
+    "max_batch_ops": 100
   }
 }
 ```
 
 | Field | Description |
 |-------|-------------|
-| `version` | Server version |
-| `uptime_secs` | Seconds since start |
-| `features` | Enabled features |
-| `stats` | Runtime statistics |
-| `config` | Relevant configuration |
+| `server_name` | Server name |
+| `server_version` | Server version |
+| `protocol_version` | Protocol version |
+| `features` | Available features |
+| `max_frame_bytes` | Maximum frame payload size |
+| `max_batch_ops` | Maximum operations per batch |
 
 ---
 

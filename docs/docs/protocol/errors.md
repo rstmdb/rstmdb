@@ -31,8 +31,7 @@ Errors related to protocol violations.
 | Code | Retryable | Description |
 |------|-----------|-------------|
 | `UNSUPPORTED_PROTOCOL` | No | Client protocol version not supported |
-| `BAD_REQUEST` | No | Malformed request (invalid JSON, missing fields) |
-| `UNKNOWN_OPERATION` | No | Unrecognized operation name |
+| `BAD_REQUEST` | No | Malformed request (invalid JSON, missing fields, unknown operation) |
 
 **Example:**
 ```json
@@ -100,7 +99,6 @@ Errors related to state transitions.
 |------|-----------|-------------|
 | `INVALID_TRANSITION` | No | No valid transition for event from current state |
 | `GUARD_FAILED` | No | Guard condition evaluated to false |
-| `INVALID_DEFINITION` | No | Machine definition is invalid |
 
 **Example: Invalid Transition**
 ```json
@@ -138,7 +136,7 @@ Errors related to concurrent operations.
 
 | Code | Retryable | Description |
 |------|-----------|-------------|
-| `CONFLICT` | Yes | Concurrent modification detected |
+| `CONFLICT` | No | Concurrent modification detected (expected_state mismatch) |
 
 **Example:**
 ```json
@@ -240,23 +238,6 @@ async function safeApplyEvent(instanceId, event, payload) {
 ## Error Details
 
 Some errors include additional details:
-
-### INVALID_DEFINITION
-
-```json
-{
-  "error": {
-    "code": "INVALID_DEFINITION",
-    "message": "Invalid machine definition",
-    "details": {
-      "errors": [
-        {"path": "initial", "message": "Initial state 'foo' not in states list"},
-        {"path": "transitions[0].to", "message": "Target state 'bar' not in states list"}
-      ]
-    }
-  }
-}
-```
 
 ### BATCH Partial Failure
 

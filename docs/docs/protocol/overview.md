@@ -47,24 +47,39 @@ Client                                    Server
    │ ◀────────── TCP Close ──────────────────│
 ```
 
+### Session States
+
+```
+Connected → (HELLO) → Ready → (AUTH, if auth_required) → Authenticated → (BYE) → Closing
+                          └─ (no auth required) ──────→ Authenticated
+```
+
+Operations exempt from auth enforcement (always allowed):
+- `HELLO`, `AUTH`, `PING`, `BYE`
+
+Session defaults:
+- Idle timeout: 300 seconds
+- Max connections: 1000
+
 ## Wire Modes
 
 ### Binary JSON (Default)
 
-The default mode uses a framed binary format:
+The default mode uses an 18-byte framed binary header:
 
 ```
-┌────────────────────────────────────────────────┐
-│                   Frame                         │
-├────────┬────────┬──────────┬──────────────────┤
-│ Magic  │ Flags  │ CRC32C   │ JSON Payload     │
-│ "RCP1" │ 4 bytes│ 4 bytes  │ variable         │
-└────────┴────────┴──────────┴──────────────────┘
+┌──────────────────────────────────────────────────────────────────────────┐
+│                               Frame                                       │
+├────────┬─────────┬────────┬────────────┬─────────────┬──────────────────┤
+│ Magic  │ Version │ Flags  │ Header Len │ Payload Len │ CRC32C │ Payload │
+│ "RCPX" │ 2 bytes │ 2 bytes│  2 bytes   │   4 bytes   │ 4 bytes│ JSON    │
+└────────┴─────────┴────────┴────────────┴─────────────┴────────┴─────────┘
 ```
 
 Benefits:
 - CRC32C checksums for data integrity
 - Clear frame boundaries
+- Protocol version negotiation
 - Efficient parsing
 
 ### JSONL Mode (Debug)
@@ -76,7 +91,7 @@ For debugging, a line-delimited JSON mode is available:
 {"type":"response","id":"1","status":"ok"}\n
 ```
 
-Enable with the `--jsonl` flag or `wire_mode: jsonl` in config.
+Wire mode is negotiated during HELLO by sending preferred `wire_modes` list. Enable with the `--jsonl` flag or `wire_mode: jsonl` in config.
 
 ## Message Types
 
@@ -105,7 +120,9 @@ Enable with the `--jsonl` flag or `wire_mode: jsonl` in config.
   },
   "meta": {
     "server_time": "2024-01-15T10:30:00Z",
-    "wal_offset": 12345
+    "leader": true,
+    "wal_offset": 12345,
+    "trace_id": "abc-123"
   }
 }
 ```
@@ -128,19 +145,21 @@ Enable with the `--jsonl` flag or `wire_mode: jsonl` in config.
 
 ### Event (Subscription)
 
+Event fields are top-level (not nested inside an `event` object):
+
 ```json
 {
   "type": "event",
   "subscription_id": "sub-123",
-  "event": {
-    "instance_id": "order-001",
-    "event": "PAY",
-    "from_state": "pending",
-    "to_state": "paid",
-    "payload": {},
-    "timestamp": "2024-01-15T10:30:00Z",
-    "wal_offset": 12345
-  }
+  "instance_id": "order-001",
+  "machine": "order",
+  "version": 1,
+  "event": "PAY",
+  "from_state": "pending",
+  "to_state": "paid",
+  "payload": {},
+  "ctx": {"customer": "alice"},
+  "wal_offset": 12345
 }
 ```
 
@@ -157,7 +176,8 @@ Every connection starts with a HELLO exchange:
   "params": {
     "protocol_version": 1,
     "client_name": "rstmdb-cli",
-    "client_version": "0.1.0"
+    "wire_modes": ["binary_json", "jsonl"],
+    "features": ["idempotency", "batch", "wal_read"]
   }
 }
 ```
@@ -170,16 +190,17 @@ Every connection starts with a HELLO exchange:
   "status": "ok",
   "result": {
     "protocol_version": 1,
-    "server_version": "0.1.0",
-    "auth_required": true,
-    "features": ["subscriptions", "batch"]
+    "wire_mode": "binary_json",
+    "server_name": "rstmdb",
+    "server_version": "0.1.1",
+    "features": ["idempotency", "batch", "wal_read"]
   }
 }
 ```
 
 ## Authentication
 
-If `auth_required` is true, authenticate before other operations:
+If authentication is required, authenticate before other operations:
 
 **Client sends:**
 ```json
@@ -188,6 +209,7 @@ If `auth_required` is true, authenticate before other operations:
   "id": "2",
   "op": "AUTH",
   "params": {
+    "method": "bearer",
     "token": "your-secret-token"
   }
 }
@@ -204,6 +226,9 @@ If `auth_required` is true, authenticate before other operations:
   }
 }
 ```
+
+- Only `"bearer"` method is currently supported.
+- Tokens are validated by SHA-256 hashing and comparing against configured hashes.
 
 ## Pipelining
 
@@ -245,7 +270,9 @@ Client                          Server
    │ ◀─── OK ──────────────────────│
 ```
 
-Events are pushed asynchronously and can interleave with request/response pairs.
+Events are pushed asynchronously and can interleave with request/response pairs. The client must demultiplex incoming frames by the `"type"` field:
+- `"response"` → match to pending request by `"id"`
+- `"event"` → route to subscription by `"subscription_id"`
 
 ## Connection Limits
 

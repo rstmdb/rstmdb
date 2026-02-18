@@ -16,7 +16,9 @@ Subscribes to events on a specific instance.
 {
   "op": "WATCH_INSTANCE",
   "params": {
-    "instance_id": "order-001"
+    "instance_id": "order-001",
+    "include_ctx": true,
+    "from_offset": 0
   }
 }
 ```
@@ -24,6 +26,8 @@ Subscribes to events on a specific instance.
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `instance_id` | string | Yes | Instance to watch |
+| `include_ctx` | boolean | No | Include context in events (default: `true`) |
+| `from_offset` | integer | No | Replay events from this WAL offset |
 
 ### Response
 
@@ -33,30 +37,29 @@ Subscribes to events on a specific instance.
   "result": {
     "subscription_id": "sub-abc123",
     "instance_id": "order-001",
-    "current_state": "pending"
+    "current_state": "pending",
+    "current_wal_offset": 1
   }
 }
 ```
 
 ### Events
 
-After subscribing, events are pushed when the instance changes:
+After subscribing, events are pushed when the instance changes. Event fields are **top-level** (not nested inside an `event` object):
 
 ```json
 {
   "type": "event",
   "subscription_id": "sub-abc123",
-  "event": {
-    "instance_id": "order-001",
-    "machine": "order",
-    "version": 1,
-    "event": "PAY",
-    "from_state": "pending",
-    "to_state": "paid",
-    "payload": {"amount": 99.99},
-    "timestamp": "2024-01-15T10:30:00Z",
-    "wal_offset": 12345
-  }
+  "instance_id": "order-001",
+  "machine": "order",
+  "version": 1,
+  "event": "PAY",
+  "from_state": "pending",
+  "to_state": "paid",
+  "payload": {"amount": 99.99},
+  "ctx": {"customer": "alice", "amount": 99.99},
+  "wal_offset": 5
 }
 ```
 
@@ -82,6 +85,7 @@ Subscribes to events across all instances with optional filtering.
     "events": ["PAY", "REFUND"],
     "from_states": ["pending"],
     "to_states": ["paid", "refunded"],
+    "include_ctx": true,
     "from_offset": 0
   }
 }
@@ -93,9 +97,10 @@ Subscribes to events across all instances with optional filtering.
 | `events` | string[] | No | Filter by event names |
 | `from_states` | string[] | No | Filter by source state |
 | `to_states` | string[] | No | Filter by target state |
+| `include_ctx` | boolean | No | Include context in events (default: `true`) |
 | `from_offset` | integer | No | Start from WAL offset |
 
-All filters are optional. If omitted, all events are delivered.
+All filters are optional. If omitted, all events are delivered. Empty arrays also match all.
 
 ### Filter Behavior
 
@@ -123,13 +128,15 @@ Within a filter, values use OR logic:
   "status": "ok",
   "result": {
     "subscription_id": "sub-xyz789",
-    "filters": {
-      "machines": ["order", "payment"],
-      "to_states": ["paid", "refunded"]
-    }
+    "wal_offset": 42
   }
 }
 ```
+
+| Field | Description |
+|-------|-------------|
+| `subscription_id` | Use this ID to identify events and to unsubscribe |
+| `wal_offset` | Current WAL head; events after this offset will be streamed |
 
 ### Events
 
@@ -137,17 +144,15 @@ Within a filter, values use OR logic:
 {
   "type": "event",
   "subscription_id": "sub-xyz789",
-  "event": {
-    "instance_id": "order-001",
-    "machine": "order",
-    "version": 1,
-    "event": "PAY",
-    "from_state": "pending",
-    "to_state": "paid",
-    "payload": {"amount": 99.99},
-    "timestamp": "2024-01-15T10:30:00Z",
-    "wal_offset": 12345
-  }
+  "instance_id": "order-001",
+  "machine": "order",
+  "version": 1,
+  "event": "PAY",
+  "from_state": "pending",
+  "to_state": "paid",
+  "payload": {"amount": 99.99},
+  "ctx": {"customer": "alice", "amount": 99.99},
+  "wal_offset": 43
 }
 ```
 
@@ -200,7 +205,8 @@ Cancels a subscription.
 {
   "status": "ok",
   "result": {
-    "cancelled": true
+    "subscription_id": "sub-abc123",
+    "removed": true
   }
 }
 ```
@@ -215,39 +221,38 @@ Cancels a subscription.
 
 ## Event Message Format
 
-All subscription events have this format:
+All subscription events have this format (fields are top-level, not nested):
 
 ```json
 {
   "type": "event",
   "subscription_id": "sub-abc123",
-  "event": {
-    "instance_id": "order-001",
-    "machine": "order",
-    "version": 1,
-    "event": "PAY",
-    "from_state": "pending",
-    "to_state": "paid",
-    "payload": {"amount": 99.99},
-    "context": {"customer": "alice", "amount": 99.99},
-    "timestamp": "2024-01-15T10:30:00Z",
-    "wal_offset": 12345
-  }
+  "instance_id": "order-001",
+  "machine": "order",
+  "version": 1,
+  "event": "PAY",
+  "from_state": "pending",
+  "to_state": "paid",
+  "payload": {"amount": 99.99},
+  "ctx": {"customer": "alice", "amount": 99.99},
+  "wal_offset": 12345
 }
 ```
 
 | Field | Description |
 |-------|-------------|
+| `subscription_id` | Subscription that matched this event |
 | `instance_id` | Affected instance |
 | `machine` | Machine name |
 | `version` | Machine version |
 | `event` | Event that was applied |
 | `from_state` | Previous state |
 | `to_state` | New state |
-| `payload` | Event payload |
-| `context` | Full context after event |
-| `timestamp` | Event timestamp |
+| `payload` | Event payload (null if absent) |
+| `ctx` | Context after transition (only if `include_ctx: true`) |
 | `wal_offset` | WAL position |
+
+**Note:** If a subscriber can't keep up (channel full), events may be silently dropped for that subscriber with a server-side warning log.
 
 ---
 
@@ -281,7 +286,7 @@ All subscription events have this format:
 ```json
 // Get current WAL position
 {"op": "WAL_STATS"}
-// Response: {"result": {"current_offset": 50000}}
+// Response: {"result": {"latest_offset": 50000, ...}}
 
 // Subscribe from beginning
 {"op": "WATCH_ALL", "params": {"from_offset": 0}}
@@ -304,8 +309,8 @@ A single connection can have multiple subscriptions:
 // Response: subscription_id = "sub-2"
 
 // Events arrive with their subscription_id
-{"type": "event", "subscription_id": "sub-1", ...}
-{"type": "event", "subscription_id": "sub-2", ...}
+{"type": "event", "subscription_id": "sub-1", "instance_id": "...", ...}
+{"type": "event", "subscription_id": "sub-2", "instance_id": "...", ...}
 ```
 
 ---

@@ -16,7 +16,7 @@ Registers a new machine definition or version.
 {
   "op": "PUT_MACHINE",
   "params": {
-    "name": "order",
+    "machine": "order",
     "version": 1,
     "definition": {
       "states": ["pending", "paid", "shipped", "delivered"],
@@ -29,16 +29,18 @@ Registers a new machine definition or version.
       "meta": {
         "description": "Order lifecycle"
       }
-    }
+    },
+    "checksum": "optional-sha256-hex"
   }
 }
 ```
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `name` | string | Yes | Machine name |
-| `version` | integer | Yes | Version number (≥ 1) |
+| `machine` | string | Yes | Machine name |
+| `version` | integer | Yes | Version number (>= 1) |
 | `definition` | object | Yes | Machine definition |
+| `checksum` | string | No | Optional SHA-256 hex for verification |
 
 ### Definition Object
 
@@ -64,8 +66,9 @@ Registers a new machine definition or version.
 {
   "status": "ok",
   "result": {
-    "name": "order",
+    "machine": "order",
     "version": 1,
+    "stored_checksum": "a1b2c3d4...",
     "created": true
   }
 }
@@ -73,15 +76,18 @@ Registers a new machine definition or version.
 
 | Field | Description |
 |-------|-------------|
-| `created` | True if newly created, false if updated |
+| `machine` | Machine name |
+| `version` | Version number |
+| `stored_checksum` | SHA-256 hex of stored definition |
+| `created` | True if newly created, false if identical definition already existed (idempotent) |
 
 ### Errors
 
 | Code | Description |
 |------|-------------|
-| `MACHINE_VERSION_EXISTS` | Version already exists |
+| `MACHINE_VERSION_EXISTS` | Version already exists with different definition |
 | `MACHINE_VERSION_LIMIT_EXCEEDED` | Max versions reached |
-| `INVALID_DEFINITION` | Definition validation failed |
+| `BAD_REQUEST` | Definition validation failed |
 
 ### Validation Rules
 
@@ -105,7 +111,7 @@ Retrieves a machine definition.
 {
   "op": "GET_MACHINE",
   "params": {
-    "name": "order",
+    "machine": "order",
     "version": 1
   }
 }
@@ -113,8 +119,8 @@ Retrieves a machine definition.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `name` | string | Yes | Machine name |
-| `version` | integer | No | Specific version (omit for latest) |
+| `machine` | string | Yes | Machine name |
+| `version` | integer | Yes | Specific version |
 
 ### Response
 
@@ -122,17 +128,20 @@ Retrieves a machine definition.
 {
   "status": "ok",
   "result": {
-    "name": "order",
-    "version": 1,
     "definition": {
       "states": ["pending", "paid", "shipped", "delivered"],
       "initial": "pending",
       "transitions": [...]
     },
-    "created_at": "2024-01-15T10:30:00Z"
+    "checksum": "a1b2c3d4..."
   }
 }
 ```
+
+| Field | Description |
+|-------|-------------|
+| `definition` | Machine definition object |
+| `checksum` | SHA-256 hex of stored definition |
 
 ### Errors
 
@@ -150,18 +159,9 @@ Lists all registered machines.
 
 ```json
 {
-  "op": "LIST_MACHINES",
-  "params": {
-    "limit": 100,
-    "offset": 0
-  }
+  "op": "LIST_MACHINES"
 }
 ```
-
-| Parameter | Type | Required | Description |
-|-----------|------|----------|-------------|
-| `limit` | integer | No | Max items (default: 100) |
-| `offset` | integer | No | Skip items (default: 0) |
 
 ### Response
 
@@ -169,40 +169,25 @@ Lists all registered machines.
 {
   "status": "ok",
   "result": {
-    "machines": [
+    "items": [
       {
-        "name": "order",
-        "versions": [1, 2],
-        "latest_version": 2,
-        "instance_count": 500
+        "machine": "order",
+        "versions": [1, 2]
       },
       {
-        "name": "user",
-        "versions": [1],
-        "latest_version": 1,
-        "instance_count": 100
+        "machine": "user",
+        "versions": [1]
       }
-    ],
-    "total": 2,
-    "has_more": false
+    ]
   }
 }
 ```
 
 | Field | Description |
 |-------|-------------|
-| `machines` | List of machine summaries |
-| `total` | Total machine count |
-| `has_more` | More items available |
-
-### Machine Summary
-
-| Field | Description |
-|-------|-------------|
-| `name` | Machine name |
-| `versions` | Available versions |
-| `latest_version` | Highest version number |
-| `instance_count` | Number of instances |
+| `items` | List of machine summaries (sorted alphabetically by name) |
+| `items[].machine` | Machine name |
+| `items[].versions` | Available version numbers |
 
 ---
 
@@ -214,7 +199,7 @@ Lists all registered machines.
 {
   "op": "PUT_MACHINE",
   "params": {
-    "name": "approval",
+    "machine": "approval",
     "version": 1,
     "definition": {
       "states": ["pending", "approved", "escalated", "rejected"],
@@ -259,7 +244,7 @@ Lists all registered machines.
 {
   "op": "PUT_MACHINE",
   "params": {
-    "name": "task",
+    "machine": "task",
     "version": 1,
     "definition": {
       "states": ["todo", "in_progress", "done", "cancelled"],
