@@ -59,6 +59,7 @@ const sidebars: SidebarsConfig = {
         'clients/overview',
         'clients/rust',
         'clients/python',
+        'clients/go',
         'clients/typescript',
       ],
     },

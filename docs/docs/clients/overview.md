@@ -53,11 +53,21 @@ Features:
 
 ### Go Client
 
-**Status:** 📋 Planned
+**Status:** ✅ Available
 
 ```bash
 go get github.com/rstmdb/rstmdb-go
 ```
+
+Features:
+- Zero external dependencies (standard library only)
+- Full RCP protocol with RCPX binary framing
+- Channel-based event streaming
+- Context-based cancellation and timeouts
+
+[pkg.go.dev Reference →](https://pkg.go.dev/github.com/rstmdb/rstmdb-go)
+
+[Full documentation →](./go)
 
 ## Protocol Integration
 
