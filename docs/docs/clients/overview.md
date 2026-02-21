@@ -69,6 +69,24 @@ Features:
 
 [Full documentation →](./go)
 
+### C# / .NET Client
+
+**Status:** ✅ Available
+
+```bash
+dotnet add package Rstmdb.Client
+```
+
+Features:
+- Zero external dependencies
+- Full RCP protocol with RCPX binary framing
+- Async streaming via `System.Threading.Channels` and `IAsyncEnumerable`
+- `async/await` with `CancellationToken` throughout
+
+[NuGet Package →](https://www.nuget.org/packages/Rstmdb.Client)
+
+[Full documentation →](./csharp)
+
 ## Protocol Integration
 
 If an official client isn't available for your language, you can integrate directly with the RCP protocol.

@@ -61,6 +61,7 @@ const sidebars: SidebarsConfig = {
         'clients/python',
         'clients/go',
         'clients/typescript',
+        'clients/csharp',
       ],
     },
     'roadmap',
