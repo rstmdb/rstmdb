@@ -43,6 +43,19 @@ pub struct StateMachineEngine {
 impl StateMachineEngine {
     /// Creates a new engine with the given WAL configuration.
     /// Replays WAL entries to restore state.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use rstmdb_core::StateMachineEngine;
+    /// use rstmdb_wal::{WalConfig, FsyncPolicy};
+    ///
+    /// let dir = tempfile::TempDir::new().unwrap();
+    /// let config = WalConfig::new(dir.path())
+    ///     .with_fsync_policy(FsyncPolicy::Never);
+    /// let engine = StateMachineEngine::new(config).unwrap();
+    /// assert_eq!(engine.instance_count(), 0);
+    /// ```
     pub fn new(wal_config: WalConfig) -> Result<Self, CoreError> {
         let wal = Arc::new(Wal::open(wal_config)?);
 
@@ -204,6 +217,30 @@ impl StateMachineEngine {
     // =========================================================================
 
     /// Registers a machine definition.
+    ///
+    /// Returns `(checksum, created)` where `created` is `true` if this is a new definition.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use rstmdb_core::StateMachineEngine;
+    /// # use rstmdb_wal::{WalConfig, FsyncPolicy};
+    /// # use serde_json::json;
+    /// # let dir = tempfile::TempDir::new().unwrap();
+    /// # let engine = StateMachineEngine::new(
+    /// #     WalConfig::new(dir.path()).with_fsync_policy(FsyncPolicy::Never)
+    /// # ).unwrap();
+    /// let (checksum, created) = engine.put_machine("order", 1, &json!({
+    ///     "states": ["created", "paid"],
+    ///     "initial": "created",
+    ///     "transitions": [
+    ///         {"from": "created", "event": "PAY", "to": "paid"}
+    ///     ]
+    /// })).unwrap();
+    ///
+    /// assert!(created);
+    /// assert!(!checksum.is_empty());
+    /// ```
     pub fn put_machine(
         &self,
         name: &str,
@@ -295,7 +332,32 @@ impl StateMachineEngine {
     // Instance Management
     // =========================================================================
 
-    /// Creates a new instance.
+    /// Creates a new instance of a registered state machine.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use rstmdb_core::StateMachineEngine;
+    /// # use rstmdb_wal::{WalConfig, FsyncPolicy};
+    /// # use serde_json::json;
+    /// # let dir = tempfile::TempDir::new().unwrap();
+    /// # let engine = StateMachineEngine::new(
+    /// #     WalConfig::new(dir.path()).with_fsync_policy(FsyncPolicy::Never)
+    /// # ).unwrap();
+    /// # engine.put_machine("order", 1, &json!({
+    /// #     "states": ["created", "paid"],
+    /// #     "initial": "created",
+    /// #     "transitions": [{"from": "created", "event": "PAY", "to": "paid"}]
+    /// # })).unwrap();
+    /// let (instance, wal_offset) = engine.create_instance(
+    ///     "order-001", "order", 1,
+    ///     json!({"customer": "alice"}),
+    ///     None,
+    /// ).unwrap();
+    ///
+    /// assert_eq!(instance.state, "created");
+    /// assert_eq!(instance.id, "order-001");
+    /// ```
     pub fn create_instance(
         &self,
         instance_id: &str,
@@ -380,7 +442,34 @@ impl StateMachineEngine {
         Ok(instance)
     }
 
-    /// Applies an event to an instance.
+    /// Applies an event to an instance, triggering a state transition.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use rstmdb_core::StateMachineEngine;
+    /// # use rstmdb_wal::{WalConfig, FsyncPolicy};
+    /// # use serde_json::json;
+    /// # let dir = tempfile::TempDir::new().unwrap();
+    /// # let engine = StateMachineEngine::new(
+    /// #     WalConfig::new(dir.path()).with_fsync_policy(FsyncPolicy::Never)
+    /// # ).unwrap();
+    /// # engine.put_machine("order", 1, &json!({
+    /// #     "states": ["created", "paid"],
+    /// #     "initial": "created",
+    /// #     "transitions": [{"from": "created", "event": "PAY", "to": "paid"}]
+    /// # })).unwrap();
+    /// # engine.create_instance("order-001", "order", 1, json!({}), None).unwrap();
+    /// let result = engine.apply_event(
+    ///     "order-001", "PAY",
+    ///     json!({"amount": 99.99}),
+    ///     None, None, None, None,
+    /// ).unwrap();
+    ///
+    /// assert_eq!(result.from_state, "created");
+    /// assert_eq!(result.to_state, "paid");
+    /// assert!(result.applied);
+    /// ```
     #[allow(clippy::too_many_arguments)]
     pub fn apply_event(
         &self,
@@ -505,6 +594,26 @@ impl StateMachineEngine {
     }
 
     /// Deletes an instance (soft delete).
+    ///
+    /// After deletion, `get_instance` and `apply_event` return `InstanceNotFound`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use rstmdb_core::StateMachineEngine;
+    /// # use rstmdb_wal::{WalConfig, FsyncPolicy};
+    /// # use serde_json::json;
+    /// # let dir = tempfile::TempDir::new().unwrap();
+    /// # let engine = StateMachineEngine::new(
+    /// #     WalConfig::new(dir.path()).with_fsync_policy(FsyncPolicy::Never)
+    /// # ).unwrap();
+    /// # engine.put_machine("order", 1, &json!({
+    /// #     "states": ["created"], "initial": "created", "transitions": []
+    /// # })).unwrap();
+    /// # engine.create_instance("i1", "order", 1, json!({}), None).unwrap();
+    /// engine.delete_instance("i1", None).unwrap();
+    /// assert!(engine.get_instance("i1").is_err());
+    /// ```
     pub fn delete_instance(
         &self,
         instance_id: &str,
@@ -542,7 +651,27 @@ impl StateMachineEngine {
     // =========================================================================
 
     /// Clears all instances, machine definitions, and idempotency cache.
-    /// Returns the number of instances and machines that were removed.
+    /// Returns `(instances_removed, machines_removed)`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use rstmdb_core::StateMachineEngine;
+    /// # use rstmdb_wal::{WalConfig, FsyncPolicy};
+    /// # use serde_json::json;
+    /// # let dir = tempfile::TempDir::new().unwrap();
+    /// # let engine = StateMachineEngine::new(
+    /// #     WalConfig::new(dir.path()).with_fsync_policy(FsyncPolicy::Never)
+    /// # ).unwrap();
+    /// # engine.put_machine("order", 1, &json!({
+    /// #     "states": ["created"], "initial": "created", "transitions": []
+    /// # })).unwrap();
+    /// # engine.create_instance("i1", "order", 1, json!({}), None).unwrap();
+    /// let (instances, machines) = engine.flush_all();
+    /// assert_eq!(instances, 1);
+    /// assert_eq!(machines, 1);
+    /// assert_eq!(engine.instance_count(), 0);
+    /// ```
     pub fn flush_all(&self) -> (usize, usize) {
         let instance_count = self.instances.len();
         let machine_count = self.definitions.len();

@@ -95,6 +95,20 @@ pub struct ConnectionConfig {
 }
 
 impl ConnectionConfig {
+    /// Creates a new connection config with defaults.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use rstmdb_client::ConnectionConfig;
+    /// use std::time::Duration;
+    ///
+    /// let config = ConnectionConfig::new("127.0.0.1:7401".parse().unwrap())
+    ///     .with_client_name("my-app")
+    ///     .with_auth_token("secret-token")
+    ///     .with_connect_timeout(Duration::from_secs(5))
+    ///     .with_request_timeout(Duration::from_secs(15));
+    /// ```
     pub fn new(addr: SocketAddr) -> Self {
         Self {
             addr,

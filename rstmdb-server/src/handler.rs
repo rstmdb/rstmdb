@@ -44,7 +44,35 @@ impl Default for ServerInfo {
     }
 }
 
-/// Command handler.
+/// Command handler that dispatches RCP requests to the engine.
+///
+/// # Examples
+///
+/// ```
+/// use rstmdb_server::handler::{CommandHandler, ServerInfo};
+/// use rstmdb_core::StateMachineEngine;
+/// use rstmdb_wal::{WalConfig, FsyncPolicy};
+/// use rstmdb_protocol::{Request, Operation};
+/// use rstmdb_server::session::Session;
+/// use serde_json::json;
+/// use std::sync::Arc;
+/// use std::net::{SocketAddr, IpAddr, Ipv4Addr};
+///
+/// let dir = tempfile::TempDir::new().unwrap();
+/// let engine = Arc::new(StateMachineEngine::new(
+///     WalConfig::new(dir.path()).with_fsync_policy(FsyncPolicy::EveryWrite),
+/// ).unwrap());
+/// let handler = CommandHandler::new(engine);
+///
+/// let mut session = Session::new(
+///     SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 12345),
+///     false,
+/// );
+///
+/// // Ping
+/// let response = handler.handle(&mut session, &Request::new("1", Operation::Ping));
+/// assert!(response.is_ok());
+/// ```
 pub struct CommandHandler {
     engine: Arc<StateMachineEngine>,
     snapshot_store: Option<Arc<SnapshotStore>>,

@@ -46,6 +46,16 @@ pub struct SnapshotStore {
 
 impl SnapshotStore {
     /// Opens or creates a snapshot store at the given directory.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use rstmdb_storage::SnapshotStore;
+    ///
+    /// let dir = tempfile::TempDir::new().unwrap();
+    /// let store = SnapshotStore::open(dir.path()).unwrap();
+    /// assert_eq!(store.snapshot_count(), 0);
+    /// ```
     pub fn open(dir: impl AsRef<Path>) -> Result<Self, StorageError> {
         let dir = dir.as_ref().to_path_buf();
         fs::create_dir_all(&dir)?;
@@ -85,7 +95,26 @@ impl SnapshotStore {
         Ok(())
     }
 
-    /// Creates a snapshot for an instance.
+    /// Creates a snapshot for an instance and persists it to disk.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use rstmdb_storage::SnapshotStore;
+    /// use rstmdb_core::instance::InstanceSnapshot;
+    /// use rstmdb_core::Instance;
+    /// use serde_json::json;
+    ///
+    /// let dir = tempfile::TempDir::new().unwrap();
+    /// let store = SnapshotStore::open(dir.path()).unwrap();
+    ///
+    /// let instance = Instance::new("i1", "order", 1, "created", json!({}), 0);
+    /// let snapshot = InstanceSnapshot::from_instance(&instance, "snap-001");
+    /// let meta = store.create_snapshot(&snapshot).unwrap();
+    ///
+    /// assert_eq!(meta.instance_id, "i1");
+    /// assert_eq!(store.snapshot_count(), 1);
+    /// ```
     pub fn create_snapshot(
         &self,
         snapshot: &InstanceSnapshot,

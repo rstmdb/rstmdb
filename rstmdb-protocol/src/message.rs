@@ -68,6 +68,20 @@ pub struct Request {
 }
 
 impl Request {
+    /// Creates a new request with empty params.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use rstmdb_protocol::{Request, Operation};
+    /// use serde_json::json;
+    ///
+    /// let req = Request::new("1", Operation::Ping);
+    /// assert_eq!(req.op, Operation::Ping);
+    ///
+    /// let req = Request::new("2", Operation::GetInstance)
+    ///     .with_params(json!({"instance_id": "order-001"}));
+    /// ```
     pub fn new(id: impl Into<String>, op: Operation) -> Self {
         Self {
             msg_type: "request".to_string(),
@@ -183,6 +197,23 @@ fn is_meta_empty(meta: &ResponseMeta) -> bool {
 }
 
 impl Response {
+    /// Creates a successful response.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use rstmdb_protocol::{Response, ResponseError};
+    /// use rstmdb_protocol::ErrorCode;
+    /// use serde_json::json;
+    ///
+    /// let ok = Response::ok("1", json!({"pong": true}));
+    /// assert!(ok.is_ok());
+    ///
+    /// let err = Response::error("2", ResponseError::new(
+    ///     ErrorCode::NotFound, "not found",
+    /// ));
+    /// assert!(err.is_error());
+    /// ```
     pub fn ok(id: impl Into<String>, result: Value) -> Self {
         Self {
             msg_type: "response".to_string(),
