@@ -24,13 +24,17 @@ It provides a TCP-based command protocol (RCP) for managing versioned state \
 machine definitions, creating instances, and applying events with guard conditions."""
 section = "database"
 priority = "optional"
-assets = [["target/release/rstmdb", "usr/bin/", "755"]]
+assets = [
+    ["target/release/rstmdb", "usr/bin/", "755"],
+    ["target/release/rstmdb-cli", "usr/bin/", "755"],
+]
 conf-files = []
 
 # RPM package configuration
 [package.metadata.generate-rpm]
 assets = [
     { source = "target/release/rstmdb", dest = "/usr/bin/rstmdb", mode = "0755" },
+    { source = "target/release/rstmdb-cli", dest = "/usr/bin/rstmdb-cli", mode = "0755" },
 ]
 
 [package.metadata.generate-rpm.requires]

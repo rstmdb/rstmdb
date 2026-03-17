@@ -260,21 +260,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         };
 
     // Resolve server address (supports hostnames like localhost:7401)
+    // Prefers IPv4 addresses to avoid issues when server binds to 127.0.0.1
     let server_addr: SocketAddr = match cli.server.parse::<SocketAddr>() {
         Ok(addr) => addr,
         Err(_) => {
-            // Try DNS resolution for hostnames
-            match lookup_host(&cli.server).await?.next() {
-                Some(addr) => addr,
-                None => {
-                    eprintln!(
-                        "{}: could not resolve address '{}'",
-                        "Error".red(),
-                        cli.server
-                    );
-                    std::process::exit(1);
-                }
+            let addrs: Vec<SocketAddr> = lookup_host(&cli.server).await?.collect();
+            if addrs.is_empty() {
+                eprintln!(
+                    "{}: could not resolve address '{}'",
+                    "Error".red(),
+                    cli.server
+                );
+                std::process::exit(1);
             }
+            // Prefer IPv4 over IPv6
+            addrs
+                .iter()
+                .find(|a| a.is_ipv4())
+                .or(addrs.first())
+                .copied()
+                .unwrap()
         }
     };
 
