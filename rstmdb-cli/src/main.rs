@@ -10,6 +10,7 @@ use colored::Colorize;
 use rstmdb_client::{Client, ConnectionConfig, TlsClientConfig};
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use tokio::net::lookup_host;
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
@@ -17,9 +18,9 @@ use tracing_subscriber::EnvFilter;
 #[command(about = "Command-line interface for rstmdb state machine database")]
 #[command(version)]
 struct Cli {
-    /// Server address
+    /// Server address (host:port, e.g. localhost:7401 or 127.0.0.1:7401)
     #[arg(short, long, default_value = "127.0.0.1:7401")]
-    server: SocketAddr,
+    server: String,
 
     /// Authentication token
     #[arg(short = 't', long, env = "RSTMDB_TOKEN")]
@@ -161,6 +162,9 @@ enum Commands {
         force: bool,
     },
 
+    /// Clear all instances and machine definitions from the database
+    FlushAll,
+
     /// Generate SHA-256 hash of a token for config files
     HashToken {
         /// The token to hash
@@ -255,8 +259,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             None
         };
 
+    // Resolve server address (supports hostnames like localhost:7401)
+    let server_addr: SocketAddr = match cli.server.parse::<SocketAddr>() {
+        Ok(addr) => addr,
+        Err(_) => {
+            // Try DNS resolution for hostnames
+            match lookup_host(&cli.server).await?.next() {
+                Some(addr) => addr,
+                None => {
+                    eprintln!(
+                        "{}: could not resolve address '{}'",
+                        "Error".red(),
+                        cli.server
+                    );
+                    std::process::exit(1);
+                }
+            }
+        }
+    };
+
     // Create client with optional auth token and TLS
-    let mut config = ConnectionConfig::new(cli.server).with_client_name("rstmdb-cli");
+    let mut config = ConnectionConfig::new(server_addr).with_client_name("rstmdb-cli");
     if let Some(ref token) = cli.token {
         config = config.with_auth_token(token);
     }
@@ -269,7 +292,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     match cli.command {
         Some(Commands::Repl) | None => {
             // Start REPL (pass token for reconnects)
-            repl::run(client, cli.server, cli.token).await?;
+            repl::run(client, server_addr, cli.token).await?;
         }
         Some(Commands::HashToken { .. }) => unreachable!(), // Already handled above
         Some(Commands::WatchInstance { id, no_ctx }) => {

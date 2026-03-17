@@ -50,6 +50,12 @@ storage:
   # When limit is reached, new versions will be rejected
   max_machine_versions: 0
 
+  # Allow re-creating instances with the same ID after deletion
+  allow_instance_recreate: true
+
+  # Allow the FLUSH_ALL operation to clear all data (disabled by default for safety)
+  allow_flush_all: false
+
 # TLS settings
 tls:
   # Enable TLS

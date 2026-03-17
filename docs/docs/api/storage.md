@@ -277,6 +277,72 @@ After:
 
 Requires a snapshot store to be configured on the server.
 
+---
+
+## FLUSH_ALL
+
+Clears all instances and machine definitions from the database. This is a destructive operation that removes all in-memory state.
+
+:::caution
+This operation is **disabled by default**. Set `storage.allow_flush_all: true` in the server configuration to enable it. Recommended only for development and testing environments.
+:::
+
+### Request
+
+```json
+{
+  "op": "FLUSH_ALL"
+}
+```
+
+No parameters required.
+
+### Response
+
+```json
+{
+  "status": "ok",
+  "result": {
+    "flushed": true,
+    "instances_removed": 42,
+    "machines_removed": 3
+  }
+}
+```
+
+| Field | Description |
+|-------|-------------|
+| `flushed` | Always `true` on success |
+| `instances_removed` | Number of instances that were cleared |
+| `machines_removed` | Number of machine definitions that were cleared |
+
+### Errors
+
+| Code | Description |
+|------|-------------|
+| `BAD_REQUEST` | `FLUSH_ALL` is disabled in server configuration |
+
+### Configuration
+
+Enable via config file:
+```yaml
+storage:
+  allow_flush_all: true
+```
+
+Or via environment variable:
+```bash
+export RSTMDB_ALLOW_FLUSH_ALL=true
+```
+
+### Notes
+
+- Does not clear the WAL — historical entries remain on disk
+- After flush, machines must be re-registered before creating new instances
+- Run `COMPACT` after `FLUSH_ALL` for a complete reset including WAL cleanup
+
+---
+
 ### Automatic Compaction
 
 Configure in server settings:

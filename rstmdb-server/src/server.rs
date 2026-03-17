@@ -38,6 +38,8 @@ pub struct ServerConfig {
     pub tls_acceptor: Option<Arc<TlsAcceptor>>,
     /// Metrics instance (if metrics are enabled).
     pub metrics: Option<Arc<Metrics>>,
+    /// Whether the FLUSH_ALL operation is allowed.
+    pub allow_flush_all: bool,
 }
 
 impl std::fmt::Debug for ServerConfig {
@@ -50,6 +52,7 @@ impl std::fmt::Debug for ServerConfig {
             .field("max_machine_versions", &self.max_machine_versions)
             .field("tls_enabled", &self.tls_acceptor.is_some())
             .field("metrics_enabled", &self.metrics.is_some())
+            .field("allow_flush_all", &self.allow_flush_all)
             .finish()
     }
 }
@@ -64,6 +67,7 @@ impl Default for ServerConfig {
             max_machine_versions: 0, // unlimited
             tls_acceptor: None,
             metrics: None,
+            allow_flush_all: false,
         }
     }
 }
@@ -135,7 +139,8 @@ impl Server {
         let broadcaster = Arc::new(EventBroadcaster::new(DEFAULT_BROADCAST_CAPACITY));
         let mut handler = CommandHandler::new(engine)
             .with_broadcaster(broadcaster.clone())
-            .with_max_machine_versions(config.max_machine_versions);
+            .with_max_machine_versions(config.max_machine_versions)
+            .with_allow_flush_all(config.allow_flush_all);
         if let Some(ref metrics) = config.metrics {
             handler = handler.with_metrics(metrics.clone());
         }
@@ -159,7 +164,8 @@ impl Server {
         let broadcaster = Arc::new(EventBroadcaster::new(DEFAULT_BROADCAST_CAPACITY));
         let mut handler = CommandHandler::with_auth(engine, auth_config)
             .with_broadcaster(broadcaster.clone())
-            .with_max_machine_versions(config.max_machine_versions);
+            .with_max_machine_versions(config.max_machine_versions)
+            .with_allow_flush_all(config.allow_flush_all);
         if let Some(ref metrics) = config.metrics {
             handler = handler.with_metrics(metrics.clone());
         }
@@ -183,7 +189,8 @@ impl Server {
         let broadcaster = Arc::new(EventBroadcaster::new(DEFAULT_BROADCAST_CAPACITY));
         let mut handler = CommandHandler::with_snapshots(engine, snapshot_dir)?
             .with_broadcaster(broadcaster.clone())
-            .with_max_machine_versions(config.max_machine_versions);
+            .with_max_machine_versions(config.max_machine_versions)
+            .with_allow_flush_all(config.allow_flush_all);
         if let Some(ref metrics) = config.metrics {
             handler = handler.with_metrics(metrics.clone());
         }
@@ -209,7 +216,8 @@ impl Server {
         let mut handler =
             CommandHandler::with_snapshots_and_auth(engine, snapshot_dir, auth_config)?
                 .with_broadcaster(broadcaster.clone())
-                .with_max_machine_versions(config.max_machine_versions);
+                .with_max_machine_versions(config.max_machine_versions)
+                .with_allow_flush_all(config.allow_flush_all);
         if let Some(ref metrics) = config.metrics {
             handler = handler.with_metrics(metrics.clone());
         }

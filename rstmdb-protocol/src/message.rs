@@ -44,6 +44,9 @@ pub enum Operation {
     WatchInstance,
     WatchAll,
     Unwatch,
+
+    // Administrative
+    FlushAll,
 }
 
 /// Request message envelope.

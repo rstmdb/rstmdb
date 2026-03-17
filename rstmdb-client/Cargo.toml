@@ -1,7 +1,7 @@
 [package]
 name = "rstmdb-client"
 description = "Client library for rstmdb - connection pooling, async API"
-version = "0.1.1"
+version = "0.2.0"
 edition.workspace = true
 repository.workspace = true
 license-file = "../LICENSE"

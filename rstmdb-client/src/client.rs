@@ -285,6 +285,12 @@ impl Client {
         self.request(Operation::SnapshotInstance, params).await
     }
 
+    /// Clears all instances and machine definitions from the database.
+    /// Requires `storage.allow_flush_all=true` in server config.
+    pub async fn flush_all(&self) -> Result<Value, ClientError> {
+        self.request(Operation::FlushAll, json!({})).await
+    }
+
     /// Compacts WAL by snapshotting instances and deleting old segments.
     pub async fn compact(&self, force_snapshot: bool) -> Result<Value, ClientError> {
         let params = json!({

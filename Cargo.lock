@@ -1253,7 +1253,7 @@ dependencies = [
 
 [[package]]
 name = "rstmdb"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "rstmdb-core",
  "rstmdb-server",
@@ -1266,7 +1266,7 @@ dependencies = [
 
 [[package]]
 name = "rstmdb-bench"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bytes",
  "crc32c",
@@ -1285,7 +1285,7 @@ dependencies = [
 
 [[package]]
 name = "rstmdb-cli"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "clap",
  "colored",
@@ -1303,7 +1303,7 @@ dependencies = [
 
 [[package]]
 name = "rstmdb-client"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "bytes",
  "pin-project-lite",
@@ -1323,7 +1323,7 @@ dependencies = [
 
 [[package]]
 name = "rstmdb-core"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "crc32c",
  "dashmap",
@@ -1339,7 +1339,7 @@ dependencies = [
 
 [[package]]
 name = "rstmdb-protocol"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "bytes",
  "chrono",
@@ -1353,7 +1353,7 @@ dependencies = [
 
 [[package]]
 name = "rstmdb-server"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "bytes",
  "dashmap",
@@ -1386,7 +1386,7 @@ dependencies = [
 
 [[package]]
 name = "rstmdb-storage"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bytes",
  "crc32c",
@@ -1405,7 +1405,7 @@ dependencies = [
 
 [[package]]
 name = "rstmdb-wal"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bytes",
  "crc32c",

@@ -204,6 +204,10 @@ pub struct StorageConfig {
     pub fsync_policy: FsyncPolicy,
     /// Maximum number of versions per machine (0 = unlimited).
     pub max_machine_versions: u32,
+    /// Allow re-creating instances after deletion.
+    pub allow_instance_recreate: bool,
+    /// Allow the FLUSH_ALL operation to clear all data.
+    pub allow_flush_all: bool,
 }
 
 /// Fsync policy for WAL writes.
@@ -227,6 +231,8 @@ impl Default for StorageConfig {
             wal_segment_size_mb: 64,
             fsync_policy: FsyncPolicy::EveryWrite,
             max_machine_versions: 0, // unlimited
+            allow_instance_recreate: true,
+            allow_flush_all: false,
         }
     }
 }
@@ -263,6 +269,14 @@ impl StorageConfig {
             if let Ok(n) = max.parse() {
                 self.max_machine_versions = n;
             }
+        }
+
+        if let Ok(val) = std::env::var("RSTMDB_ALLOW_INSTANCE_RECREATE") {
+            self.allow_instance_recreate = val == "1" || val.to_lowercase() == "true";
+        }
+
+        if let Ok(val) = std::env::var("RSTMDB_ALLOW_FLUSH_ALL") {
+            self.allow_flush_all = val == "1" || val.to_lowercase() == "true";
         }
     }
 
