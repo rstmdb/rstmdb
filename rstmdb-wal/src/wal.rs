@@ -37,6 +37,17 @@ pub struct WalConfig {
 }
 
 impl WalConfig {
+    /// Creates a new WAL configuration with defaults.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use rstmdb_wal::{WalConfig, FsyncPolicy};
+    ///
+    /// let config = WalConfig::new("/tmp/wal")
+    ///     .with_segment_size(32 * 1024 * 1024)
+    ///     .with_fsync_policy(FsyncPolicy::Never);
+    /// ```
     pub fn new(dir: impl Into<PathBuf>) -> Self {
         Self {
             dir: dir.into(),
@@ -66,6 +77,21 @@ impl WalOffset {
     const OFFSET_BITS: u64 = 40;
     const OFFSET_MASK: u64 = (1 << Self::OFFSET_BITS) - 1;
 
+    /// Creates a new WAL offset from a segment ID and offset within the segment.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use rstmdb_wal::WalOffset;
+    ///
+    /// let offset = WalOffset::new(1, 42);
+    /// assert_eq!(offset.segment_id(), 1);
+    /// assert_eq!(offset.offset(), 42);
+    ///
+    /// // Roundtrip through u64
+    /// let raw = offset.as_u64();
+    /// assert_eq!(WalOffset::from_u64(raw), offset);
+    /// ```
     pub fn new(segment_id: SegmentId, offset: u64) -> Self {
         assert!(offset <= Self::OFFSET_MASK, "offset too large");
         Self((segment_id << Self::OFFSET_BITS) | offset)
@@ -126,6 +152,31 @@ pub struct Wal {
 
 impl Wal {
     /// Opens or creates a WAL at the configured directory.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use rstmdb_wal::{Wal, WalConfig, WalEntry, FsyncPolicy};
+    ///
+    /// let dir = tempfile::TempDir::new().unwrap();
+    /// let wal = Wal::open(
+    ///     WalConfig::new(dir.path()).with_fsync_policy(FsyncPolicy::Never)
+    /// ).unwrap();
+    ///
+    /// // Append an entry
+    /// let entry = WalEntry::PutMachine {
+    ///     machine: "order".into(),
+    ///     version: 1,
+    ///     definition_hash: "abc".into(),
+    ///     definition: serde_json::json!({}),
+    /// };
+    /// let (sequence, offset) = wal.append(&entry).unwrap();
+    /// assert_eq!(sequence, 1);
+    ///
+    /// // Read it back
+    /// let entries = wal.read_from(offset, None).unwrap();
+    /// assert_eq!(entries.len(), 1);
+    /// ```
     pub fn open(config: WalConfig) -> Result<Self, WalError> {
         // Create directory if it doesn't exist
         std::fs::create_dir_all(&config.dir)?;

@@ -51,6 +51,18 @@ pub struct Instance {
 
 impl Instance {
     /// Creates a new instance.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use rstmdb_core::Instance;
+    /// use serde_json::json;
+    ///
+    /// let instance = Instance::new("order-001", "order", 1, "created", json!({}), 0);
+    /// assert_eq!(instance.id, "order-001");
+    /// assert_eq!(instance.state, "created");
+    /// assert!(instance.is_active());
+    /// ```
     pub fn new(
         id: impl Into<String>,
         machine: impl Into<String>,
@@ -97,6 +109,20 @@ impl Instance {
     }
 
     /// Marks the instance as deleted.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use rstmdb_core::Instance;
+    /// use serde_json::json;
+    ///
+    /// let mut instance = Instance::new("i1", "order", 1, "created", json!({}), 0);
+    /// assert!(instance.is_active());
+    ///
+    /// instance.soft_delete(1);
+    /// assert!(instance.is_deleted());
+    /// assert!(!instance.is_active());
+    /// ```
     pub fn soft_delete(&mut self, wal_offset: u64) {
         self.instance_state = InstanceState::Deleted;
         self.last_wal_offset = wal_offset;

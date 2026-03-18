@@ -47,6 +47,12 @@ storage:
   # Maximum versions per machine (0 = unlimited)
   max_machine_versions: 0
 
+  # Allow re-creating instances after deletion with the same ID
+  allow_instance_recreate: true
+
+  # Allow the FLUSH_ALL operation to clear all data (disabled by default)
+  allow_flush_all: false
+
 # Authentication settings
 auth:
   # Require authentication
@@ -127,6 +133,8 @@ All configuration options can be set via environment variables:
 | `RSTMDB_WAL_SEGMENT_SIZE_MB` | `storage.wal_segment_size_mb` | `64` |
 | `RSTMDB_FSYNC_POLICY` | `storage.fsync_policy` | `every_write` |
 | `RSTMDB_MAX_MACHINE_VERSIONS` | `storage.max_machine_versions` | `0` |
+| `RSTMDB_ALLOW_INSTANCE_RECREATE` | `storage.allow_instance_recreate` | `true` |
+| `RSTMDB_ALLOW_FLUSH_ALL` | `storage.allow_flush_all` | `false` |
 
 ### Authentication
 
@@ -305,6 +313,7 @@ network:
 storage:
   data_dir: "./data"
   fsync_policy: never  # Fast for development
+  allow_flush_all: true  # Useful for dev reset
 
 auth:
   required: false

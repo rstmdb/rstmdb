@@ -12,7 +12,6 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  BINARY_NAME: rstmdb
 
 jobs:
   build-linux:
@@ -43,27 +42,28 @@ jobs:
         with:
           key: ${{ matrix.target }}
 
-      - name: Build binary
+      - name: Build binaries
         run: |
           if [ "${{ matrix.target }}" = "aarch64-unknown-linux-gnu" ]; then
             export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
           fi
-          cargo build --release --target ${{ matrix.target }}
+          cargo build --release --target ${{ matrix.target }} -p rstmdb -p rstmdb-cli
 
       - name: Prepare artifacts
         run: |
           mkdir -p dist
-          cp target/${{ matrix.target }}/release/${{ env.BINARY_NAME }} dist/
+          cp target/${{ matrix.target }}/release/rstmdb dist/
+          cp target/${{ matrix.target }}/release/rstmdb-cli dist/
           cp README.md LICENSE dist/ 2>/dev/null || true
           cd dist
-          tar -czvf ${{ env.BINARY_NAME }}-linux-${{ matrix.arch }}.tar.gz ${{ env.BINARY_NAME }} README.md LICENSE 2>/dev/null || \
-          tar -czvf ${{ env.BINARY_NAME }}-linux-${{ matrix.arch }}.tar.gz ${{ env.BINARY_NAME }}
+          tar -czvf rstmdb-linux-${{ matrix.arch }}.tar.gz rstmdb rstmdb-cli README.md LICENSE 2>/dev/null || \
+          tar -czvf rstmdb-linux-${{ matrix.arch }}.tar.gz rstmdb rstmdb-cli
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: linux-${{ matrix.arch }}
-          path: dist/${{ env.BINARY_NAME }}-linux-${{ matrix.arch }}.tar.gz
+          path: dist/rstmdb-linux-${{ matrix.arch }}.tar.gz
 
   build-deb:
     name: Build DEB Package (${{ matrix.arch }})
@@ -108,12 +108,12 @@ jobs:
           VERSION="${VERSION#v}"
           echo "version=$VERSION" >> $GITHUB_OUTPUT
 
-      - name: Build binary
+      - name: Build binaries
         run: |
           if [ "${{ matrix.target }}" = "aarch64-unknown-linux-gnu" ]; then
             export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
           fi
-          cargo build --release --target ${{ matrix.target }}
+          cargo build --release --target ${{ matrix.target }} -p rstmdb -p rstmdb-cli
 
       - name: Build DEB package
         run: |
@@ -122,7 +122,7 @@ jobs:
       - name: Rename package
         run: |
           mkdir -p dist
-          cp target/${{ matrix.target }}/debian/*.deb dist/${{ env.BINARY_NAME }}_${{ steps.version.outputs.version }}_${{ matrix.arch }}.deb
+          cp target/${{ matrix.target }}/debian/*.deb dist/rstmdb_${{ steps.version.outputs.version }}_${{ matrix.arch }}.deb
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -173,17 +173,17 @@ jobs:
           VERSION="${VERSION#v}"
           echo "version=$VERSION" >> $GITHUB_OUTPUT
 
-      - name: Build binary
+      - name: Build binaries
         run: |
           if [ "${{ matrix.target }}" = "aarch64-unknown-linux-gnu" ]; then
             export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
           fi
-          cargo build --release --target ${{ matrix.target }}
+          cargo build --release --target ${{ matrix.target }} -p rstmdb -p rstmdb-cli
 
-      - name: Strip binary
+      - name: Strip binaries
         run: |
           if [ "${{ matrix.target }}" = "x86_64-unknown-linux-gnu" ]; then
-            strip target/${{ matrix.target }}/release/${{ env.BINARY_NAME }}
+            strip target/${{ matrix.target }}/release/rstmdb target/${{ matrix.target }}/release/rstmdb-cli
           fi
 
       - name: Build RPM package
@@ -193,7 +193,7 @@ jobs:
       - name: Rename package
         run: |
           mkdir -p dist
-          cp target/${{ matrix.target }}/generate-rpm/*.rpm dist/${{ env.BINARY_NAME }}-${{ steps.version.outputs.version }}-1.${{ matrix.arch }}.rpm
+          cp target/${{ matrix.target }}/generate-rpm/*.rpm dist/rstmdb-${{ steps.version.outputs.version }}-1.${{ matrix.arch }}.rpm
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -223,23 +223,24 @@ jobs:
         with:
           key: ${{ matrix.target }}
 
-      - name: Build binary
-        run: cargo build --release --target ${{ matrix.target }}
+      - name: Build binaries
+        run: cargo build --release --target ${{ matrix.target }} -p rstmdb -p rstmdb-cli
 
       - name: Prepare artifacts
         run: |
           mkdir -p dist
-          cp target/${{ matrix.target }}/release/${{ env.BINARY_NAME }} dist/
+          cp target/${{ matrix.target }}/release/rstmdb dist/
+          cp target/${{ matrix.target }}/release/rstmdb-cli dist/
           cp README.md LICENSE dist/ 2>/dev/null || true
           cd dist
-          zip ${{ env.BINARY_NAME }}-macos-${{ matrix.arch }}.zip ${{ env.BINARY_NAME }} README.md LICENSE 2>/dev/null || \
-          zip ${{ env.BINARY_NAME }}-macos-${{ matrix.arch }}.zip ${{ env.BINARY_NAME }}
+          zip rstmdb-macos-${{ matrix.arch }}.zip rstmdb rstmdb-cli README.md LICENSE 2>/dev/null || \
+          zip rstmdb-macos-${{ matrix.arch }}.zip rstmdb rstmdb-cli
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: macos-${{ matrix.arch }}
-          path: dist/${{ env.BINARY_NAME }}-macos-${{ matrix.arch }}.zip
+          path: dist/rstmdb-macos-${{ matrix.arch }}.zip
 
   build-windows:
     name: Build Windows (${{ matrix.target }})
@@ -263,23 +264,75 @@ jobs:
         with:
           key: ${{ matrix.target }}
 
-      - name: Build binary
-        run: cargo build --release --target ${{ matrix.target }}
+      - name: Build binaries
+        run: cargo build --release --target ${{ matrix.target }} -p rstmdb -p rstmdb-cli
 
       - name: Prepare artifacts
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path dist
-          Copy-Item "target/${{ matrix.target }}/release/${{ env.BINARY_NAME }}.exe" dist/
+          Copy-Item "target/${{ matrix.target }}/release/rstmdb.exe" dist/
+          Copy-Item "target/${{ matrix.target }}/release/rstmdb-cli.exe" dist/
           if (Test-Path README.md) { Copy-Item README.md dist/ }
           if (Test-Path LICENSE) { Copy-Item LICENSE dist/ }
-          Compress-Archive -Path dist/* -DestinationPath "dist/${{ env.BINARY_NAME }}-windows-${{ matrix.arch }}.zip"
+          Compress-Archive -Path dist/* -DestinationPath "dist/rstmdb-windows-${{ matrix.arch }}.zip"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: windows-${{ matrix.arch }}
-          path: dist/${{ env.BINARY_NAME }}-windows-${{ matrix.arch }}.zip
+          path: dist/rstmdb-windows-${{ matrix.arch }}.zip
+
+  docker:
+    name: Docker Build & Push
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Get version
+        id: version
+        run: |
+          if [ -n "${{ github.event.inputs.tag }}" ]; then
+            VERSION="${{ github.event.inputs.tag }}"
+          else
+            VERSION="${GITHUB_REF#refs/tags/}"
+          fi
+          echo "tag=$VERSION" >> $GITHUB_OUTPUT
+          echo "version=${VERSION#v}" >> $GITHUB_OUTPUT
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ secrets.DOCKERHUB_USERNAME }}/rstmdb
+          tags: |
+            type=raw,value=latest
+            type=semver,pattern={{version}},value=${{ steps.version.outputs.tag }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ steps.version.outputs.tag }}
+            type=semver,pattern={{major}},value=${{ steps.version.outputs.tag }}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
 
   release:
     name: Create Release

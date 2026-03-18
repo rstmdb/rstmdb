@@ -113,7 +113,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_fsync_policy(fsync_policy);
 
     // Create state machine engine
-    let engine = Arc::new(StateMachineEngine::new(wal_config)?);
+    let engine = Arc::new(
+        StateMachineEngine::new(wal_config)?
+            .with_allow_instance_recreate(config.storage.allow_instance_recreate),
+    );
 
     // Create snapshot store
     let snapshot_store = Arc::new(SnapshotStore::open(&snapshot_dir)?);
@@ -133,6 +136,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut server_config = ServerConfig::new(config.network.bind_addr);
     server_config.auth_required = config.auth.required;
     server_config.max_machine_versions = config.storage.max_machine_versions;
+    server_config.allow_flush_all = config.storage.allow_flush_all;
     if let Some(acceptor) = tls_acceptor {
         server_config = server_config.with_tls(acceptor);
     }

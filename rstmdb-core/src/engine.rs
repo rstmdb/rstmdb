@@ -35,11 +35,27 @@ pub struct StateMachineEngine {
 
     /// Write-ahead log.
     wal: Arc<Wal>,
+
+    /// Whether to allow re-creating deleted instances with the same ID.
+    allow_instance_recreate: bool,
 }
 
 impl StateMachineEngine {
     /// Creates a new engine with the given WAL configuration.
     /// Replays WAL entries to restore state.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use rstmdb_core::StateMachineEngine;
+    /// use rstmdb_wal::{WalConfig, FsyncPolicy};
+    ///
+    /// let dir = tempfile::TempDir::new().unwrap();
+    /// let config = WalConfig::new(dir.path())
+    ///     .with_fsync_policy(FsyncPolicy::Never);
+    /// let engine = StateMachineEngine::new(config).unwrap();
+    /// assert_eq!(engine.instance_count(), 0);
+    /// ```
     pub fn new(wal_config: WalConfig) -> Result<Self, CoreError> {
         let wal = Arc::new(Wal::open(wal_config)?);
 
@@ -48,12 +64,19 @@ impl StateMachineEngine {
             instances: DashMap::new(),
             idempotency_cache: DashMap::new(),
             wal,
+            allow_instance_recreate: true,
         };
 
         // Replay WAL to restore state
         engine.replay_wal()?;
 
         Ok(engine)
+    }
+
+    /// Sets whether re-creating deleted instances is allowed.
+    pub fn with_allow_instance_recreate(mut self, allow: bool) -> Self {
+        self.allow_instance_recreate = allow;
+        self
     }
 
     /// Creates a new engine with an existing WAL.
@@ -64,6 +87,7 @@ impl StateMachineEngine {
             instances: DashMap::new(),
             idempotency_cache: DashMap::new(),
             wal,
+            allow_instance_recreate: true,
         };
 
         engine.replay_wal()?;
@@ -193,6 +217,30 @@ impl StateMachineEngine {
     // =========================================================================
 
     /// Registers a machine definition.
+    ///
+    /// Returns `(checksum, created)` where `created` is `true` if this is a new definition.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use rstmdb_core::StateMachineEngine;
+    /// # use rstmdb_wal::{WalConfig, FsyncPolicy};
+    /// # use serde_json::json;
+    /// # let dir = tempfile::TempDir::new().unwrap();
+    /// # let engine = StateMachineEngine::new(
+    /// #     WalConfig::new(dir.path()).with_fsync_policy(FsyncPolicy::Never)
+    /// # ).unwrap();
+    /// let (checksum, created) = engine.put_machine("order", 1, &json!({
+    ///     "states": ["created", "paid"],
+    ///     "initial": "created",
+    ///     "transitions": [
+    ///         {"from": "created", "event": "PAY", "to": "paid"}
+    ///     ]
+    /// })).unwrap();
+    ///
+    /// assert!(created);
+    /// assert!(!checksum.is_empty());
+    /// ```
     pub fn put_machine(
         &self,
         name: &str,
@@ -284,7 +332,32 @@ impl StateMachineEngine {
     // Instance Management
     // =========================================================================
 
-    /// Creates a new instance.
+    /// Creates a new instance of a registered state machine.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use rstmdb_core::StateMachineEngine;
+    /// # use rstmdb_wal::{WalConfig, FsyncPolicy};
+    /// # use serde_json::json;
+    /// # let dir = tempfile::TempDir::new().unwrap();
+    /// # let engine = StateMachineEngine::new(
+    /// #     WalConfig::new(dir.path()).with_fsync_policy(FsyncPolicy::Never)
+    /// # ).unwrap();
+    /// # engine.put_machine("order", 1, &json!({
+    /// #     "states": ["created", "paid"],
+    /// #     "initial": "created",
+    /// #     "transitions": [{"from": "created", "event": "PAY", "to": "paid"}]
+    /// # })).unwrap();
+    /// let (instance, wal_offset) = engine.create_instance(
+    ///     "order-001", "order", 1,
+    ///     json!({"customer": "alice"}),
+    ///     None,
+    /// ).unwrap();
+    ///
+    /// assert_eq!(instance.state, "created");
+    /// assert_eq!(instance.id, "order-001");
+    /// ```
     pub fn create_instance(
         &self,
         instance_id: &str,
@@ -306,10 +379,17 @@ impl StateMachineEngine {
         }
 
         // Check if instance already exists
-        if self.instances.contains_key(instance_id) {
-            return Err(CoreError::InstanceExists {
-                instance_id: instance_id.to_string(),
-            });
+        if let Some(existing) = self.instances.get(instance_id) {
+            let is_deleted = existing.read().is_deleted();
+            drop(existing); // Release the map guard before mutating
+
+            if is_deleted && self.allow_instance_recreate {
+                self.instances.remove(instance_id);
+            } else {
+                return Err(CoreError::InstanceExists {
+                    instance_id: instance_id.to_string(),
+                });
+            }
         }
 
         // Get machine definition
@@ -343,17 +423,53 @@ impl StateMachineEngine {
         Ok((instance, sequence))
     }
 
-    /// Gets an instance by ID.
+    /// Gets an instance by ID. Returns `InstanceNotFound` for deleted instances.
     pub fn get_instance(&self, instance_id: &str) -> Result<Instance, CoreError> {
-        self.instances
+        let instance = self
+            .instances
             .get(instance_id)
             .map(|r| r.read().clone())
             .ok_or_else(|| CoreError::InstanceNotFound {
                 instance_id: instance_id.to_string(),
-            })
+            })?;
+
+        if instance.is_deleted() {
+            return Err(CoreError::InstanceNotFound {
+                instance_id: instance_id.to_string(),
+            });
+        }
+
+        Ok(instance)
     }
 
-    /// Applies an event to an instance.
+    /// Applies an event to an instance, triggering a state transition.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use rstmdb_core::StateMachineEngine;
+    /// # use rstmdb_wal::{WalConfig, FsyncPolicy};
+    /// # use serde_json::json;
+    /// # let dir = tempfile::TempDir::new().unwrap();
+    /// # let engine = StateMachineEngine::new(
+    /// #     WalConfig::new(dir.path()).with_fsync_policy(FsyncPolicy::Never)
+    /// # ).unwrap();
+    /// # engine.put_machine("order", 1, &json!({
+    /// #     "states": ["created", "paid"],
+    /// #     "initial": "created",
+    /// #     "transitions": [{"from": "created", "event": "PAY", "to": "paid"}]
+    /// # })).unwrap();
+    /// # engine.create_instance("order-001", "order", 1, json!({}), None).unwrap();
+    /// let result = engine.apply_event(
+    ///     "order-001", "PAY",
+    ///     json!({"amount": 99.99}),
+    ///     None, None, None, None,
+    /// ).unwrap();
+    ///
+    /// assert_eq!(result.from_state, "created");
+    /// assert_eq!(result.to_state, "paid");
+    /// assert!(result.applied);
+    /// ```
     #[allow(clippy::too_many_arguments)]
     pub fn apply_event(
         &self,
@@ -382,6 +498,13 @@ impl StateMachineEngine {
                 })?;
 
         let mut instance = instance_lock.write();
+
+        // Reject events on deleted instances
+        if instance.is_deleted() {
+            return Err(CoreError::InstanceNotFound {
+                instance_id: instance_id.to_string(),
+            });
+        }
 
         // Check expected state
         if let Some(expected) = expected_state {
@@ -471,6 +594,26 @@ impl StateMachineEngine {
     }
 
     /// Deletes an instance (soft delete).
+    ///
+    /// After deletion, `get_instance` and `apply_event` return `InstanceNotFound`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use rstmdb_core::StateMachineEngine;
+    /// # use rstmdb_wal::{WalConfig, FsyncPolicy};
+    /// # use serde_json::json;
+    /// # let dir = tempfile::TempDir::new().unwrap();
+    /// # let engine = StateMachineEngine::new(
+    /// #     WalConfig::new(dir.path()).with_fsync_policy(FsyncPolicy::Never)
+    /// # ).unwrap();
+    /// # engine.put_machine("order", 1, &json!({
+    /// #     "states": ["created"], "initial": "created", "transitions": []
+    /// # })).unwrap();
+    /// # engine.create_instance("i1", "order", 1, json!({}), None).unwrap();
+    /// engine.delete_instance("i1", None).unwrap();
+    /// assert!(engine.get_instance("i1").is_err());
+    /// ```
     pub fn delete_instance(
         &self,
         instance_id: &str,
@@ -501,6 +644,43 @@ impl StateMachineEngine {
         instance.soft_delete(offset.as_u64());
 
         Ok(offset.as_u64())
+    }
+
+    // =========================================================================
+    // Administrative
+    // =========================================================================
+
+    /// Clears all instances, machine definitions, and idempotency cache.
+    /// Returns `(instances_removed, machines_removed)`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use rstmdb_core::StateMachineEngine;
+    /// # use rstmdb_wal::{WalConfig, FsyncPolicy};
+    /// # use serde_json::json;
+    /// # let dir = tempfile::TempDir::new().unwrap();
+    /// # let engine = StateMachineEngine::new(
+    /// #     WalConfig::new(dir.path()).with_fsync_policy(FsyncPolicy::Never)
+    /// # ).unwrap();
+    /// # engine.put_machine("order", 1, &json!({
+    /// #     "states": ["created"], "initial": "created", "transitions": []
+    /// # })).unwrap();
+    /// # engine.create_instance("i1", "order", 1, json!({}), None).unwrap();
+    /// let (instances, machines) = engine.flush_all();
+    /// assert_eq!(instances, 1);
+    /// assert_eq!(machines, 1);
+    /// assert_eq!(engine.instance_count(), 0);
+    /// ```
+    pub fn flush_all(&self) -> (usize, usize) {
+        let instance_count = self.instances.len();
+        let machine_count = self.definitions.len();
+
+        self.instances.clear();
+        self.definitions.clear();
+        self.idempotency_cache.clear();
+
+        (instance_count, machine_count)
     }
 
     // =========================================================================
@@ -754,5 +934,226 @@ mod tests {
 
         assert_eq!(result1.wal_offset, result2.wal_offset);
         assert_eq!(result1.to_state, result2.to_state);
+    }
+
+    // =========================================================================
+    // Delete + Recreate Tests
+    // =========================================================================
+
+    #[test]
+    fn test_delete_instance() {
+        let (_dir, engine) = test_engine();
+        engine
+            .put_machine("order", 1, &sample_definition())
+            .unwrap();
+        engine
+            .create_instance("i-del", "order", 1, json!({}), None)
+            .unwrap();
+
+        let offset = engine.delete_instance("i-del", None).unwrap();
+        assert!(offset > 0);
+
+        // Should not be retrievable after delete
+        let err = engine.get_instance("i-del").unwrap_err();
+        assert!(matches!(err, CoreError::InstanceNotFound { .. }));
+    }
+
+    #[test]
+    fn test_delete_instance_idempotent() {
+        let (_dir, engine) = test_engine();
+        engine
+            .put_machine("order", 1, &sample_definition())
+            .unwrap();
+        engine
+            .create_instance("i-del2", "order", 1, json!({}), None)
+            .unwrap();
+
+        // First delete succeeds
+        engine.delete_instance("i-del2", None).unwrap();
+        // Second delete is idempotent (returns existing offset)
+        engine.delete_instance("i-del2", None).unwrap();
+    }
+
+    #[test]
+    fn test_apply_event_on_deleted_instance_fails() {
+        let (_dir, engine) = test_engine();
+        engine
+            .put_machine("order", 1, &sample_definition())
+            .unwrap();
+        engine
+            .create_instance("i-del3", "order", 1, json!({}), None)
+            .unwrap();
+
+        engine.delete_instance("i-del3", None).unwrap();
+
+        let err = engine
+            .apply_event("i-del3", "PAY", json!({}), None, None, None, None)
+            .unwrap_err();
+        assert!(matches!(err, CoreError::InstanceNotFound { .. }));
+    }
+
+    #[test]
+    fn test_deleted_instance_excluded_from_list() {
+        let (_dir, engine) = test_engine();
+        engine
+            .put_machine("order", 1, &sample_definition())
+            .unwrap();
+        engine
+            .create_instance("i-list1", "order", 1, json!({}), None)
+            .unwrap();
+        engine
+            .create_instance("i-list2", "order", 1, json!({}), None)
+            .unwrap();
+
+        assert_eq!(engine.get_all_instances().len(), 2);
+
+        engine.delete_instance("i-list1", None).unwrap();
+
+        let instances = engine.get_all_instances();
+        assert_eq!(instances.len(), 1);
+        assert_eq!(instances[0].id, "i-list2");
+    }
+
+    #[test]
+    fn test_recreate_deleted_instance_allowed() {
+        let (_dir, engine) = test_engine();
+        // allow_instance_recreate is true by default
+        engine
+            .put_machine("order", 1, &sample_definition())
+            .unwrap();
+
+        // Create, use, and delete
+        engine
+            .create_instance("i-reuse", "order", 1, json!({"round": 1}), None)
+            .unwrap();
+        engine
+            .apply_event("i-reuse", "PAY", json!({}), None, None, None, None)
+            .unwrap();
+        engine.delete_instance("i-reuse", None).unwrap();
+
+        // Re-create with same ID — should succeed
+        let (instance, _) = engine
+            .create_instance("i-reuse", "order", 1, json!({"round": 2}), None)
+            .unwrap();
+        assert_eq!(instance.state, "created"); // Fresh instance, back to initial state
+        assert_eq!(instance.ctx, json!({"round": 2}));
+
+        // Should be fully functional
+        let result = engine
+            .apply_event("i-reuse", "PAY", json!({}), None, None, None, None)
+            .unwrap();
+        assert_eq!(result.to_state, "paid");
+    }
+
+    #[test]
+    fn test_recreate_deleted_instance_disallowed() {
+        let dir = TempDir::new().unwrap();
+        let config = WalConfig::new(dir.path())
+            .with_segment_size(4096)
+            .with_fsync_policy(FsyncPolicy::EveryWrite);
+        let engine = StateMachineEngine::new(config)
+            .unwrap()
+            .with_allow_instance_recreate(false);
+
+        engine
+            .put_machine("order", 1, &sample_definition())
+            .unwrap();
+        engine
+            .create_instance("i-noreuse", "order", 1, json!({}), None)
+            .unwrap();
+        engine.delete_instance("i-noreuse", None).unwrap();
+
+        // Re-create should fail when allow_instance_recreate is false
+        let err = engine
+            .create_instance("i-noreuse", "order", 1, json!({}), None)
+            .unwrap_err();
+        assert!(matches!(err, CoreError::InstanceExists { .. }));
+    }
+
+    #[test]
+    fn test_recreate_active_instance_always_fails() {
+        let (_dir, engine) = test_engine();
+        engine
+            .put_machine("order", 1, &sample_definition())
+            .unwrap();
+        engine
+            .create_instance("i-active", "order", 1, json!({}), None)
+            .unwrap();
+
+        // Creating again without deleting should always fail
+        let err = engine
+            .create_instance("i-active", "order", 1, json!({}), None)
+            .unwrap_err();
+        assert!(matches!(err, CoreError::InstanceExists { .. }));
+    }
+
+    // =========================================================================
+    // Flush All Tests
+    // =========================================================================
+
+    #[test]
+    fn test_flush_all() {
+        let (_dir, engine) = test_engine();
+        engine
+            .put_machine("order", 1, &sample_definition())
+            .unwrap();
+        engine
+            .put_machine(
+                "user",
+                1,
+                &json!({
+                    "states": ["active"],
+                    "initial": "active",
+                    "transitions": []
+                }),
+            )
+            .unwrap();
+        engine
+            .create_instance("i1", "order", 1, json!({}), None)
+            .unwrap();
+        engine
+            .create_instance("i2", "order", 1, json!({}), None)
+            .unwrap();
+
+        let (instances, machines) = engine.flush_all();
+        assert_eq!(instances, 2);
+        assert_eq!(machines, 2);
+
+        // Everything should be gone
+        assert!(engine.get_instance("i1").is_err());
+        assert!(engine.get_instance("i2").is_err());
+        assert!(engine.get_machine("order", 1).is_err());
+        assert_eq!(engine.get_all_instances().len(), 0);
+    }
+
+    #[test]
+    fn test_flush_all_then_recreate() {
+        let (_dir, engine) = test_engine();
+        engine
+            .put_machine("order", 1, &sample_definition())
+            .unwrap();
+        engine
+            .create_instance("i1", "order", 1, json!({}), None)
+            .unwrap();
+
+        engine.flush_all();
+
+        // Can re-register machine and create instances after flush
+        engine
+            .put_machine("order", 1, &sample_definition())
+            .unwrap();
+        let (instance, _) = engine
+            .create_instance("i1", "order", 1, json!({"fresh": true}), None)
+            .unwrap();
+        assert_eq!(instance.state, "created");
+        assert_eq!(instance.ctx, json!({"fresh": true}));
+    }
+
+    #[test]
+    fn test_flush_all_empty_database() {
+        let (_dir, engine) = test_engine();
+        let (instances, machines) = engine.flush_all();
+        assert_eq!(instances, 0);
+        assert_eq!(machines, 0);
     }
 }

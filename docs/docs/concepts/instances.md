@@ -150,8 +150,39 @@ rstmdb-cli delete-instance order-001
 
 Deleted instances:
 - Are marked as deleted but not immediately removed
-- Can be excluded from list queries
+- Return `INSTANCE_NOT_FOUND` on `GET_INSTANCE` and `APPLY_EVENT`
+- Are excluded from `LIST_INSTANCES` results
 - Are cleaned up during compaction
+- Deleting an already-deleted instance is idempotent
+
+### Re-creating Deleted Instances
+
+By default, you can re-create an instance with the same ID after deletion. The new instance starts fresh in the initial state:
+
+```bash
+# Create, use, and delete
+rstmdb-cli create-instance -m order -V 1 -i order-001 -c '{"customer": "alice"}'
+rstmdb-cli apply-event -i order-001 -e PAY -p '{"amount": 99.99}'
+rstmdb-cli delete-instance order-001
+
+# Re-create with the same ID — starts fresh
+rstmdb-cli create-instance -m order -V 1 -i order-001 -c '{"customer": "bob"}'
+# State is back to "created", context is {"customer": "bob"}
+```
+
+This behavior can be disabled in the server configuration:
+
+```yaml
+storage:
+  allow_instance_recreate: false
+```
+
+Or via environment variable:
+```bash
+export RSTMDB_ALLOW_INSTANCE_RECREATE=false
+```
+
+When disabled, attempting to create an instance with a previously used ID returns `INSTANCE_EXISTS`, even after deletion.
 
 ## Instance Lifecycle
 

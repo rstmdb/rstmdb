@@ -146,6 +146,26 @@ pub struct MachineDefinition {
 
 impl MachineDefinition {
     /// Parses and validates a machine definition from JSON.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use rstmdb_core::MachineDefinition;
+    /// use serde_json::json;
+    ///
+    /// let def = MachineDefinition::from_json("order", 1, &json!({
+    ///     "states": ["created", "paid", "shipped"],
+    ///     "initial": "created",
+    ///     "transitions": [
+    ///         {"from": "created", "event": "PAY", "to": "paid"},
+    ///         {"from": "paid", "event": "SHIP", "to": "shipped"}
+    ///     ]
+    /// })).unwrap();
+    ///
+    /// assert_eq!(def.name, "order");
+    /// assert_eq!(def.initial.as_str(), "created");
+    /// assert!(def.has_state(&rstmdb_core::State::new("paid")));
+    /// ```
     pub fn from_json(
         name: impl Into<String>,
         version: u32,

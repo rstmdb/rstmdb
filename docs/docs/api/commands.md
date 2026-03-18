@@ -15,7 +15,7 @@ Complete reference for all rstmdb API commands.
 | [Instances](./instances) | CREATE_INSTANCE, GET_INSTANCE, LIST_INSTANCES, DELETE_INSTANCE |
 | [Events](./events) | APPLY_EVENT, BATCH |
 | [Subscriptions](./subscriptions) | WATCH_INSTANCE, WATCH_ALL, UNWATCH |
-| [Storage](./storage) | SNAPSHOT_INSTANCE, WAL_READ, WAL_STATS, COMPACT |
+| [Storage](./storage) | SNAPSHOT_INSTANCE, WAL_READ, WAL_STATS, COMPACT, FLUSH_ALL |
 
 ## Quick Reference
 
@@ -131,6 +131,9 @@ Complete reference for all rstmdb API commands.
 
 // COMPACT
 {"op": "COMPACT", "params": {"force_snapshot": false}}
+
+// FLUSH_ALL - Clear all data (requires storage.allow_flush_all: true)
+{"op": "FLUSH_ALL"}
 ```
 
 ## Common Parameters

@@ -43,7 +43,7 @@ PONG
 
 | Option | Env Variable | Default | Description |
 |--------|--------------|---------|-------------|
-| `-s, --server <ADDR>` | `RSTMDB_SERVER` | `127.0.0.1:7401` | Server address |
+| `-s, --server <ADDR>` | `RSTMDB_SERVER` | `127.0.0.1:7401` | Server address (supports hostnames, e.g. `localhost:7401`) |
 | `-t, --token <TOKEN>` | `RSTMDB_TOKEN` | None | Authentication token |
 | `--tls` | `RSTMDB_TLS` | false | Enable TLS |
 | `--ca-cert <PATH>` | `RSTMDB_CA_CERT` | None | CA certificate path |
@@ -373,6 +373,24 @@ Trigger WAL compaction.
 ```bash
 rstmdb-cli compact
 ```
+
+#### flush-all
+
+Clear all instances and machine definitions from the database. Requires `storage.allow_flush_all: true` in the server configuration.
+
+```bash
+rstmdb-cli flush-all
+```
+
+```
+Database flushed
+  Instances removed: 42
+  Machines removed: 3
+```
+
+:::caution
+This is a destructive operation that removes all in-memory state. It does not clear the WAL — use `compact` after `flush-all` for a full reset. This command is disabled by default and must be explicitly enabled in the server configuration.
+:::
 
 ---
 

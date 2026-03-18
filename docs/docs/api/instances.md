@@ -60,7 +60,11 @@ Creates a new instance of a state machine.
 | Code | Description |
 |------|-------------|
 | `MACHINE_NOT_FOUND` | Machine or version doesn't exist |
-| `INSTANCE_EXISTS` | Instance ID already in use |
+| `INSTANCE_EXISTS` | Instance ID already in use (or was deleted and `allow_instance_recreate` is `false`) |
+
+:::tip Instance Re-creation
+By default, you can re-create an instance with the same ID after it has been deleted. The new instance starts fresh with the initial state. This behavior can be disabled by setting `storage.allow_instance_recreate: false` in the server configuration.
+:::
 
 ---
 
@@ -217,11 +221,13 @@ Soft-deletes an instance.
 
 ### Behavior
 
-- Instance is marked as deleted
-- Excluded from LIST_INSTANCES by default
-- GET_INSTANCE returns INSTANCE_NOT_FOUND
-- Events cannot be applied to deleted instances
+- Instance is marked as deleted (soft delete)
+- `GET_INSTANCE` returns `INSTANCE_NOT_FOUND` for deleted instances
+- `APPLY_EVENT` returns `INSTANCE_NOT_FOUND` for deleted instances
+- Excluded from `LIST_INSTANCES` results
+- Can be re-created with the same ID using `CREATE_INSTANCE` (when `storage.allow_instance_recreate` is `true`, which is the default)
 - Physically removed during compaction
+- Deleting an already-deleted instance is idempotent (returns success)
 
 ### Errors
 

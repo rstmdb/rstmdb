@@ -44,7 +44,35 @@ impl Default for ServerInfo {
     }
 }
 
-/// Command handler.
+/// Command handler that dispatches RCP requests to the engine.
+///
+/// # Examples
+///
+/// ```
+/// use rstmdb_server::handler::{CommandHandler, ServerInfo};
+/// use rstmdb_core::StateMachineEngine;
+/// use rstmdb_wal::{WalConfig, FsyncPolicy};
+/// use rstmdb_protocol::{Request, Operation};
+/// use rstmdb_server::session::Session;
+/// use serde_json::json;
+/// use std::sync::Arc;
+/// use std::net::{SocketAddr, IpAddr, Ipv4Addr};
+///
+/// let dir = tempfile::TempDir::new().unwrap();
+/// let engine = Arc::new(StateMachineEngine::new(
+///     WalConfig::new(dir.path()).with_fsync_policy(FsyncPolicy::EveryWrite),
+/// ).unwrap());
+/// let handler = CommandHandler::new(engine);
+///
+/// let mut session = Session::new(
+///     SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 12345),
+///     false,
+/// );
+///
+/// // Ping
+/// let response = handler.handle(&mut session, &Request::new("1", Operation::Ping));
+/// assert!(response.is_ok());
+/// ```
 pub struct CommandHandler {
     engine: Arc<StateMachineEngine>,
     snapshot_store: Option<Arc<SnapshotStore>>,
@@ -59,6 +87,8 @@ pub struct CommandHandler {
     broadcaster: Option<Arc<EventBroadcaster>>,
     /// Metrics for request tracking.
     metrics: Option<Arc<Metrics>>,
+    /// Whether the FLUSH_ALL operation is allowed.
+    allow_flush_all: bool,
 }
 
 impl CommandHandler {
@@ -73,6 +103,7 @@ impl CommandHandler {
             max_machine_versions: 0,
             broadcaster: None,
             metrics: None,
+            allow_flush_all: false,
         }
     }
 
@@ -93,6 +124,7 @@ impl CommandHandler {
             max_machine_versions: 0,
             broadcaster: None,
             metrics: None,
+            allow_flush_all: false,
         }
     }
 
@@ -111,6 +143,7 @@ impl CommandHandler {
             max_machine_versions: 0,
             broadcaster: None,
             metrics: None,
+            allow_flush_all: false,
         })
     }
 
@@ -136,6 +169,7 @@ impl CommandHandler {
             max_machine_versions: 0,
             broadcaster: None,
             metrics: None,
+            allow_flush_all: false,
         })
     }
 
@@ -150,6 +184,7 @@ impl CommandHandler {
             max_machine_versions: 0,
             broadcaster: None,
             metrics: None,
+            allow_flush_all: false,
         }
     }
 
@@ -168,6 +203,12 @@ impl CommandHandler {
     /// Sets the maximum number of versions per machine (0 = unlimited).
     pub fn with_max_machine_versions(mut self, max: u32) -> Self {
         self.max_machine_versions = max;
+        self
+    }
+
+    /// Enables or disables the FLUSH_ALL operation.
+    pub fn with_allow_flush_all(mut self, allow: bool) -> Self {
+        self.allow_flush_all = allow;
         self
     }
 
@@ -277,6 +318,7 @@ impl CommandHandler {
             Operation::WatchInstance => self.handle_watch_instance_cmd(session, &request.params),
             Operation::WatchAll => self.handle_watch_all_cmd(session, &request.params),
             Operation::Unwatch => self.handle_unwatch(session, &request.params),
+            Operation::FlushAll => self.handle_flush_all(),
         };
 
         // Record metrics
@@ -322,6 +364,7 @@ impl CommandHandler {
             Operation::WatchInstance => "WATCH_INSTANCE",
             Operation::WatchAll => "WATCH_ALL",
             Operation::Unwatch => "UNWATCH",
+            Operation::FlushAll => "FLUSH_ALL",
         }
     }
 
@@ -574,8 +617,12 @@ impl CommandHandler {
     }
 
     fn handle_list_instances(&self, params: &Value) -> Result<Value, ServerError> {
-        let p: ListInstancesParams = serde_json::from_value(params.clone())
-            .map_err(|e| ServerError::InvalidRequest(e.to_string()))?;
+        let p: ListInstancesParams = if params.is_null() {
+            ListInstancesParams::default()
+        } else {
+            serde_json::from_value(params.clone())
+                .map_err(|e| ServerError::InvalidRequest(e.to_string()))?
+        };
 
         let all_instances = self.engine.get_all_instances();
 
@@ -781,6 +828,26 @@ impl CommandHandler {
         }
     }
 
+    fn handle_flush_all(&self) -> Result<Value, ServerError> {
+        if !self.allow_flush_all {
+            return Err(ServerError::InvalidRequest(
+                "FLUSH_ALL is disabled. Set storage.allow_flush_all=true in config to enable."
+                    .to_string(),
+            ));
+        }
+
+        let (instances_removed, machines_removed) = self.engine.flush_all();
+
+        // Update gauge metrics
+        self.update_gauge_metrics();
+
+        Ok(json!({
+            "flushed": true,
+            "instances_removed": instances_removed,
+            "machines_removed": machines_removed,
+        }))
+    }
+
     fn handle_compact(&self, params: &Value) -> Result<Value, ServerError> {
         let force_snapshot = params["force_snapshot"].as_bool().unwrap_or(false);
 
@@ -968,8 +1035,12 @@ impl CommandHandler {
         session: &mut Session,
         params: &Value,
     ) -> Result<Value, ServerError> {
-        let p: WatchAllParams = serde_json::from_value(params.clone())
-            .map_err(|e| ServerError::InvalidRequest(e.to_string()))?;
+        let p: WatchAllParams = if params.is_null() {
+            WatchAllParams::default()
+        } else {
+            serde_json::from_value(params.clone())
+                .map_err(|e| ServerError::InvalidRequest(e.to_string()))?
+        };
 
         let broadcaster = self.broadcaster.as_ref().ok_or_else(|| {
             ServerError::InvalidRequest("streaming not enabled on this server".to_string())
@@ -1009,8 +1080,12 @@ impl CommandHandler {
         session: &mut Session,
         params: &Value,
     ) -> Result<(Value, broadcast::Receiver<InstanceEvent>, EventFilter), ServerError> {
-        let p: WatchAllParams = serde_json::from_value(params.clone())
-            .map_err(|e| ServerError::InvalidRequest(e.to_string()))?;
+        let p: WatchAllParams = if params.is_null() {
+            WatchAllParams::default()
+        } else {
+            serde_json::from_value(params.clone())
+                .map_err(|e| ServerError::InvalidRequest(e.to_string()))?
+        };
 
         let broadcaster = self.broadcaster.as_ref().ok_or_else(|| {
             ServerError::InvalidRequest("streaming not enabled on this server".to_string())
@@ -1965,5 +2040,209 @@ mod tests {
         let result = response.result.unwrap();
         let instance_id = result["instance_id"].as_str().unwrap();
         assert!(!instance_id.is_empty());
+    }
+
+    // =========================================================================
+    // Null params tests (client sends no params field)
+    // =========================================================================
+
+    #[test]
+    fn test_list_instances_null_params() {
+        let (_dir, handler, mut session) = test_handler();
+
+        // Setup: put machine and create an instance
+        let put_request = Request::new("1", Operation::PutMachine).with_params(json!({
+            "machine": "order",
+            "version": 1,
+            "definition": {
+                "states": ["created"],
+                "initial": "created",
+                "transitions": []
+            }
+        }));
+        handler.handle(&mut session, &put_request);
+
+        let create_request = Request::new("2", Operation::CreateInstance).with_params(json!({
+            "instance_id": "i-null-test",
+            "machine": "order",
+            "version": 1
+        }));
+        handler.handle(&mut session, &create_request);
+
+        // Send LIST_INSTANCES with null params (simulates missing params field on the wire)
+        let mut request = Request::new("3", Operation::ListInstances);
+        request.params = Value::Null;
+        let response = handler.handle(&mut session, &request);
+
+        assert!(response.is_ok());
+        let result = response.result.unwrap();
+        assert_eq!(result["total"], 1);
+        assert_eq!(result["instances"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_watch_all_null_params() {
+        let (_dir, handler, mut session) = test_handler_with_broadcaster();
+
+        // Send WATCH_ALL with null params
+        let mut request = Request::new("1", Operation::WatchAll);
+        request.params = Value::Null;
+        let response = handler.handle(&mut session, &request);
+
+        assert!(response.is_ok());
+        let result = response.result.unwrap();
+        assert!(result["subscription_id"].is_string());
+    }
+
+    #[test]
+    fn test_list_instances_empty_object_params() {
+        let (_dir, handler, mut session) = test_handler();
+
+        // Setup
+        let put_request = Request::new("1", Operation::PutMachine).with_params(json!({
+            "machine": "order",
+            "version": 1,
+            "definition": {
+                "states": ["created"],
+                "initial": "created",
+                "transitions": []
+            }
+        }));
+        handler.handle(&mut session, &put_request);
+
+        let create_request = Request::new("2", Operation::CreateInstance).with_params(json!({
+            "instance_id": "i-empty-test",
+            "machine": "order",
+            "version": 1
+        }));
+        handler.handle(&mut session, &create_request);
+
+        // Send LIST_INSTANCES with empty object params (should also work)
+        let request = Request::new("3", Operation::ListInstances).with_params(json!({}));
+        let response = handler.handle(&mut session, &request);
+
+        assert!(response.is_ok());
+        let result = response.result.unwrap();
+        assert_eq!(result["total"], 1);
+    }
+
+    // =========================================================================
+    // Flush all tests
+    // =========================================================================
+
+    #[test]
+    fn test_flush_all_disabled_by_default() {
+        let (_dir, handler, mut session) = test_handler();
+
+        let request = Request::new("1", Operation::FlushAll);
+        let response = handler.handle(&mut session, &request);
+
+        assert!(response.is_error());
+        assert!(response
+            .error
+            .unwrap()
+            .message
+            .contains("FLUSH_ALL is disabled"));
+    }
+
+    #[test]
+    fn test_flush_all_enabled() {
+        let (_dir, handler, mut session) = test_handler();
+        let handler = handler.with_allow_flush_all(true);
+
+        // Setup: put machine and create instances
+        let put_request = Request::new("1", Operation::PutMachine).with_params(json!({
+            "machine": "order",
+            "version": 1,
+            "definition": {
+                "states": ["created"],
+                "initial": "created",
+                "transitions": []
+            }
+        }));
+        handler.handle(&mut session, &put_request);
+
+        for i in 1..=3 {
+            let create_request = Request::new(format!("{}", i + 1), Operation::CreateInstance)
+                .with_params(json!({
+                    "instance_id": format!("flush-{}", i),
+                    "machine": "order",
+                    "version": 1
+                }));
+            handler.handle(&mut session, &create_request);
+        }
+
+        // Verify instances exist
+        let list_request = Request::new("10", Operation::ListInstances);
+        let response = handler.handle(&mut session, &list_request);
+        assert_eq!(response.result.unwrap()["total"], 3);
+
+        // Flush all
+        let flush_request = Request::new("11", Operation::FlushAll);
+        let response = handler.handle(&mut session, &flush_request);
+        assert!(response.is_ok());
+        let result = response.result.unwrap();
+        assert_eq!(result["flushed"], true);
+        assert_eq!(result["instances_removed"], 3);
+        assert_eq!(result["machines_removed"], 1);
+
+        // Verify everything is gone
+        let list_request = Request::new("12", Operation::ListInstances);
+        let response = handler.handle(&mut session, &list_request);
+        assert_eq!(response.result.unwrap()["total"], 0);
+
+        let list_machines = Request::new("13", Operation::ListMachines);
+        let response = handler.handle(&mut session, &list_machines);
+        let result = response.result.unwrap();
+        assert_eq!(result["items"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn test_flush_all_then_recreate() {
+        let (_dir, handler, mut session) = test_handler();
+        let handler = handler.with_allow_flush_all(true);
+
+        // Setup
+        let put_request = Request::new("1", Operation::PutMachine).with_params(json!({
+            "machine": "order",
+            "version": 1,
+            "definition": {
+                "states": ["created", "paid"],
+                "initial": "created",
+                "transitions": [{"from": "created", "event": "PAY", "to": "paid"}]
+            }
+        }));
+        handler.handle(&mut session, &put_request);
+
+        let create_request = Request::new("2", Operation::CreateInstance).with_params(json!({
+            "instance_id": "i-flush-recreate",
+            "machine": "order",
+            "version": 1
+        }));
+        handler.handle(&mut session, &create_request);
+
+        // Flush
+        let flush_request = Request::new("3", Operation::FlushAll);
+        handler.handle(&mut session, &flush_request);
+
+        // Re-register machine and create new instance with same ID
+        handler.handle(&mut session, &put_request);
+
+        let create_request = Request::new("5", Operation::CreateInstance).with_params(json!({
+            "instance_id": "i-flush-recreate",
+            "machine": "order",
+            "version": 1
+        }));
+        let response = handler.handle(&mut session, &create_request);
+        assert!(response.is_ok());
+
+        // Apply event to verify it works
+        let apply_request = Request::new("6", Operation::ApplyEvent).with_params(json!({
+            "instance_id": "i-flush-recreate",
+            "event": "PAY"
+        }));
+        let response = handler.handle(&mut session, &apply_request);
+        assert!(response.is_ok());
+        assert_eq!(response.result.unwrap()["to_state"], "paid");
     }
 }

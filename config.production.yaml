@@ -23,6 +23,10 @@ storage:
   # Maximum number of versions per state machine (0 = unlimited)
   # When limit is reached, new versions will be rejected
   max_machine_versions: 0
+  allow_instance_recreate: true
+
+  # FLUSH_ALL is disabled in production for safety
+  allow_flush_all: false
 
 compaction:
   enabled: true

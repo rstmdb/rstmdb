@@ -32,6 +32,8 @@ storage:
   wal_segment_size_mb: 64
   fsync_policy: every_write
   max_machine_versions: 0
+  allow_instance_recreate: true
+  allow_flush_all: true
 
 # Automatic compaction settings
 compaction:

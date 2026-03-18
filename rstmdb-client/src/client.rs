@@ -7,6 +7,38 @@ use serde_json::{json, Value};
 use std::sync::Arc;
 
 /// High-level client for rstmdb.
+///
+/// # Examples
+///
+/// ```no_run
+/// use rstmdb_client::{Client, ConnectionConfig};
+/// use serde_json::json;
+///
+/// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+/// let config = ConnectionConfig::new("127.0.0.1:7401".parse()?)
+///     .with_client_name("my-app");
+/// let client = Client::new(config);
+/// client.connect().await?;
+///
+/// // Ping the server
+/// client.ping().await?;
+///
+/// // Register a machine
+/// client.put_machine("order", 1, json!({
+///     "states": ["created", "paid"],
+///     "initial": "created",
+///     "transitions": [{"from": "created", "event": "PAY", "to": "paid"}]
+/// })).await?;
+///
+/// // Create an instance
+/// let result = client.create_instance(
+///     "order", 1, Some("order-001"), Some(json!({"customer": "alice"})), None,
+/// ).await?;
+///
+/// client.close().await?;
+/// # Ok(())
+/// # }
+/// ```
 pub struct Client {
     conn: Arc<Connection>,
 }
@@ -283,6 +315,12 @@ impl Client {
         });
 
         self.request(Operation::SnapshotInstance, params).await
+    }
+
+    /// Clears all instances and machine definitions from the database.
+    /// Requires `storage.allow_flush_all=true` in server config.
+    pub async fn flush_all(&self) -> Result<Value, ClientError> {
+        self.request(Operation::FlushAll, json!({})).await
     }
 
     /// Compacts WAL by snapshotting instances and deleting old segments.

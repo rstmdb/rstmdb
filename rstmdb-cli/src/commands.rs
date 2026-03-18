@@ -256,6 +256,18 @@ pub async fn execute(client: &Client, cmd: Commands) -> Result<String, Box<dyn s
         Commands::WatchInstance { .. } => unreachable!(),
         Commands::WatchAll { .. } => unreachable!(),
 
+        Commands::FlushAll => {
+            let result = client.flush_all().await?;
+            let instances = result["instances_removed"].as_u64().unwrap_or(0);
+            let machines = result["machines_removed"].as_u64().unwrap_or(0);
+            Ok(format!(
+                "{}\n  Instances removed: {}\n  Machines removed: {}",
+                "Database flushed".green(),
+                instances,
+                machines
+            ))
+        }
+
         Commands::Unwatch { subscription_id } => {
             let result = client.unwatch(&subscription_id).await?;
             if result.removed {

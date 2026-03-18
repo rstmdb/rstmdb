@@ -3,7 +3,7 @@
 # ============================================================================
 # Stage 1: Chef - Prepare dependency recipe
 # ============================================================================
-FROM rust:1.83-slim-bookworm AS chef
+FROM rust:1-slim-bookworm AS chef
 
 RUN cargo install cargo-chef --locked
 WORKDIR /app
