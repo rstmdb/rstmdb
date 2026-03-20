@@ -87,6 +87,32 @@ compaction:
   # Minimum interval between auto-compactions in seconds
   min_interval_secs: 60
 
+# Replication settings
+replication:
+  # Role: standalone (no replication), primary (accepts writes, streams to replicas),
+  #        or replica (read-only, receives stream from primary)
+  role: standalone
+
+  # Mode: async (primary streams entries in background, writes return immediately)
+  #        or sync (primary waits for ACKs from replicas before returning)
+  mode: async
+
+  # Upstream primary address (required for replica role)
+  # upstream: "primary-host:7401"
+
+  # Minimum number of replica ACKs required before responding (sync mode only)
+  sync_replicas: 1
+
+  # Timeout in milliseconds for waiting for sync ACKs
+  sync_timeout_ms: 5000
+
+  # Alerting thresholds for replication lag
+  max_lag_seconds: 30
+  max_lag_entries: 10000
+
+  # Authentication token for replication connections
+  # auth_token: "repl-secret-token"
+
 # Prometheus metrics settings
 metrics:
   # Enable metrics HTTP server

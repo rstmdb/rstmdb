@@ -119,8 +119,9 @@ impl StateMachineEngine {
         Ok(())
     }
 
-    /// Replays a single WAL entry.
-    fn replay_entry(&self, offset: u64, entry: WalEntry) -> Result<(), CoreError> {
+    /// Replays a single WAL entry to restore in-memory state.
+    /// This is used during WAL recovery and replication.
+    pub fn replay_entry(&self, offset: u64, entry: WalEntry) -> Result<(), CoreError> {
         match entry {
             WalEntry::PutMachine {
                 machine,
@@ -210,6 +211,18 @@ impl StateMachineEngine {
         }
 
         Ok(())
+    }
+
+    /// Applies a replicated WAL entry from a primary server.
+    /// Appends the entry to the local WAL, then replays it to update in-memory state.
+    /// Returns the local (sequence, offset) after appending.
+    pub fn apply_replicated_entry(
+        &self,
+        entry: WalEntry,
+    ) -> Result<(u64, u64), CoreError> {
+        let (sequence, offset) = self.wal.append(&entry)?;
+        self.replay_entry(offset.as_u64(), entry)?;
+        Ok((sequence, offset.as_u64()))
     }
 
     // =========================================================================

@@ -22,6 +22,11 @@ impl MaybeTlsStream {
     pub fn is_tls(&self) -> bool {
         matches!(self, MaybeTlsStream::Tls { .. })
     }
+
+    /// Returns whether this stream is plain TCP (not TLS).
+    pub fn is_plain(&self) -> bool {
+        matches!(self, MaybeTlsStream::Plain { .. })
+    }
 }
 
 impl AsyncRead for MaybeTlsStream {

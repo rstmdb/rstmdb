@@ -18,6 +18,7 @@ pub mod config;
 pub mod error;
 pub mod handler;
 pub mod metrics;
+pub mod replication;
 pub mod server;
 pub mod session;
 pub mod stream;
@@ -27,10 +28,12 @@ pub use auth::TokenValidator;
 pub use broadcast::{EventBroadcaster, EventFilter, InstanceEvent, Subscription, SubscriptionType};
 pub use compaction::CompactionManager;
 pub use config::{
-    AuthConfig, CompactionConfig, Config, MetricsConfig, NetworkConfig, StorageConfig, TlsConfig,
+    AuthConfig, CompactionConfig, Config, MetricsConfig, NetworkConfig, ReplicationConfig,
+    ReplicationMode, ReplicationRole, StorageConfig, TlsConfig,
 };
 pub use error::ServerError;
 pub use handler::CommandHandler;
 pub use metrics::{run_metrics_server, Metrics};
+pub use replication::{ReplicaClient, ReplicationManager};
 pub use server::{Server, ServerConfig};
 pub use session::Session;

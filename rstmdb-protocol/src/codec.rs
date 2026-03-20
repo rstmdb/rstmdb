@@ -26,6 +26,13 @@ impl Encoder {
         let frame = Frame::from_json(value)?;
         frame.encode()
     }
+
+    /// Encodes raw bytes into an RCPX frame.
+    pub fn encode_raw(payload: &[u8]) -> BytesMut {
+        let frame = Frame::new(Bytes::copy_from_slice(payload));
+        // Frame::encode can only fail for payload > MAX_PAYLOAD_SIZE, which we trust
+        frame.encode().expect("frame encoding should not fail for reasonable payloads")
+    }
 }
 
 /// Decodes frames into requests and responses.
@@ -77,6 +84,15 @@ impl Decoder {
                 let response: Response = serde_json::from_str(payload)?;
                 Ok(Some(response))
             }
+            None => Ok(None),
+        }
+    }
+
+    /// Attempts to decode the next raw payload from the buffer.
+    /// Returns the payload bytes without parsing as JSON.
+    pub fn decode_raw(&mut self) -> Result<Option<Vec<u8>>, ProtocolError> {
+        match self.decode_frame()? {
+            Some(frame) => Ok(Some(frame.payload.to_vec())),
             None => Ok(None),
         }
     }

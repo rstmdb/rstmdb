@@ -5,6 +5,7 @@ use crate::broadcast::{EventBroadcaster, EventFilter, InstanceEvent};
 use crate::config::AuthConfig;
 use crate::error::ServerError;
 use crate::metrics::Metrics;
+use crate::replication::ReplicationManager;
 use crate::session::{Session, SessionState, WireMode};
 use rstmdb_core::instance::InstanceSnapshot;
 use rstmdb_core::StateMachineEngine;
@@ -89,6 +90,10 @@ pub struct CommandHandler {
     metrics: Option<Arc<Metrics>>,
     /// Whether the FLUSH_ALL operation is allowed.
     allow_flush_all: bool,
+    /// Whether this handler is in read-only mode (replica).
+    read_only: bool,
+    /// Replication manager (primary mode).
+    replication_manager: Option<Arc<ReplicationManager>>,
 }
 
 impl CommandHandler {
@@ -104,6 +109,8 @@ impl CommandHandler {
             broadcaster: None,
             metrics: None,
             allow_flush_all: false,
+            read_only: false,
+            replication_manager: None,
         }
     }
 
@@ -125,6 +132,8 @@ impl CommandHandler {
             broadcaster: None,
             metrics: None,
             allow_flush_all: false,
+            read_only: false,
+            replication_manager: None,
         }
     }
 
@@ -144,6 +153,8 @@ impl CommandHandler {
             broadcaster: None,
             metrics: None,
             allow_flush_all: false,
+            read_only: false,
+            replication_manager: None,
         })
     }
 
@@ -170,6 +181,8 @@ impl CommandHandler {
             broadcaster: None,
             metrics: None,
             allow_flush_all: false,
+            read_only: false,
+            replication_manager: None,
         })
     }
 
@@ -185,6 +198,8 @@ impl CommandHandler {
             broadcaster: None,
             metrics: None,
             allow_flush_all: false,
+            read_only: false,
+            replication_manager: None,
         }
     }
 
@@ -209,6 +224,18 @@ impl CommandHandler {
     /// Enables or disables the FLUSH_ALL operation.
     pub fn with_allow_flush_all(mut self, allow: bool) -> Self {
         self.allow_flush_all = allow;
+        self
+    }
+
+    /// Sets the handler to read-only mode (for replicas).
+    pub fn with_read_only(mut self, read_only: bool) -> Self {
+        self.read_only = read_only;
+        self
+    }
+
+    /// Sets the replication manager (for primaries).
+    pub fn with_replication_manager(mut self, manager: Arc<ReplicationManager>) -> Self {
+        self.replication_manager = Some(manager);
         self
     }
 
@@ -246,6 +273,20 @@ impl CommandHandler {
             let wal_stats = wal.stats();
             metrics.update_wal_stats(wal_stats);
         }
+    }
+
+    /// Returns whether an operation is a write (mutating) operation.
+    fn is_write_operation(op: &Operation) -> bool {
+        matches!(
+            op,
+            Operation::PutMachine
+                | Operation::CreateInstance
+                | Operation::ApplyEvent
+                | Operation::DeleteInstance
+                | Operation::Batch
+                | Operation::FlushAll
+                | Operation::Compact
+        )
     }
 
     /// Returns whether authentication is required for an operation.
@@ -296,6 +337,25 @@ impl CommandHandler {
             );
         }
 
+        // READ-ONLY ENFORCEMENT: Reject write operations on replicas
+        if self.read_only && Self::is_write_operation(&request.op) {
+            if let Some(ref metrics) = self.metrics {
+                metrics.requests_total.with_label_values(&[op_name]).inc();
+                metrics
+                    .errors_total
+                    .with_label_values(&["READ_ONLY_MODE"])
+                    .inc();
+            }
+            drop(timer);
+            return Response::error(
+                &request.id,
+                ResponseError::new(
+                    ErrorCode::ReadOnlyMode,
+                    "server is in read-only mode (replica)".to_string(),
+                ),
+            );
+        }
+
         let result = match request.op {
             Operation::Hello => self.handle_hello(session, &request.params),
             Operation::Auth => self.handle_auth(session, &request.params),
@@ -319,6 +379,11 @@ impl CommandHandler {
             Operation::WatchAll => self.handle_watch_all_cmd(session, &request.params),
             Operation::Unwatch => self.handle_unwatch(session, &request.params),
             Operation::FlushAll => self.handle_flush_all(),
+            Operation::Replicate | Operation::ReplicateAck => {
+                Err(ServerError::InvalidRequest(
+                    "replication operations are handled internally".to_string(),
+                ))
+            }
         };
 
         // Record metrics
@@ -365,6 +430,8 @@ impl CommandHandler {
             Operation::WatchAll => "WATCH_ALL",
             Operation::Unwatch => "UNWATCH",
             Operation::FlushAll => "FLUSH_ALL",
+            Operation::Replicate => "REPLICATE",
+            Operation::ReplicateAck => "REPLICATE_ACK",
         }
     }
 
@@ -387,6 +454,9 @@ impl CommandHandler {
             ErrorCode::WalIoError => "WAL_IO_ERROR",
             ErrorCode::InternalError => "INTERNAL_ERROR",
             ErrorCode::RateLimited => "RATE_LIMITED",
+            ErrorCode::ReadOnlyMode => "READ_ONLY_MODE",
+            ErrorCode::ReplicationTimeout => "REPLICATION_TIMEOUT",
+            ErrorCode::ReplicationError => "REPLICATION_ERROR",
         }
     }
 

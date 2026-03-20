@@ -26,6 +26,8 @@ pub struct Config {
     pub tls: TlsConfig,
     /// Metrics configuration.
     pub metrics: MetricsConfig,
+    /// Replication configuration.
+    pub replication: ReplicationConfig,
 }
 
 impl Config {
@@ -70,6 +72,7 @@ impl Config {
         self.auth.apply_env_overrides();
         self.tls.apply_env_overrides();
         self.metrics.apply_env_overrides();
+        self.replication.apply_env_overrides();
     }
 
     /// Loads secrets from external file if configured.
@@ -463,6 +466,147 @@ impl MetricsConfig {
     }
 }
 
+/// Replication role.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ReplicationRole {
+    /// Standalone server (no replication).
+    #[default]
+    Standalone,
+    /// Primary server (accepts writes, streams to replicas).
+    Primary,
+    /// Replica server (read-only, receives stream from primary).
+    Replica,
+}
+
+/// Replication mode.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ReplicationMode {
+    /// Async: primary streams entries in background, writes return immediately.
+    #[default]
+    Async,
+    /// Sync: primary waits for ACKs from replicas before returning write response.
+    Sync,
+}
+
+/// Replication configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ReplicationConfig {
+    /// Replication role.
+    pub role: ReplicationRole,
+    /// Replication mode (async or sync).
+    pub mode: ReplicationMode,
+    /// Upstream primary address (replica only).
+    pub upstream: Option<String>,
+    /// Minimum number of replica ACKs required before responding (sync mode).
+    pub sync_replicas: u32,
+    /// Timeout in milliseconds for waiting for sync ACKs.
+    pub sync_timeout_ms: u64,
+    /// Alerting threshold: max lag in seconds before warning.
+    pub max_lag_seconds: u64,
+    /// Alerting threshold: max lag in entries before warning.
+    pub max_lag_entries: u64,
+    /// Authentication token for replication connections.
+    pub auth_token: Option<String>,
+}
+
+impl Default for ReplicationConfig {
+    fn default() -> Self {
+        Self {
+            role: ReplicationRole::Standalone,
+            mode: ReplicationMode::Async,
+            upstream: None,
+            sync_replicas: 1,
+            sync_timeout_ms: 5000,
+            max_lag_seconds: 30,
+            max_lag_entries: 10000,
+            auth_token: None,
+        }
+    }
+}
+
+impl ReplicationConfig {
+    fn apply_env_overrides(&mut self) {
+        if let Ok(role) = std::env::var("RSTMDB_REPL_ROLE") {
+            match role.to_lowercase().as_str() {
+                "standalone" => self.role = ReplicationRole::Standalone,
+                "primary" => self.role = ReplicationRole::Primary,
+                "replica" => self.role = ReplicationRole::Replica,
+                _ => {}
+            }
+        }
+
+        if let Ok(mode) = std::env::var("RSTMDB_REPL_MODE") {
+            match mode.to_lowercase().as_str() {
+                "async" => self.mode = ReplicationMode::Async,
+                "sync" => self.mode = ReplicationMode::Sync,
+                _ => {}
+            }
+        }
+
+        if let Ok(upstream) = std::env::var("RSTMDB_REPL_UPSTREAM") {
+            if !upstream.is_empty() {
+                self.upstream = Some(upstream);
+            }
+        }
+
+        if let Ok(n) = std::env::var("RSTMDB_REPL_SYNC_REPLICAS") {
+            if let Ok(v) = n.parse() {
+                self.sync_replicas = v;
+            }
+        }
+
+        if let Ok(ms) = std::env::var("RSTMDB_REPL_SYNC_TIMEOUT_MS") {
+            if let Ok(v) = ms.parse() {
+                self.sync_timeout_ms = v;
+            }
+        }
+
+        if let Ok(token) = std::env::var("RSTMDB_REPL_AUTH_TOKEN") {
+            if !token.is_empty() {
+                self.auth_token = Some(token);
+            }
+        }
+    }
+
+    /// Returns the sync timeout as Duration.
+    pub fn sync_timeout(&self) -> Duration {
+        Duration::from_millis(self.sync_timeout_ms)
+    }
+
+    /// Returns whether this server is a primary.
+    pub fn is_primary(&self) -> bool {
+        self.role == ReplicationRole::Primary
+    }
+
+    /// Returns whether this server is a replica.
+    pub fn is_replica(&self) -> bool {
+        self.role == ReplicationRole::Replica
+    }
+
+    /// Returns whether this server is standalone (no replication).
+    pub fn is_standalone(&self) -> bool {
+        self.role == ReplicationRole::Standalone
+    }
+
+    /// Validates the replication configuration.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.role == ReplicationRole::Replica && self.upstream.is_none() {
+            return Err(ConfigError::ValidationError(
+                "replication role is 'replica' but no upstream address configured".to_string(),
+            ));
+        }
+        if self.mode == ReplicationMode::Sync && self.sync_replicas == 0 {
+            return Err(ConfigError::ValidationError(
+                "sync replication mode requires sync_replicas > 0".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Configuration error.
 #[derive(Debug)]
 pub enum ConfigError {
@@ -521,6 +665,40 @@ mod tests {
         assert_eq!(config.storage.wal_segment_size(), 64 * 1024 * 1024);
         assert_eq!(config.storage.max_machine_versions, 0); // unlimited by default
         assert!(config.compaction.enabled);
+        assert!(config.replication.is_standalone());
+    }
+
+    #[test]
+    fn test_replication_config_defaults() {
+        let config = ReplicationConfig::default();
+        assert_eq!(config.role, ReplicationRole::Standalone);
+        assert_eq!(config.mode, ReplicationMode::Async);
+        assert!(config.upstream.is_none());
+        assert_eq!(config.sync_replicas, 1);
+        assert_eq!(config.sync_timeout_ms, 5000);
+        assert!(config.is_standalone());
+        assert!(!config.is_primary());
+        assert!(!config.is_replica());
+    }
+
+    #[test]
+    fn test_replication_config_validation() {
+        let mut config = ReplicationConfig::default();
+        assert!(config.validate().is_ok());
+
+        // Replica without upstream should fail
+        config.role = ReplicationRole::Replica;
+        assert!(config.validate().is_err());
+
+        // Replica with upstream should succeed
+        config.upstream = Some("primary:7401".to_string());
+        assert!(config.validate().is_ok());
+
+        // Sync mode with 0 replicas should fail
+        config.role = ReplicationRole::Primary;
+        config.mode = ReplicationMode::Sync;
+        config.sync_replicas = 0;
+        assert!(config.validate().is_err());
     }
 
     #[test]

@@ -67,6 +67,16 @@ pub struct Metrics {
     pub wal_fsyncs_total: Counter,
     /// Last reported WAL stats (for computing counter deltas).
     last_wal_stats: Arc<Mutex<WalStats>>,
+    /// Replication lag in entries (per replica for primary, single value for replica).
+    pub replication_lag_entries: Gauge,
+    /// Replication lag in seconds.
+    pub replication_lag_seconds: Gauge,
+    /// Number of connected replicas (primary only).
+    pub replication_connected_replicas: Gauge,
+    /// Total replication entries sent (primary only).
+    pub replication_entries_sent_total: Counter,
+    /// Total sync replication timeouts (primary only).
+    pub replication_sync_timeouts_total: Counter,
 }
 
 impl Metrics {
@@ -200,6 +210,37 @@ impl Metrics {
         ))?;
         registry.register(Box::new(wal_fsyncs_total.clone()))?;
 
+        // Replication metrics
+        let replication_lag_entries = Gauge::with_opts(Opts::new(
+            "rstmdb_replication_lag_entries",
+            "Replication lag in entries",
+        ))?;
+        registry.register(Box::new(replication_lag_entries.clone()))?;
+
+        let replication_lag_seconds = Gauge::with_opts(Opts::new(
+            "rstmdb_replication_lag_seconds",
+            "Replication lag in seconds",
+        ))?;
+        registry.register(Box::new(replication_lag_seconds.clone()))?;
+
+        let replication_connected_replicas = Gauge::with_opts(Opts::new(
+            "rstmdb_replication_connected_replicas",
+            "Number of connected replicas",
+        ))?;
+        registry.register(Box::new(replication_connected_replicas.clone()))?;
+
+        let replication_entries_sent_total = Counter::with_opts(Opts::new(
+            "rstmdb_replication_entries_sent_total",
+            "Total replication entries sent to replicas",
+        ))?;
+        registry.register(Box::new(replication_entries_sent_total.clone()))?;
+
+        let replication_sync_timeouts_total = Counter::with_opts(Opts::new(
+            "rstmdb_replication_sync_timeouts_total",
+            "Total sync replication timeouts",
+        ))?;
+        registry.register(Box::new(replication_sync_timeouts_total.clone()))?;
+
         Ok(Self {
             registry,
             connections_total,
@@ -220,6 +261,11 @@ impl Metrics {
             wal_reads_total,
             wal_fsyncs_total,
             last_wal_stats: Arc::new(Mutex::new(WalStats::default())),
+            replication_lag_entries,
+            replication_lag_seconds,
+            replication_connected_replicas,
+            replication_entries_sent_total,
+            replication_sync_timeouts_total,
         })
     }
 

@@ -47,6 +47,10 @@ pub enum Operation {
 
     // Administrative
     FlushAll,
+
+    // Replication (internal use)
+    Replicate,
+    ReplicateAck,
 }
 
 /// Request message envelope.
