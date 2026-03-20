@@ -2313,4 +2313,245 @@ mod tests {
         assert!(response.is_ok());
         assert_eq!(response.result.unwrap()["to_state"], "paid");
     }
+
+    fn test_handler_read_only() -> (TempDir, CommandHandler, Session) {
+        let dir = TempDir::new().unwrap();
+        let config = WalConfig::new(dir.path())
+            .with_segment_size(4096)
+            .with_fsync_policy(FsyncPolicy::EveryWrite);
+        let engine = Arc::new(StateMachineEngine::new(config).unwrap());
+        let handler = CommandHandler::new(engine)
+            .with_read_only(true)
+            .with_allow_flush_all(true);
+        let session = Session::new(
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 12345),
+            false,
+        );
+        (dir, handler, session)
+    }
+
+    #[test]
+    fn test_read_only_rejects_put_machine() {
+        let (_dir, handler, mut session) = test_handler_read_only();
+
+        let request = Request::new("1", Operation::PutMachine).with_params(json!({
+            "machine": "order",
+            "version": 1,
+            "definition": {
+                "states": ["created"],
+                "initial": "created",
+                "transitions": []
+            }
+        }));
+        let response = handler.handle(&mut session, &request);
+        assert!(response.is_error());
+        assert_eq!(response.error.unwrap().code, ErrorCode::ReadOnlyMode);
+    }
+
+    #[test]
+    fn test_read_only_rejects_create_instance() {
+        let (_dir, handler, mut session) = test_handler_read_only();
+
+        let request = Request::new("1", Operation::CreateInstance).with_params(json!({
+            "instance_id": "i-1",
+            "machine": "order",
+            "version": 1
+        }));
+        let response = handler.handle(&mut session, &request);
+        assert!(response.is_error());
+        assert_eq!(response.error.unwrap().code, ErrorCode::ReadOnlyMode);
+    }
+
+    #[test]
+    fn test_read_only_rejects_apply_event() {
+        let (_dir, handler, mut session) = test_handler_read_only();
+
+        let request = Request::new("1", Operation::ApplyEvent).with_params(json!({
+            "instance_id": "i-1",
+            "event": "PAY"
+        }));
+        let response = handler.handle(&mut session, &request);
+        assert!(response.is_error());
+        assert_eq!(response.error.unwrap().code, ErrorCode::ReadOnlyMode);
+    }
+
+    #[test]
+    fn test_read_only_rejects_delete_instance() {
+        let (_dir, handler, mut session) = test_handler_read_only();
+
+        let request = Request::new("1", Operation::DeleteInstance).with_params(json!({
+            "instance_id": "i-1"
+        }));
+        let response = handler.handle(&mut session, &request);
+        assert!(response.is_error());
+        assert_eq!(response.error.unwrap().code, ErrorCode::ReadOnlyMode);
+    }
+
+    #[test]
+    fn test_read_only_rejects_batch() {
+        let (_dir, handler, mut session) = test_handler_read_only();
+
+        let request = Request::new("1", Operation::Batch).with_params(json!({
+            "ops": [{"op": "PING", "params": {}}]
+        }));
+        let response = handler.handle(&mut session, &request);
+        assert!(response.is_error());
+        assert_eq!(response.error.unwrap().code, ErrorCode::ReadOnlyMode);
+    }
+
+    #[test]
+    fn test_read_only_rejects_flush_all() {
+        let (_dir, handler, mut session) = test_handler_read_only();
+
+        let request = Request::new("1", Operation::FlushAll);
+        let response = handler.handle(&mut session, &request);
+        assert!(response.is_error());
+        assert_eq!(response.error.unwrap().code, ErrorCode::ReadOnlyMode);
+    }
+
+    #[test]
+    fn test_read_only_rejects_compact() {
+        let (_dir, handler, mut session) = test_handler_read_only();
+
+        let request = Request::new("1", Operation::Compact).with_params(json!({}));
+        let response = handler.handle(&mut session, &request);
+        assert!(response.is_error());
+        assert_eq!(response.error.unwrap().code, ErrorCode::ReadOnlyMode);
+    }
+
+    #[test]
+    fn test_read_only_allows_reads() {
+        let (_dir, handler, mut session) = test_handler_read_only();
+
+        // These should all succeed (not ReadOnlyMode)
+        let ops = [
+            Operation::Ping,
+            Operation::Info,
+            Operation::ListMachines,
+            Operation::WalStats,
+        ];
+
+        for op in ops {
+            let request = Request::new("1", op);
+            let response = handler.handle(&mut session, &request);
+            assert!(
+                response.is_ok(),
+                "{:?} should be allowed in read-only mode",
+                op
+            );
+        }
+    }
+
+    #[test]
+    fn test_read_only_allows_hello_and_bye() {
+        let (_dir, handler, mut session) = test_handler_read_only();
+
+        let hello = Request::new("1", Operation::Hello).with_params(json!({
+            "protocol_version": 1,
+            "client_name": "test",
+            "wire_modes": ["binary_json"],
+            "features": []
+        }));
+        let response = handler.handle(&mut session, &hello);
+        assert!(response.is_ok());
+
+        let bye = Request::new("2", Operation::Bye);
+        let response = handler.handle(&mut session, &bye);
+        assert!(response.is_ok());
+    }
+
+    #[test]
+    fn test_read_only_allows_get_instance() {
+        let (_dir, handler, mut session) = test_handler_read_only();
+
+        // GetInstance should be allowed — it returns NotFound, not ReadOnlyMode
+        let request = Request::new("1", Operation::GetInstance).with_params(json!({
+            "instance_id": "nonexistent"
+        }));
+        let response = handler.handle(&mut session, &request);
+        assert!(response.is_error());
+        // Error should be NotFound, NOT ReadOnlyMode
+        assert_eq!(response.error.unwrap().code, ErrorCode::InstanceNotFound);
+    }
+
+    #[test]
+    fn test_read_only_allows_get_machine() {
+        let (_dir, handler, mut session) = test_handler_read_only();
+
+        let request = Request::new("1", Operation::GetMachine).with_params(json!({
+            "machine": "nonexistent",
+            "version": 1
+        }));
+        let response = handler.handle(&mut session, &request);
+        assert!(response.is_error());
+        assert_eq!(response.error.unwrap().code, ErrorCode::MachineNotFound);
+    }
+
+    #[test]
+    fn test_is_write_operation_write_ops() {
+        let write_ops = [
+            Operation::PutMachine,
+            Operation::CreateInstance,
+            Operation::ApplyEvent,
+            Operation::DeleteInstance,
+            Operation::Batch,
+            Operation::FlushAll,
+            Operation::Compact,
+        ];
+        for op in write_ops {
+            assert!(
+                CommandHandler::is_write_operation(&op),
+                "{:?} should be classified as a write operation",
+                op
+            );
+        }
+    }
+
+    #[test]
+    fn test_is_write_operation_read_ops() {
+        let read_ops = [
+            Operation::Hello,
+            Operation::Auth,
+            Operation::Ping,
+            Operation::Bye,
+            Operation::Info,
+            Operation::GetMachine,
+            Operation::ListMachines,
+            Operation::GetInstance,
+            Operation::ListInstances,
+            Operation::SnapshotInstance,
+            Operation::WalRead,
+            Operation::WalStats,
+            Operation::WatchInstance,
+            Operation::WatchAll,
+            Operation::Unwatch,
+            Operation::Replicate,
+            Operation::ReplicateAck,
+        ];
+        for op in read_ops {
+            assert!(
+                !CommandHandler::is_write_operation(&op),
+                "{:?} should NOT be classified as a write operation",
+                op
+            );
+        }
+    }
+
+    #[test]
+    fn test_non_read_only_allows_writes() {
+        // Verify that with read_only=false, writes succeed normally
+        let (_dir, handler, mut session) = test_handler();
+
+        let request = Request::new("1", Operation::PutMachine).with_params(json!({
+            "machine": "order",
+            "version": 1,
+            "definition": {
+                "states": ["created"],
+                "initial": "created",
+                "transitions": []
+            }
+        }));
+        let response = handler.handle(&mut session, &request);
+        assert!(response.is_ok());
+    }
 }

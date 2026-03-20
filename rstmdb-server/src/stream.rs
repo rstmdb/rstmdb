@@ -68,3 +68,34 @@ impl AsyncWrite for MaybeTlsStream {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::net::TcpListener;
+
+    async fn make_plain_stream() -> MaybeTlsStream {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let connect = TcpStream::connect(addr);
+        let accept = listener.accept();
+        let (stream, _) = tokio::join!(connect, accept);
+        MaybeTlsStream::Plain {
+            stream: stream.unwrap(),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_plain_is_plain() {
+        let stream = make_plain_stream().await;
+        assert!(stream.is_plain());
+        assert!(!stream.is_tls());
+    }
+
+    #[tokio::test]
+    async fn test_plain_and_tls_are_mutually_exclusive() {
+        let stream = make_plain_stream().await;
+        // Exactly one must be true
+        assert!(stream.is_plain() ^ stream.is_tls());
+    }
+}
