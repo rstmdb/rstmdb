@@ -113,7 +113,11 @@ impl ReplicationManager {
 
                 self.last_tailed_sequence.store(seq, Ordering::Release);
 
-                tracing::trace!("Replicated WAL entry seq={} to {} replica(s)", seq, self.replicas.len());
+                tracing::trace!(
+                    "Replicated WAL entry seq={} to {} replica(s)",
+                    seq,
+                    self.replicas.len()
+                );
             }
         }
     }

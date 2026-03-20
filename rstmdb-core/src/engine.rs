@@ -216,10 +216,7 @@ impl StateMachineEngine {
     /// Applies a replicated WAL entry from a primary server.
     /// Appends the entry to the local WAL, then replays it to update in-memory state.
     /// Returns the local (sequence, offset) after appending.
-    pub fn apply_replicated_entry(
-        &self,
-        entry: WalEntry,
-    ) -> Result<(u64, u64), CoreError> {
+    pub fn apply_replicated_entry(&self, entry: WalEntry) -> Result<(u64, u64), CoreError> {
         let (sequence, offset) = self.wal.append(&entry)?;
         self.replay_entry(offset.as_u64(), entry)?;
         Ok((sequence, offset.as_u64()))

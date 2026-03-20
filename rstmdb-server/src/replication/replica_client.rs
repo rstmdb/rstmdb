@@ -158,10 +158,7 @@ impl ReplicaClient {
                         primary_sequence,
                         timestamp_ms: _,
                     } => {
-                        tracing::debug!(
-                            "Heartbeat from primary: sequence={}",
-                            primary_sequence
-                        );
+                        tracing::debug!("Heartbeat from primary: sequence={}", primary_sequence);
                         self.primary_sequence
                             .store(primary_sequence, Ordering::Release);
                     }

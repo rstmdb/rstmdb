@@ -4,8 +4,8 @@
 
 use rstmdb_core::StateMachineEngine;
 use rstmdb_server::{
-    run_metrics_server, tls, CompactionManager, Config, Metrics, ReplicaClient,
-    ReplicationManager, ReplicationRole, Server, ServerConfig,
+    run_metrics_server, tls, CompactionManager, Config, Metrics, ReplicaClient, ReplicationManager,
+    ReplicationRole, Server, ServerConfig,
 };
 use rstmdb_storage::SnapshotStore;
 use rstmdb_wal::{FsyncPolicy, WalConfig};

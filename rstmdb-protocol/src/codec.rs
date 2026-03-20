@@ -31,7 +31,9 @@ impl Encoder {
     pub fn encode_raw(payload: &[u8]) -> BytesMut {
         let frame = Frame::new(Bytes::copy_from_slice(payload));
         // Frame::encode can only fail for payload > MAX_PAYLOAD_SIZE, which we trust
-        frame.encode().expect("frame encoding should not fail for reasonable payloads")
+        frame
+            .encode()
+            .expect("frame encoding should not fail for reasonable payloads")
     }
 }
 

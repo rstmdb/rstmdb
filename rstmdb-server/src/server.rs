@@ -231,7 +231,7 @@ impl Server {
                 .with_broadcaster(broadcaster.clone())
                 .with_max_machine_versions(config.max_machine_versions)
                 .with_allow_flush_all(config.allow_flush_all)
-            .with_read_only(config.read_only);
+                .with_read_only(config.read_only);
         if let Some(ref metrics) = config.metrics {
             handler = handler.with_metrics(metrics.clone());
         }
@@ -409,7 +409,11 @@ impl Server {
                 return Ok(());
             }
             decoder.extend(&peek_buf[..n]);
-            tracing::debug!("[{}] Read {} initial bytes, checking for replication", addr, n);
+            tracing::debug!(
+                "[{}] Read {} initial bytes, checking for replication",
+                addr,
+                n
+            );
 
             // Try to decode the first frame as a replication message
             match decoder.decode_raw() {
@@ -422,15 +426,25 @@ impl Server {
                             return Ok(());
                         }
                         Ok(_) => {
-                            tracing::debug!("[{}] First frame is not ReplicateAuth, treating as client", addr);
+                            tracing::debug!(
+                                "[{}] First frame is not ReplicateAuth, treating as client",
+                                addr
+                            );
                         }
                         Err(e) => {
-                            tracing::debug!("[{}] First frame is not replication JSON ({}), treating as client", addr, e);
+                            tracing::debug!(
+                                "[{}] First frame is not replication JSON ({}), treating as client",
+                                addr,
+                                e
+                            );
                         }
                     }
                 }
                 Ok(None) => {
-                    tracing::debug!("[{}] Incomplete frame in initial read, treating as client", addr);
+                    tracing::debug!(
+                        "[{}] Incomplete frame in initial read, treating as client",
+                        addr
+                    );
                 }
                 Err(e) => {
                     tracing::debug!("[{}] Frame decode error ({}), treating as client", addr, e);
@@ -489,16 +503,24 @@ impl Server {
                     match handler.handle_watch_instance(&mut session, &request.params) {
                         Ok((result, receiver)) => {
                             let sub_id = result["subscription_id"].as_str().unwrap().to_string();
-                            let include_ctx = request.params["include_ctx"].as_bool().unwrap_or(true);
+                            let include_ctx =
+                                request.params["include_ctx"].as_bool().unwrap_or(true);
                             let task = Self::spawn_subscription_forwarder(
-                                sub_id.clone(), receiver, None, include_ctx, event_tx.clone(),
+                                sub_id.clone(),
+                                receiver,
+                                None,
+                                include_ctx,
+                                event_tx.clone(),
                             );
                             subscription_tasks.insert(sub_id, task);
                             rstmdb_protocol::Response::ok(&request.id, result)
                         }
                         Err(e) => rstmdb_protocol::Response::error(
                             &request.id,
-                            rstmdb_protocol::message::ResponseError::new(e.error_code(), e.to_string()),
+                            rstmdb_protocol::message::ResponseError::new(
+                                e.error_code(),
+                                e.to_string(),
+                            ),
                         ),
                     }
                 }
@@ -506,16 +528,24 @@ impl Server {
                     match handler.handle_watch_all(&mut session, &request.params) {
                         Ok((result, receiver, filter)) => {
                             let sub_id = result["subscription_id"].as_str().unwrap().to_string();
-                            let include_ctx = request.params["include_ctx"].as_bool().unwrap_or(true);
+                            let include_ctx =
+                                request.params["include_ctx"].as_bool().unwrap_or(true);
                             let task = Self::spawn_subscription_forwarder(
-                                sub_id.clone(), receiver, Some(filter), include_ctx, event_tx.clone(),
+                                sub_id.clone(),
+                                receiver,
+                                Some(filter),
+                                include_ctx,
+                                event_tx.clone(),
                             );
                             subscription_tasks.insert(sub_id, task);
                             rstmdb_protocol::Response::ok(&request.id, result)
                         }
                         Err(e) => rstmdb_protocol::Response::error(
                             &request.id,
-                            rstmdb_protocol::message::ResponseError::new(e.error_code(), e.to_string()),
+                            rstmdb_protocol::message::ResponseError::new(
+                                e.error_code(),
+                                e.to_string(),
+                            ),
                         ),
                     }
                 }
@@ -629,34 +659,52 @@ impl Server {
                     Operation::WatchInstance => {
                         match handler.handle_watch_instance(&mut session, &request.params) {
                             Ok((result, receiver)) => {
-                                let sub_id = result["subscription_id"].as_str().unwrap().to_string();
-                                let include_ctx = request.params["include_ctx"].as_bool().unwrap_or(true);
+                                let sub_id =
+                                    result["subscription_id"].as_str().unwrap().to_string();
+                                let include_ctx =
+                                    request.params["include_ctx"].as_bool().unwrap_or(true);
                                 let task = Self::spawn_subscription_forwarder(
-                                    sub_id.clone(), receiver, None, include_ctx, event_tx.clone(),
+                                    sub_id.clone(),
+                                    receiver,
+                                    None,
+                                    include_ctx,
+                                    event_tx.clone(),
                                 );
                                 subscription_tasks.insert(sub_id, task);
                                 rstmdb_protocol::Response::ok(&request.id, result)
                             }
                             Err(e) => rstmdb_protocol::Response::error(
                                 &request.id,
-                                rstmdb_protocol::message::ResponseError::new(e.error_code(), e.to_string()),
+                                rstmdb_protocol::message::ResponseError::new(
+                                    e.error_code(),
+                                    e.to_string(),
+                                ),
                             ),
                         }
                     }
                     Operation::WatchAll => {
                         match handler.handle_watch_all(&mut session, &request.params) {
                             Ok((result, receiver, filter)) => {
-                                let sub_id = result["subscription_id"].as_str().unwrap().to_string();
-                                let include_ctx = request.params["include_ctx"].as_bool().unwrap_or(true);
+                                let sub_id =
+                                    result["subscription_id"].as_str().unwrap().to_string();
+                                let include_ctx =
+                                    request.params["include_ctx"].as_bool().unwrap_or(true);
                                 let task = Self::spawn_subscription_forwarder(
-                                    sub_id.clone(), receiver, Some(filter), include_ctx, event_tx.clone(),
+                                    sub_id.clone(),
+                                    receiver,
+                                    Some(filter),
+                                    include_ctx,
+                                    event_tx.clone(),
                                 );
                                 subscription_tasks.insert(sub_id, task);
                                 rstmdb_protocol::Response::ok(&request.id, result)
                             }
                             Err(e) => rstmdb_protocol::Response::error(
                                 &request.id,
-                                rstmdb_protocol::message::ResponseError::new(e.error_code(), e.to_string()),
+                                rstmdb_protocol::message::ResponseError::new(
+                                    e.error_code(),
+                                    e.to_string(),
+                                ),
                             ),
                         }
                     }

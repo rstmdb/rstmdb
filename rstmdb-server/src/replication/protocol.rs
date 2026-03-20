@@ -31,9 +31,7 @@ pub enum ReplicationMessage {
     },
 
     /// Replica → Primary: confirms entry was applied.
-    ReplicateAck {
-        sequence: u64,
-    },
+    ReplicateAck { sequence: u64 },
 
     /// Primary → Replica: periodic heartbeat with current sequence for lag calculation.
     ReplicateHeartbeat {

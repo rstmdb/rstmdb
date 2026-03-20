@@ -379,11 +379,9 @@ impl CommandHandler {
             Operation::WatchAll => self.handle_watch_all_cmd(session, &request.params),
             Operation::Unwatch => self.handle_unwatch(session, &request.params),
             Operation::FlushAll => self.handle_flush_all(),
-            Operation::Replicate | Operation::ReplicateAck => {
-                Err(ServerError::InvalidRequest(
-                    "replication operations are handled internally".to_string(),
-                ))
-            }
+            Operation::Replicate | Operation::ReplicateAck => Err(ServerError::InvalidRequest(
+                "replication operations are handled internally".to_string(),
+            )),
         };
 
         // Record metrics
