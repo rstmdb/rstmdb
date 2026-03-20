@@ -31,6 +31,9 @@ replication:
   role: primary
   mode: async
   auth_token: "repl-dev-token"
+  poll_interval_ms: 10
+  heartbeat_interval_secs: 5
+  lag_check_interval_secs: 10
 
 metrics:
   enabled: true

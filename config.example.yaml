@@ -113,6 +113,18 @@ replication:
   # Authentication token for replication connections
   # auth_token: "repl-secret-token"
 
+  # How often the primary polls the WAL for new entries to stream (ms)
+  poll_interval_ms: 10
+
+  # How often the primary sends heartbeats to replicas (seconds)
+  heartbeat_interval_secs: 5
+
+  # How long a replica waits before reconnecting after connection loss (seconds)
+  reconnect_delay_secs: 2
+
+  # How often replication lag is checked and logged (seconds)
+  lag_check_interval_secs: 10
+
 # Prometheus metrics settings
 metrics:
   # Enable metrics HTTP server

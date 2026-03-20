@@ -5,16 +5,15 @@
 use crate::config::ReplicationConfig;
 use crate::replication::manager::ReplicationManager;
 use std::sync::Arc;
-use std::time::Duration;
 use tokio::sync::broadcast;
 
 /// Runs a background lag monitoring task for the primary.
 pub async fn run_primary_lag_monitor(
     manager: Arc<ReplicationManager>,
-    _config: ReplicationConfig,
+    config: ReplicationConfig,
     mut shutdown: broadcast::Receiver<()>,
 ) {
-    let check_interval = Duration::from_secs(10);
+    let check_interval = config.lag_check_interval();
 
     loop {
         tokio::select! {
@@ -44,7 +43,7 @@ pub async fn run_replica_lag_monitor(
     config: ReplicationConfig,
     mut shutdown: broadcast::Receiver<()>,
 ) {
-    let check_interval = Duration::from_secs(10);
+    let check_interval = config.lag_check_interval();
 
     loop {
         tokio::select! {

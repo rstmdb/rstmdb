@@ -12,3 +12,9 @@ pub mod replica_client;
 pub use manager::ReplicationManager;
 pub use protocol::ReplicationMessage;
 pub use replica_client::ReplicaClient;
+
+/// Per-replica entry channel capacity.
+const REPLICA_CHANNEL_CAPACITY: usize = 4096;
+
+/// TCP read buffer size for replication connections.
+const REPLICATION_READ_BUF_SIZE: usize = 8192;

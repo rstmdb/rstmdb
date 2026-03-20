@@ -13,7 +13,6 @@ use rstmdb_wal::WalOffset;
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot, Mutex};
@@ -70,7 +69,7 @@ impl ReplicationManager {
 
     /// Background task that polls the WAL for new entries and sends them to all replicas.
     async fn wal_tailer_task(&self) {
-        let mut interval = tokio::time::interval(Duration::from_millis(10));
+        let mut interval = tokio::time::interval(self.config.poll_interval());
 
         loop {
             interval.tick().await;
@@ -220,7 +219,8 @@ impl ReplicationManager {
         );
 
         // Create entry channel for this replica
-        let (entry_tx, mut entry_rx) = mpsc::channel::<ReplicationMessage>(4096);
+        let (entry_tx, mut entry_rx) =
+            mpsc::channel::<ReplicationMessage>(super::REPLICA_CHANNEL_CAPACITY);
         let last_acked = Arc::new(AtomicU64::new(0));
 
         self.replicas.insert(
@@ -252,7 +252,7 @@ impl ReplicationManager {
         // Spawn writer task: sends entries from channel to replica
         let writer_handle = tokio::spawn(async move {
             // Heartbeat interval
-            let mut heartbeat_interval = tokio::time::interval(Duration::from_secs(5));
+            let mut heartbeat_interval = tokio::time::interval(mgr.config.heartbeat_interval());
 
             loop {
                 tokio::select! {
@@ -294,7 +294,7 @@ impl ReplicationManager {
         let rid2 = replica_id.clone();
         let reader_handle = tokio::spawn(async move {
             let mut decoder = Decoder::new();
-            let mut buf = [0u8; 4096];
+            let mut buf = [0u8; super::REPLICATION_READ_BUF_SIZE];
 
             loop {
                 match read_half.read(&mut buf).await {

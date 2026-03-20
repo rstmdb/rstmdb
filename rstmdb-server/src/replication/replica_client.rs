@@ -2,17 +2,18 @@
 //!
 //! Connects to a primary server, receives WAL entry stream, and applies entries locally.
 
+use crate::config::ReplicationConfig;
 use crate::replication::protocol::ReplicationMessage;
 use rstmdb_core::StateMachineEngine;
 use rstmdb_protocol::{Decoder, Encoder};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 /// Replica-side client that connects to the primary and applies streamed entries.
 pub struct ReplicaClient {
+    config: ReplicationConfig,
     engine: Arc<StateMachineEngine>,
     upstream: String,
     auth_token: Option<String>,
@@ -25,6 +26,7 @@ pub struct ReplicaClient {
 impl ReplicaClient {
     /// Creates a new replica client.
     pub fn new(
+        config: ReplicationConfig,
         engine: Arc<StateMachineEngine>,
         upstream: String,
         auth_token: Option<String>,
@@ -33,6 +35,7 @@ impl ReplicaClient {
         let last_seq = engine.wal().next_sequence().saturating_sub(1);
 
         Self {
+            config,
             engine,
             upstream,
             auth_token,
@@ -46,8 +49,12 @@ impl ReplicaClient {
         loop {
             tokio::select! {
                 _ = self.connect_and_stream() => {
-                    tracing::warn!("Replication connection lost, reconnecting in 2s...");
-                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    let delay = self.config.reconnect_delay();
+                    tracing::warn!(
+                        "Replication connection lost, reconnecting in {}s...",
+                        delay.as_secs()
+                    );
+                    tokio::time::sleep(delay).await;
                 }
                 _ = shutdown.recv() => {
                     tracing::info!("Replica client shutting down");
@@ -74,7 +81,7 @@ impl ReplicaClient {
 
         // Read sync response
         let mut decoder = Decoder::new();
-        let mut buf = [0u8; 8192];
+        let mut buf = [0u8; super::REPLICATION_READ_BUF_SIZE];
 
         let sync_resp = loop {
             let n = stream.read(&mut buf).await?;

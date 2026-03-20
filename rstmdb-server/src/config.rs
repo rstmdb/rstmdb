@@ -510,6 +510,14 @@ pub struct ReplicationConfig {
     pub max_lag_entries: u64,
     /// Authentication token for replication connections.
     pub auth_token: Option<String>,
+    /// How often the primary polls the WAL for new entries to stream (milliseconds).
+    pub poll_interval_ms: u64,
+    /// How often the primary sends heartbeats to replicas (seconds).
+    pub heartbeat_interval_secs: u64,
+    /// How long a replica waits before reconnecting after a connection loss (seconds).
+    pub reconnect_delay_secs: u64,
+    /// How often replication lag is checked and logged (seconds).
+    pub lag_check_interval_secs: u64,
 }
 
 impl Default for ReplicationConfig {
@@ -523,6 +531,10 @@ impl Default for ReplicationConfig {
             max_lag_seconds: 30,
             max_lag_entries: 10000,
             auth_token: None,
+            poll_interval_ms: 10,
+            heartbeat_interval_secs: 5,
+            reconnect_delay_secs: 2,
+            lag_check_interval_secs: 10,
         }
     }
 }
@@ -569,11 +581,55 @@ impl ReplicationConfig {
                 self.auth_token = Some(token);
             }
         }
+
+        if let Ok(ms) = std::env::var("RSTMDB_REPL_POLL_INTERVAL_MS") {
+            if let Ok(v) = ms.parse() {
+                self.poll_interval_ms = v;
+            }
+        }
+
+        if let Ok(s) = std::env::var("RSTMDB_REPL_HEARTBEAT_INTERVAL_SECS") {
+            if let Ok(v) = s.parse() {
+                self.heartbeat_interval_secs = v;
+            }
+        }
+
+        if let Ok(s) = std::env::var("RSTMDB_REPL_RECONNECT_DELAY_SECS") {
+            if let Ok(v) = s.parse() {
+                self.reconnect_delay_secs = v;
+            }
+        }
+
+        if let Ok(s) = std::env::var("RSTMDB_REPL_LAG_CHECK_INTERVAL_SECS") {
+            if let Ok(v) = s.parse() {
+                self.lag_check_interval_secs = v;
+            }
+        }
     }
 
     /// Returns the sync timeout as Duration.
     pub fn sync_timeout(&self) -> Duration {
         Duration::from_millis(self.sync_timeout_ms)
+    }
+
+    /// Returns the WAL poll interval as Duration.
+    pub fn poll_interval(&self) -> Duration {
+        Duration::from_millis(self.poll_interval_ms)
+    }
+
+    /// Returns the heartbeat interval as Duration.
+    pub fn heartbeat_interval(&self) -> Duration {
+        Duration::from_secs(self.heartbeat_interval_secs)
+    }
+
+    /// Returns the reconnect delay as Duration.
+    pub fn reconnect_delay(&self) -> Duration {
+        Duration::from_secs(self.reconnect_delay_secs)
+    }
+
+    /// Returns the lag check interval as Duration.
+    pub fn lag_check_interval(&self) -> Duration {
+        Duration::from_secs(self.lag_check_interval_secs)
     }
 
     /// Returns whether this server is a primary.

@@ -221,7 +221,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let replica_handle = if config.replication.is_replica() {
         let upstream = config.replication.upstream.clone().unwrap();
         let auth_token = config.replication.auth_token.clone();
-        let replica_client = ReplicaClient::new(engine.clone(), upstream, auth_token);
+        let replica_client = ReplicaClient::new(
+            config.replication.clone(),
+            engine.clone(),
+            upstream,
+            auth_token,
+        );
         let shutdown_rx = server.subscribe_shutdown();
         Some(tokio::spawn(async move {
             replica_client.run(shutdown_rx).await;
