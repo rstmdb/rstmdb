@@ -3,6 +3,7 @@
 //! Background task that periodically checks replication lag and logs warnings.
 
 use crate::config::ReplicationConfig;
+use crate::metrics::Metrics;
 use crate::replication::manager::ReplicationManager;
 use std::sync::Arc;
 use tokio::sync::broadcast;
@@ -11,6 +12,7 @@ use tokio::sync::broadcast;
 pub async fn run_primary_lag_monitor(
     manager: Arc<ReplicationManager>,
     config: ReplicationConfig,
+    metrics: Option<Arc<Metrics>>,
     mut shutdown: broadcast::Receiver<()>,
 ) {
     let check_interval = config.lag_check_interval();
@@ -19,6 +21,11 @@ pub async fn run_primary_lag_monitor(
         tokio::select! {
             _ = tokio::time::sleep(check_interval) => {
                 let connected = manager.connected_replica_count();
+
+                if let Some(ref m) = metrics {
+                    m.replication_connected_replicas.set(connected as f64);
+                }
+
                 if connected == 0 {
                     tracing::debug!("No replicas connected");
                     continue;
@@ -41,6 +48,7 @@ pub async fn run_primary_lag_monitor(
 pub async fn run_replica_lag_monitor(
     replica_client: &crate::replication::replica_client::ReplicaClient,
     config: ReplicationConfig,
+    metrics: Option<Arc<Metrics>>,
     mut shutdown: broadcast::Receiver<()>,
 ) {
     let check_interval = config.lag_check_interval();
@@ -49,6 +57,10 @@ pub async fn run_replica_lag_monitor(
         tokio::select! {
             _ = tokio::time::sleep(check_interval) => {
                 let lag = replica_client.lag_entries();
+
+                if let Some(ref m) = metrics {
+                    m.replication_lag_entries.set(lag as f64);
+                }
 
                 if lag > config.max_lag_entries {
                     tracing::warn!(

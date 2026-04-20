@@ -182,7 +182,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Set up replication based on role
     let _replication_manager = if config.replication.is_primary() {
-        let mgr = ReplicationManager::new(config.replication.clone(), engine.clone());
+        let repl_shutdown = server.subscribe_shutdown();
+        let mgr = ReplicationManager::new(
+            config.replication.clone(),
+            engine.clone(),
+            repl_shutdown,
+            metrics.clone(),
+        );
         server.set_replication_manager(mgr.clone());
         Some(mgr)
     } else {
@@ -198,8 +204,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.compaction.clone(),
     ));
 
+    // Replicas should not run compaction — it's a write operation that produces
+    // snapshot files and could interact with WAL replay on restart. Compaction
+    // is the primary's responsibility; replicas can reset or be rebuilt if disk
+    // usage becomes a concern.
+    let compaction_enabled = !config.replication.is_replica();
+
     // Log compaction config
-    if config.compaction.is_disabled() {
+    if !compaction_enabled {
+        tracing::info!("  Auto-compaction: disabled (replica mode)");
+    } else if config.compaction.is_disabled() {
         tracing::info!("  Auto-compaction: disabled");
     } else {
         tracing::info!(
@@ -209,12 +223,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    // Spawn compaction manager
-    let compaction_handle = {
+    // Spawn compaction manager (primary/standalone only)
+    let compaction_handle = if compaction_enabled {
         let cm = compaction_manager.clone();
-        tokio::spawn(async move {
+        Some(tokio::spawn(async move {
             cm.run().await;
-        })
+        }))
+    } else {
+        None
     };
 
     // Spawn replica client if in replica mode
@@ -266,8 +282,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Run server (blocks until shutdown)
     server.run().await?;
 
-    // Wait for compaction manager to stop
-    let _ = compaction_handle.await;
+    // Wait for compaction manager to stop (if it was spawned)
+    if let Some(handle) = compaction_handle {
+        let _ = handle.await;
+    }
 
     // Wait for metrics server to stop
     if let Some(handle) = metrics_handle {

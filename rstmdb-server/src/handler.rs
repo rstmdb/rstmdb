@@ -276,7 +276,7 @@ impl CommandHandler {
     }
 
     /// Returns whether an operation is a write (mutating) operation.
-    fn is_write_operation(op: &Operation) -> bool {
+    pub fn is_write_operation(op: &Operation) -> bool {
         matches!(
             op,
             Operation::PutMachine

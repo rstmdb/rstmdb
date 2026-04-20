@@ -1,0 +1,167 @@
+# rstmdb Replication Setup
+#
+# Start:  docker compose -f docker-compose.replication.yaml up --build
+# Stop:   docker compose -f docker-compose.replication.yaml down
+# Reset:  docker compose -f docker-compose.replication.yaml down -v
+#
+# Test:
+#   # Write to primary
+#   rstmdb-cli -s 127.0.0.1:7401 put-machine -n order -v 1 '{"states":["created","paid"],"initial":"created","transitions":[{"from":"created","event":"PAY","to":"paid"}]}'
+#   rstmdb-cli -s 127.0.0.1:7401 create-instance -m order -V 1 -i test-1
+#
+#   # Read from replicas
+#   rstmdb-cli -s 127.0.0.1:7402 get-instance test-1
+#   rstmdb-cli -s 127.0.0.1:7403 get-instance test-1
+#
+#   # Write to replica (should fail)
+#   rstmdb-cli -s 127.0.0.1:7402 create-instance -m order -V 1 -i test-2
+
+services:
+  # ========================================================================
+  # Primary — accepts reads and writes, streams WAL to replicas
+  # ========================================================================
+  primary:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: rstmdb:replication
+    container_name: rstmdb-primary
+    restart: unless-stopped
+    ports:
+      - "7401:7401"
+      - "9090:9090"
+    volumes:
+      - primary-data:/data
+    environment:
+      RUST_LOG: info
+      RSTMDB_BIND: 0.0.0.0:7401
+      RSTMDB_DATA: /data
+      RSTMDB_REPL_ROLE: primary
+      RSTMDB_REPL_MODE: async
+      RSTMDB_REPL_AUTH_TOKEN: repl-docker-token
+      RSTMDB_METRICS_ENABLED: "true"
+      RSTMDB_METRICS_BIND: "0.0.0.0:9090"
+      RSTMDB_ALLOW_FLUSH_ALL: "true"
+    healthcheck:
+      test: ["CMD", "rstmdb-cli", "-s", "127.0.0.1:7401", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 3s
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+        reservations:
+          memory: 128M
+
+  # ========================================================================
+  # Replica 1 — read-only, streams from primary
+  # ========================================================================
+  replica1:
+    image: rstmdb:replication
+    container_name: rstmdb-replica1
+    restart: unless-stopped
+    ports:
+      - "7402:7401"
+      - "9091:9090"
+    volumes:
+      - replica1-data:/data
+    environment:
+      RUST_LOG: info
+      RSTMDB_BIND: 0.0.0.0:7401
+      RSTMDB_DATA: /data
+      RSTMDB_REPL_ROLE: replica
+      RSTMDB_REPL_UPSTREAM: "primary:7401"
+      RSTMDB_REPL_AUTH_TOKEN: repl-docker-token
+      RSTMDB_METRICS_ENABLED: "true"
+      RSTMDB_METRICS_BIND: "0.0.0.0:9090"
+    healthcheck:
+      test: ["CMD", "rstmdb-cli", "-s", "127.0.0.1:7401", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+    depends_on:
+      primary:
+        condition: service_healthy
+
+  # ========================================================================
+  # Replica 2 — read-only, streams from primary
+  # ========================================================================
+  replica2:
+    image: rstmdb:replication
+    container_name: rstmdb-replica2
+    restart: unless-stopped
+    ports:
+      - "7403:7401"
+      - "9092:9090"
+    volumes:
+      - replica2-data:/data
+    environment:
+      RUST_LOG: info
+      RSTMDB_BIND: 0.0.0.0:7401
+      RSTMDB_DATA: /data
+      RSTMDB_REPL_ROLE: replica
+      RSTMDB_REPL_UPSTREAM: "primary:7401"
+      RSTMDB_REPL_AUTH_TOKEN: repl-docker-token
+      RSTMDB_METRICS_ENABLED: "true"
+      RSTMDB_METRICS_BIND: "0.0.0.0:9090"
+    healthcheck:
+      test: ["CMD", "rstmdb-cli", "-s", "127.0.0.1:7401", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+    depends_on:
+      primary:
+        condition: service_healthy
+
+  # ========================================================================
+  # Prometheus — scrapes metrics from all three nodes
+  # ========================================================================
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: rstmdb-repl-prometheus
+    restart: unless-stopped
+    volumes:
+      - ./grafana/prometheus.replication.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    ports:
+      - "9093:9090"
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.enable-lifecycle'
+    depends_on:
+      - primary
+      - replica1
+      - replica2
+
+  # ========================================================================
+  # Grafana — dashboards for the cluster
+  # ========================================================================
+  grafana:
+    image: grafana/grafana:latest
+    container_name: rstmdb-repl-grafana
+    restart: unless-stopped
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/rstmdb.json
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    depends_on:
+      - prometheus
+
+volumes:
+  primary-data:
+  replica1-data:
+  replica2-data:
+  prometheus-data:
+  grafana-data:

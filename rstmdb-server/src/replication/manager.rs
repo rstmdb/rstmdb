@@ -5,6 +5,7 @@
 //! WAL entries and fans them out to all connected replicas.
 
 use crate::config::{ReplicationConfig, ReplicationMode};
+use crate::metrics::Metrics;
 use crate::replication::protocol::ReplicationMessage;
 use dashmap::DashMap;
 use rstmdb_core::StateMachineEngine;
@@ -30,6 +31,15 @@ struct SyncBarrier {
     senders: Vec<oneshot::Sender<()>>,
 }
 
+/// Tracks the WAL position the tailer has streamed up to.
+struct TailPosition {
+    /// The sequence of the last entry we tailed. 0 if nothing tailed yet.
+    sequence: u64,
+    /// The offset of the last entry we tailed. Used as a lower bound for the
+    /// next `read_from` call; the sequence filter skips the already-tailed entry.
+    last_offset: u64,
+}
+
 /// Primary-side replication manager.
 pub struct ReplicationManager {
     config: ReplicationConfig,
@@ -40,14 +50,23 @@ pub struct ReplicationManager {
     sync_barriers: Mutex<BTreeMap<u64, SyncBarrier>>,
     /// Next replica ID counter.
     next_replica_id: AtomicU64,
-    /// Last sequence that the WAL tailer has streamed to replicas.
-    last_tailed_sequence: AtomicU64,
+    /// WAL tailer position — protected by mutex since only the tailer task writes it.
+    tail_position: Mutex<TailPosition>,
+    /// Optional metrics for replication counters.
+    metrics: Option<Arc<Metrics>>,
 }
 
 impl ReplicationManager {
     /// Creates a new replication manager and spawns the WAL tailer.
-    pub fn new(config: ReplicationConfig, engine: Arc<StateMachineEngine>) -> Arc<Self> {
+    /// The tailer stops when the shutdown signal is received.
+    pub fn new(
+        config: ReplicationConfig,
+        engine: Arc<StateMachineEngine>,
+        shutdown: tokio::sync::broadcast::Receiver<()>,
+        metrics: Option<Arc<Metrics>>,
+    ) -> Arc<Self> {
         let last_seq = engine.wal().next_sequence().saturating_sub(1);
+        let last_offset = engine.wal().latest_offset().map(|o| o.as_u64()).unwrap_or(0);
 
         let manager = Arc::new(Self {
             config,
@@ -55,38 +74,50 @@ impl ReplicationManager {
             replicas: DashMap::new(),
             sync_barriers: Mutex::new(BTreeMap::new()),
             next_replica_id: AtomicU64::new(1),
-            last_tailed_sequence: AtomicU64::new(last_seq),
+            tail_position: Mutex::new(TailPosition {
+                sequence: last_seq,
+                last_offset,
+            }),
+            metrics,
         });
 
         // Spawn the WAL tailer that watches for new entries and fans out
         let mgr = manager.clone();
         tokio::spawn(async move {
-            mgr.wal_tailer_task().await;
+            mgr.wal_tailer_task(shutdown).await;
         });
 
         manager
     }
 
     /// Background task that polls the WAL for new entries and sends them to all replicas.
-    async fn wal_tailer_task(&self) {
+    async fn wal_tailer_task(&self, mut shutdown: tokio::sync::broadcast::Receiver<()>) {
         let mut interval = tokio::time::interval(self.config.poll_interval());
 
         loop {
-            interval.tick().await;
+            tokio::select! {
+                _ = interval.tick() => {}
+                _ = shutdown.recv() => {
+                    tracing::info!("WAL tailer shutting down");
+                    return;
+                }
+            }
 
             if self.replicas.is_empty() {
                 continue;
             }
 
             let current_seq = self.engine.wal().next_sequence().saturating_sub(1);
-            let last_tailed = self.last_tailed_sequence.load(Ordering::Acquire);
 
-            if current_seq <= last_tailed {
+            let mut pos = self.tail_position.lock().await;
+            if current_seq <= pos.sequence {
                 continue;
             }
 
-            // Read new entries from WAL
-            let entries = match self.engine.wal().read_from(WalOffset::from_u64(0), None) {
+            // Read entries from the segment containing our last-tailed offset.
+            // The sequence filter below skips the already-tailed entry itself.
+            let from_offset = WalOffset::from_u64(pos.last_offset);
+            let entries = match self.engine.wal().read_from(from_offset, None) {
                 Ok(e) => e,
                 Err(e) => {
                     tracing::error!("WAL tailer read error: {}", e);
@@ -95,7 +126,7 @@ impl ReplicationManager {
             };
 
             for (seq, offset, entry) in entries {
-                if seq <= last_tailed {
+                if seq <= pos.sequence {
                     continue;
                 }
 
@@ -106,16 +137,24 @@ impl ReplicationManager {
                 };
 
                 // Fan out to all connected replicas
+                let replica_count = self.replicas.len();
                 for replica in self.replicas.iter() {
                     let _ = replica.value().entry_tx.try_send(msg.clone());
                 }
 
-                self.last_tailed_sequence.store(seq, Ordering::Release);
+                pos.sequence = seq;
+                pos.last_offset = offset.as_u64();
+
+                if let Some(ref m) = self.metrics {
+                    m.replication_entries_sent_total.inc();
+                    m.replication_connected_replicas
+                        .set(replica_count as f64);
+                }
 
                 tracing::trace!(
                     "Replicated WAL entry seq={} to {} replica(s)",
                     seq,
-                    self.replicas.len()
+                    replica_count
                 );
             }
         }
@@ -367,6 +406,63 @@ impl ReplicationManager {
         let bytes = serde_json::to_vec(msg).map_err(std::io::Error::other)?;
         let frame = Encoder::encode_raw(&bytes);
         stream.write_all(&frame).await
+    }
+
+    /// Waits until the current WAL head sequence has been ACKed by enough replicas,
+    /// or returns an error on timeout. Used by the server for sync replication mode.
+    pub async fn await_replication(&self) -> Result<(), String> {
+        let sequence = self.engine.wal().next_sequence().saturating_sub(1);
+        if sequence == 0 {
+            return Ok(());
+        }
+
+        if self.replicas.is_empty() {
+            return Err("no replicas connected for sync replication".to_string());
+        }
+
+        // Check if already satisfied
+        let ack_count = self
+            .replicas
+            .iter()
+            .filter(|r| r.last_acked_sequence.load(Ordering::Acquire) >= sequence)
+            .count();
+        if ack_count >= self.config.sync_replicas as usize {
+            return Ok(());
+        }
+
+        // Create barrier
+        let (tx, rx) = oneshot::channel();
+        {
+            let mut barriers = self.sync_barriers.lock().await;
+            let barrier = barriers.entry(sequence).or_insert_with(|| SyncBarrier {
+                senders: Vec::new(),
+            });
+            barrier.senders.push(tx);
+        }
+
+        // Re-check after registering (race with ACKs arriving)
+        self.check_and_resolve_barriers(sequence).await;
+
+        // Wait with timeout
+        let timeout = self.config.sync_timeout();
+        match tokio::time::timeout(timeout, rx).await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(_)) => Err("sync barrier dropped".to_string()),
+            Err(_) => {
+                // Timeout — clean up barrier
+                let mut barriers = self.sync_barriers.lock().await;
+                barriers.remove(&sequence);
+
+                if let Some(ref m) = self.metrics {
+                    m.replication_sync_timeouts_total.inc();
+                }
+
+                Err(format!(
+                    "sync replication timeout after {}ms (sequence={}, need {} ACKs)",
+                    self.config.sync_timeout_ms, sequence, self.config.sync_replicas
+                ))
+            }
+        }
     }
 
     /// Returns the number of connected replicas.

@@ -165,7 +165,11 @@ impl StateMachineEngine {
                 initial_ctx,
                 ..
             } => {
-                if !self.instances.contains_key(&instance_id) {
+                let should_create = match self.instances.get(&instance_id) {
+                    None => true,
+                    Some(existing) => existing.read().is_deleted(),
+                };
+                if should_create {
                     let instance = Instance::new(
                         instance_id.clone(),
                         machine,
@@ -214,12 +218,25 @@ impl StateMachineEngine {
     }
 
     /// Applies a replicated WAL entry from a primary server.
-    /// Appends the entry to the local WAL, then replays it to update in-memory state.
-    /// Returns the local (sequence, offset) after appending.
-    pub fn apply_replicated_entry(&self, entry: WalEntry) -> Result<(u64, u64), CoreError> {
-        let (sequence, offset) = self.wal.append(&entry)?;
-        self.replay_entry(offset.as_u64(), entry)?;
-        Ok((sequence, offset.as_u64()))
+    /// Appends the entry to the local WAL, then replays it using the primary's
+    /// offset so the replica's in-memory `last_wal_offset` matches the primary's.
+    ///
+    /// **Restart caveat:** after a replica restart, `replay_wal()` uses local
+    /// offsets during recovery, so in-memory offsets revert to local values
+    /// until the replica catches up from the primary again. For cross-node
+    /// comparisons, use the WAL `sequence` (which matches across nodes).
+    ///
+    /// Returns the replica's local `(sequence, offset)` after appending.
+    pub fn apply_replicated_entry(
+        &self,
+        primary_offset: u64,
+        entry: WalEntry,
+    ) -> Result<(u64, u64), CoreError> {
+        let (sequence, local_offset) = self.wal.append(&entry)?;
+        // Use the primary's offset in memory so clients see consistent offsets
+        // when reading from any node that's fully caught up.
+        self.replay_entry(primary_offset, entry)?;
+        Ok((sequence, local_offset.as_u64()))
     }
 
     // =========================================================================
@@ -1178,7 +1195,7 @@ mod tests {
             definition: sample_definition(),
         };
 
-        let (seq, offset) = engine.apply_replicated_entry(entry).unwrap();
+        let (seq, offset) = engine.apply_replicated_entry(0, entry).unwrap();
         assert_eq!(seq, 1);
         assert!(offset > 0);
 
@@ -1194,7 +1211,7 @@ mod tests {
 
         // First replicate the machine definition
         engine
-            .apply_replicated_entry(WalEntry::PutMachine {
+            .apply_replicated_entry(0, WalEntry::PutMachine {
                 machine: "order".to_string(),
                 version: 1,
                 definition_hash: "abc".to_string(),
@@ -1204,7 +1221,7 @@ mod tests {
 
         // Then replicate instance creation
         let (seq, offset) = engine
-            .apply_replicated_entry(WalEntry::CreateInstance {
+            .apply_replicated_entry(0, WalEntry::CreateInstance {
                 instance_id: "i-repl-1".to_string(),
                 machine: "order".to_string(),
                 version: 1,
@@ -1229,7 +1246,7 @@ mod tests {
 
         // Set up machine + instance via replication
         engine
-            .apply_replicated_entry(WalEntry::PutMachine {
+            .apply_replicated_entry(0, WalEntry::PutMachine {
                 machine: "order".to_string(),
                 version: 1,
                 definition_hash: "abc".to_string(),
@@ -1238,7 +1255,7 @@ mod tests {
             .unwrap();
 
         engine
-            .apply_replicated_entry(WalEntry::CreateInstance {
+            .apply_replicated_entry(0, WalEntry::CreateInstance {
                 instance_id: "i-repl-2".to_string(),
                 machine: "order".to_string(),
                 version: 1,
@@ -1250,7 +1267,7 @@ mod tests {
 
         // Replicate an event application
         let (seq, _) = engine
-            .apply_replicated_entry(WalEntry::ApplyEvent {
+            .apply_replicated_entry(0, WalEntry::ApplyEvent {
                 instance_id: "i-repl-2".to_string(),
                 event: "PAY".to_string(),
                 from_state: "created".to_string(),
@@ -1275,7 +1292,7 @@ mod tests {
         let (_dir, engine) = test_engine();
 
         engine
-            .apply_replicated_entry(WalEntry::PutMachine {
+            .apply_replicated_entry(0, WalEntry::PutMachine {
                 machine: "order".to_string(),
                 version: 1,
                 definition_hash: "abc".to_string(),
@@ -1284,7 +1301,7 @@ mod tests {
             .unwrap();
 
         engine
-            .apply_replicated_entry(WalEntry::CreateInstance {
+            .apply_replicated_entry(0, WalEntry::CreateInstance {
                 instance_id: "i-repl-del".to_string(),
                 machine: "order".to_string(),
                 version: 1,
@@ -1299,7 +1316,7 @@ mod tests {
 
         // Replicate deletion
         let (seq, _) = engine
-            .apply_replicated_entry(WalEntry::DeleteInstance {
+            .apply_replicated_entry(0, WalEntry::DeleteInstance {
                 instance_id: "i-repl-del".to_string(),
                 idempotency_key: None,
             })
@@ -1323,7 +1340,7 @@ mod tests {
             let engine = StateMachineEngine::new(config).unwrap();
 
             engine
-                .apply_replicated_entry(WalEntry::PutMachine {
+                .apply_replicated_entry(0, WalEntry::PutMachine {
                     machine: "order".to_string(),
                     version: 1,
                     definition_hash: "abc".to_string(),
@@ -1332,7 +1349,7 @@ mod tests {
                 .unwrap();
 
             engine
-                .apply_replicated_entry(WalEntry::CreateInstance {
+                .apply_replicated_entry(0, WalEntry::CreateInstance {
                     instance_id: "i-persist".to_string(),
                     machine: "order".to_string(),
                     version: 1,
@@ -1343,7 +1360,7 @@ mod tests {
                 .unwrap();
 
             engine
-                .apply_replicated_entry(WalEntry::ApplyEvent {
+                .apply_replicated_entry(0, WalEntry::ApplyEvent {
                     instance_id: "i-persist".to_string(),
                     event: "PAY".to_string(),
                     from_state: "created".to_string(),
@@ -1379,7 +1396,7 @@ mod tests {
 
         // Replicate a full workflow: machine → instance → event → event → delete
         engine
-            .apply_replicated_entry(WalEntry::PutMachine {
+            .apply_replicated_entry(0, WalEntry::PutMachine {
                 machine: "order".to_string(),
                 version: 1,
                 definition_hash: "abc".to_string(),
@@ -1388,7 +1405,7 @@ mod tests {
             .unwrap();
 
         engine
-            .apply_replicated_entry(WalEntry::CreateInstance {
+            .apply_replicated_entry(0, WalEntry::CreateInstance {
                 instance_id: "i-full".to_string(),
                 machine: "order".to_string(),
                 version: 1,
@@ -1399,7 +1416,7 @@ mod tests {
             .unwrap();
 
         engine
-            .apply_replicated_entry(WalEntry::ApplyEvent {
+            .apply_replicated_entry(0, WalEntry::ApplyEvent {
                 instance_id: "i-full".to_string(),
                 event: "PAY".to_string(),
                 from_state: "created".to_string(),
@@ -1412,7 +1429,7 @@ mod tests {
             .unwrap();
 
         engine
-            .apply_replicated_entry(WalEntry::ApplyEvent {
+            .apply_replicated_entry(0, WalEntry::ApplyEvent {
                 instance_id: "i-full".to_string(),
                 event: "SHIP".to_string(),
                 from_state: "paid".to_string(),
@@ -1429,7 +1446,7 @@ mod tests {
         assert_eq!(instance.ctx["tracking"], "XYZ");
 
         engine
-            .apply_replicated_entry(WalEntry::DeleteInstance {
+            .apply_replicated_entry(0, WalEntry::DeleteInstance {
                 instance_id: "i-full".to_string(),
                 idempotency_key: None,
             })
@@ -1443,7 +1460,7 @@ mod tests {
         let (_dir, engine) = test_engine();
 
         let (seq1, off1) = engine
-            .apply_replicated_entry(WalEntry::PutMachine {
+            .apply_replicated_entry(0, WalEntry::PutMachine {
                 machine: "m1".to_string(),
                 version: 1,
                 definition_hash: "a".to_string(),
@@ -1452,7 +1469,7 @@ mod tests {
             .unwrap();
 
         let (seq2, off2) = engine
-            .apply_replicated_entry(WalEntry::CreateInstance {
+            .apply_replicated_entry(0, WalEntry::CreateInstance {
                 instance_id: "i1".to_string(),
                 machine: "m1".to_string(),
                 version: 1,
@@ -1463,7 +1480,7 @@ mod tests {
             .unwrap();
 
         let (seq3, off3) = engine
-            .apply_replicated_entry(WalEntry::ApplyEvent {
+            .apply_replicated_entry(0, WalEntry::ApplyEvent {
                 instance_id: "i1".to_string(),
                 event: "PAY".to_string(),
                 from_state: "created".to_string(),
@@ -1488,7 +1505,7 @@ mod tests {
 
         // Snapshot and Checkpoint entries should be accepted but not affect state
         let (seq1, _) = engine
-            .apply_replicated_entry(WalEntry::Snapshot {
+            .apply_replicated_entry(0, WalEntry::Snapshot {
                 instance_id: "nonexistent".to_string(),
                 snapshot_id: "snap-1".to_string(),
                 state: "s".to_string(),
@@ -1497,7 +1514,7 @@ mod tests {
             .unwrap();
 
         let (seq2, _) = engine
-            .apply_replicated_entry(WalEntry::Checkpoint { timestamp: 0 })
+            .apply_replicated_entry(0, WalEntry::Checkpoint { timestamp: 0 })
             .unwrap();
 
         assert_eq!(seq1, 1);

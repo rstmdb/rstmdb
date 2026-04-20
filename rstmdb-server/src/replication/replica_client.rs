@@ -132,11 +132,12 @@ impl ReplicaClient {
                 match msg {
                     ReplicationMessage::ReplicateEntry {
                         sequence,
-                        offset: _,
+                        offset,
                         entry,
                     } => {
-                        // Apply the entry
-                        match self.engine.apply_replicated_entry(entry) {
+                        // Apply the entry, passing the primary's offset so the
+                        // replica's in-memory state reflects primary offsets.
+                        match self.engine.apply_replicated_entry(offset, entry) {
                             Ok((local_seq, _local_offset)) => {
                                 self.last_applied_sequence
                                     .store(local_seq, Ordering::Release);
