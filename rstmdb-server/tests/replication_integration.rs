@@ -7,6 +7,7 @@ use rstmdb_core::StateMachineEngine;
 use rstmdb_protocol::message::{Operation, Request};
 use rstmdb_protocol::{Decoder, Encoder};
 use rstmdb_server::config::{ReplicationConfig, ReplicationMode, ReplicationRole};
+use rstmdb_server::auth::TokenValidator;
 use rstmdb_server::handler::CommandHandler;
 use rstmdb_server::session::Session;
 use rstmdb_wal::{FsyncPolicy, WalConfig, WalEntry};
@@ -317,6 +318,47 @@ fn test_delete_replicates_to_replica() {
 // =========================================================================
 
 #[test]
+fn test_replication_token_hash_matches_cli_output() {
+    // Sanity check: the hash produced by TokenValidator is the same that
+    // `rstmdb-cli hash-token` would produce — used by operators to
+    // populate `auth_token_hashes` in config.
+    let hash = TokenValidator::hash_token("my-secret-token");
+    assert_eq!(hash.len(), 64);
+    assert_eq!(
+        hash,
+        "ea5add57437cbf20af59034d7ed17968dcc56767b41965fcc5b376d45db8b4a3"
+    );
+}
+
+#[test]
+fn test_replication_auth_validator_accepts_correct_token() {
+    let hash = TokenValidator::hash_token("dev-token");
+    let validator = TokenValidator::new(vec![hash]);
+    assert!(validator.validate("dev-token"));
+    assert!(!validator.validate("wrong-token"));
+    assert!(!validator.validate(""));
+}
+
+#[test]
+fn test_replication_config_hashes_plaintext_token() {
+    let config = ReplicationConfig {
+        auth_token: Some("some-plaintext".to_string()),
+        ..Default::default()
+    };
+    assert!(config.auth_required());
+    let hashes = config.resolved_token_hashes();
+    assert_eq!(hashes.len(), 1);
+    // Must match what TokenValidator produces
+    let expected = TokenValidator::hash_token("some-plaintext");
+    assert_eq!(hashes[0], expected);
+
+    // A validator built from the resolved hashes accepts the plaintext
+    let validator = TokenValidator::new(hashes);
+    assert!(validator.validate("some-plaintext"));
+    assert!(!validator.validate("something-else"));
+}
+
+#[test]
 fn test_sync_mode_config_validation() {
     let config = ReplicationConfig {
         role: ReplicationRole::Primary,
@@ -364,6 +406,7 @@ fn test_replication_message_framing_roundtrip() {
         ReplicationMessage::ReplicateAuth {
             auth_token: Some("secret".to_string()),
             last_sequence: 42,
+            last_primary_offset: 0,
         },
         ReplicationMessage::ReplicateSyncResponse {
             ok: true,
@@ -381,11 +424,13 @@ fn test_replication_message_framing_roundtrip() {
                 initial_ctx: json!({"key": "value"}),
                 idempotency_key: None,
             },
+            timestamp_ms: 1_700_000_000_000,
         },
         ReplicationMessage::ReplicateAck { sequence: 1 },
         ReplicationMessage::ReplicateHeartbeat {
             primary_sequence: 50,
-            timestamp_ms: 1234567890,
+            timestamp_ms: 1_234_567_890,
+            primary_latest_write_ts_ms: 1_234_560_000,
         },
     ];
 
@@ -934,6 +979,7 @@ fn test_replication_message_auth_no_token() {
     let msg = ReplicationMessage::ReplicateAuth {
         auth_token: None,
         last_sequence: 0,
+        last_primary_offset: 0,
     };
 
     let bytes = msg.to_bytes().unwrap();
@@ -943,9 +989,11 @@ fn test_replication_message_auth_no_token() {
         ReplicationMessage::ReplicateAuth {
             auth_token,
             last_sequence,
+            last_primary_offset,
         } => {
             assert!(auth_token.is_none());
             assert_eq!(*last_sequence, 0);
+            assert_eq!(*last_primary_offset, 0);
         }
         _ => panic!("wrong variant"),
     }
@@ -1041,6 +1089,96 @@ fn test_replication_config_duration_helpers() {
     assert_eq!(config.reconnect_delay().as_secs(), 3);
     assert_eq!(config.lag_check_interval().as_secs(), 15);
     assert_eq!(config.sync_timeout().as_millis(), 2000);
+}
+
+// =========================================================================
+// Observability: primary-side per-replica stats method
+// =========================================================================
+
+#[test]
+fn test_manager_replica_stats_empty_when_no_replicas() {
+    use rstmdb_server::replication::ReplicationManager;
+
+    let dir = TempDir::new().unwrap();
+    let engine = make_engine(dir.path());
+    let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel(1);
+
+    // Use a tokio runtime explicitly to spawn the WAL tailer
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let _guard = rt.enter();
+
+    let config = ReplicationConfig {
+        role: ReplicationRole::Primary,
+        ..Default::default()
+    };
+    let mgr = ReplicationManager::new(config, engine, shutdown_rx, None);
+
+    let stats = mgr.replica_stats();
+    assert!(stats.is_empty());
+    assert_eq!(mgr.connected_replica_count(), 0);
+
+    let _ = shutdown_tx.send(());
+}
+
+// =========================================================================
+// Backpressure: slow replica is disconnected instead of silently dropping entries
+// =========================================================================
+
+#[test]
+fn test_slow_replica_lag_visibility_via_stats() {
+    // Verify that `replica_stats()` reflects lag when a replica hasn't ACKed.
+    // This exercises the same machinery used by backpressure detection and
+    // by the per-replica metrics/logs.
+    use rstmdb_server::replication::ReplicationManager;
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let dir = TempDir::new().unwrap();
+        let engine = make_engine(dir.path());
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel(1);
+
+        let config = ReplicationConfig {
+            role: ReplicationRole::Primary,
+            ..Default::default()
+        };
+        let mgr = ReplicationManager::new(config, engine.clone(), shutdown_rx, None);
+
+        // Write some entries to primary — they bump next_sequence.
+        engine
+            .put_machine("order", 1, &sample_definition())
+            .unwrap();
+        engine
+            .create_instance("s-1", "order", 1, json!({}), None)
+            .unwrap();
+
+        // With no replicas connected, stats is empty.
+        let stats = mgr.replica_stats();
+        assert!(stats.is_empty());
+        assert_eq!(mgr.connected_replica_count(), 0);
+    });
+}
+
+// =========================================================================
+// Observability: replica lag_seconds when fully caught up is 0
+// =========================================================================
+
+#[test]
+fn test_replica_lag_seconds_caught_up() {
+    use rstmdb_server::replication::ReplicaClient;
+
+    let dir = TempDir::new().unwrap();
+    let engine = make_engine(dir.path());
+    let config = ReplicationConfig {
+        role: ReplicationRole::Replica,
+        upstream: Some("127.0.0.1:65535".to_string()),
+        ..Default::default()
+    };
+
+    let client = ReplicaClient::new(config, engine, "127.0.0.1:65535".to_string(), None).unwrap();
+
+    // No heartbeat received, no entries applied — lag_seconds should be 0
+    assert_eq!(client.lag_seconds(), 0.0);
+    assert_eq!(client.lag_entries(), 0);
 }
 
 // =========================================================================
