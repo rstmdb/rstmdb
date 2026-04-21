@@ -252,26 +252,7 @@ impl CommandHandler {
     /// Updates gauge metrics from current engine state.
     pub fn update_gauge_metrics(&self) {
         if let Some(ref metrics) = self.metrics {
-            // Update instances count
-            let instances = self.engine.get_all_instances();
-            metrics.instances_total.set(instances.len() as f64);
-
-            // Update machines count
-            let machines = self.engine.list_machines();
-            let machine_count: usize = machines.values().map(|versions| versions.len()).sum();
-            metrics.machines_total.set(machine_count as f64);
-
-            // Update WAL metrics
-            let wal = self.engine.wal();
-            // next_sequence is 1-based, so subtract 1 to get actual entry count
-            let entry_count = wal.next_sequence().saturating_sub(1);
-            metrics.wal_entries.set(entry_count as f64);
-            metrics.wal_segments.set(wal.segment_ids().len() as f64);
-            metrics.wal_size_bytes.set(wal.total_size() as f64);
-
-            // Update WAL I/O counters
-            let wal_stats = wal.stats();
-            metrics.update_wal_stats(wal_stats);
+            crate::metrics::refresh_engine_gauges(&self.engine, metrics);
         }
     }
 

@@ -51,6 +51,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err(e.into());
     }
 
+    // Load replication auth secrets from external file if configured
+    if let Err(e) = config.replication.load_secrets() {
+        tracing::error!("Failed to load replication auth secrets: {}", e);
+        return Err(e.into());
+    }
+
     tracing::info!("Starting rstmdb server");
     tracing::info!("  Bind address: {}", config.network.bind_addr);
     tracing::info!("  Data directory: {}", config.storage.data_dir.display());
@@ -87,15 +93,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err(e.into());
     }
 
+    // Warn if a plaintext replication token is configured
+    if config.replication.auth_token.is_some() {
+        tracing::warn!(
+            "replication.auth_token is set in plaintext — prefer replication.auth_token_hashes \
+             (generate with: rstmdb-cli hash-token <token>) or replication.auth_secrets_file"
+        );
+    }
+
     match config.replication.role {
         ReplicationRole::Primary => {
+            let auth_state = if config.replication.auth_required() {
+                format!("auth: {} hash(es)", config.replication.resolved_token_hashes().len())
+            } else {
+                "auth: disabled".to_string()
+            };
             tracing::info!(
-                "  Replication: primary ({} mode)",
+                "  Replication: primary ({} mode, {})",
                 if config.replication.mode == rstmdb_server::ReplicationMode::Sync {
                     "sync"
                 } else {
                     "async"
-                }
+                },
+                auth_state,
             );
         }
         ReplicationRole::Replica => {
@@ -242,7 +262,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             engine.clone(),
             upstream,
             auth_token,
-        );
+        )
+        .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
         let shutdown_rx = server.subscribe_shutdown();
         Some(tokio::spawn(async move {
             replica_client.run(shutdown_rx).await;
@@ -260,6 +281,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             if let Err(e) = run_metrics_server(metrics_addr, metrics_clone, shutdown_rx).await {
                 tracing::error!("Metrics server error: {}", e);
             }
+        }))
+    } else {
+        None
+    };
+
+    // Spawn periodic gauge refresher so WAL/instance/machine gauges stay
+    // accurate on read-only replicas (which don't trigger write-path updates)
+    // and to pick up any changes the write handlers missed.
+    let gauge_refresher_handle = if let (Some(ref m), Some(ref tx)) = (&metrics, &shutdown_tx) {
+        let engine_clone = engine.clone();
+        let metrics_clone = m.clone();
+        let shutdown_rx = tx.subscribe();
+        Some(tokio::spawn(async move {
+            rstmdb_server::metrics::run_gauge_refresher(
+                engine_clone,
+                metrics_clone,
+                std::time::Duration::from_secs(5),
+                shutdown_rx,
+            )
+            .await;
         }))
     } else {
         None
@@ -294,6 +335,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Wait for replica client to stop
     if let Some(handle) = replica_handle {
+        let _ = handle.await;
+    }
+
+    // Wait for gauge refresher to stop
+    if let Some(handle) = gauge_refresher_handle {
         let _ = handle.await;
     }
 

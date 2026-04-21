@@ -33,7 +33,8 @@ replication:
   auth_token: "repl-dev-token"
   max_lag_entries: 10000
   max_lag_seconds: 30
-  reconnect_delay_secs: 2
+  reconnect_delay_secs: 1
+  reconnect_max_delay_secs: 60
   lag_check_interval_secs: 10
 
 metrics:

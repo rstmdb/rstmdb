@@ -30,6 +30,7 @@ hex.workspace = true
 rustls.workspace = true
 tokio-rustls.workspace = true
 rustls-pemfile.workspace = true
+webpki-roots.workspace = true
 pin-project-lite.workspace = true
 prometheus = { version = "0.13", features = ["process"] }
 hyper = { version = "1.4", features = ["server", "http1"] }

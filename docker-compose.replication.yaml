@@ -38,7 +38,8 @@ services:
       RSTMDB_DATA: /data
       RSTMDB_REPL_ROLE: primary
       RSTMDB_REPL_MODE: async
-      RSTMDB_REPL_AUTH_TOKEN: repl-docker-token
+      # Primary accepts the hash of "repl-docker-token" (preferred over plaintext).
+      RSTMDB_REPL_AUTH_TOKEN_HASH: "acbbe5ae3f2637d9e80ff79de0f379252df03b174797f9a9cc21790568281b13"
       RSTMDB_METRICS_ENABLED: "true"
       RSTMDB_METRICS_BIND: "0.0.0.0:9090"
       RSTMDB_ALLOW_FLUSH_ALL: "true"

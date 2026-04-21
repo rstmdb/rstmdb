@@ -110,8 +110,23 @@ replication:
   max_lag_seconds: 30
   max_lag_entries: 10000
 
-  # Authentication token for replication connections
+  # Authentication token for replication connections.
+  # *** DEPRECATED *** — plaintext tokens in config files are insecure.
+  # Prefer `auth_token_hashes` or `auth_secrets_file` below. If set, the
+  # replica still sends this value; the primary hashes it at load time and
+  # appends to auth_token_hashes.
   # auth_token: "repl-secret-token"
+
+  # SHA-256 hex hashes of accepted replication tokens (primary side).
+  # Generate with: `rstmdb-cli hash-token <your-token>`. Multiple entries
+  # supported for rotation. The replica still sends plaintext via
+  # `auth_token`; the primary compares sha256(received) against this list.
+  # auth_token_hashes:
+  #   - "ea5add57437cbf20af59034d7ed17968dcc56767b41965fcc5b376d45db8b4a3"
+
+  # Optional path to a file containing replication token hashes (one per line,
+  # # for comments). Merged with auth_token_hashes at startup.
+  # auth_secrets_file: "/etc/rstmdb/repl-tokens.secret"
 
   # How often the primary polls the WAL for new entries to stream (ms)
   poll_interval_ms: 10
@@ -119,11 +134,26 @@ replication:
   # How often the primary sends heartbeats to replicas (seconds)
   heartbeat_interval_secs: 5
 
-  # How long a replica waits before reconnecting after connection loss (seconds)
-  reconnect_delay_secs: 2
+  # Base delay for the replica's reconnect loop (seconds). The actual wait
+  # uses capped exponential backoff with full jitter:
+  # delay = uniform_random(0, min(base * 2^attempt, max))
+  reconnect_delay_secs: 1
+
+  # Maximum reconnect delay in seconds (cap for exponential backoff).
+  reconnect_max_delay_secs: 60
 
   # How often replication lag is checked and logged (seconds)
   lag_check_interval_secs: 10
+
+  # Enable TLS for replication connections (replica -> primary).
+  # tls_enabled: false
+
+  # Optional path to CA certificate for verifying the primary's cert.
+  # If omitted, system root certificates are used.
+  # tls_ca_path: "/etc/rstmdb/ca.pem"
+
+  # Skip TLS verification — development only!
+  # tls_insecure: false
 
 # Prometheus metrics settings
 metrics:

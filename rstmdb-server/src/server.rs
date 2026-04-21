@@ -379,11 +379,11 @@ impl Server {
 
     /// Handles a connection, detecting if it's a replication connection.
     ///
-    /// For plain TCP connections with a replication manager, we peek at the
-    /// first RCPX frame. If it decodes as a ReplicateAuth message, we hand off
-    /// to the replication manager. Otherwise, we proceed with normal handling.
+    /// Works for both plain TCP and TLS streams. Peeks at the first RCPX frame;
+    /// if it decodes as a ReplicateAuth message, hands off to the replication
+    /// manager. Otherwise, the read bytes are forwarded to normal client handling.
     async fn handle_connection_with_repl_detect(
-        stream: MaybeTlsStream,
+        mut stream: MaybeTlsStream,
         addr: SocketAddr,
         handler: Arc<CommandHandler>,
         broadcaster: Arc<EventBroadcaster>,
@@ -391,21 +391,14 @@ impl Server {
         shutdown: &mut broadcast::Receiver<()>,
         repl_manager: Option<Arc<ReplicationManager>>,
     ) -> Result<(), ServerError> {
-        // Only attempt replication detection for primary servers with plain TCP
-        let is_plain = stream.is_plain();
-        if let (Some(mgr), true) = (repl_manager.as_ref(), is_plain) {
+        if let Some(mgr) = repl_manager.as_ref() {
             let mgr = mgr.clone();
-            let mut tcp = match stream {
-                MaybeTlsStream::Plain { stream: s } => s,
-                _ => unreachable!(),
-            };
 
             // Peek at the first frame to detect replication
             let mut decoder = rstmdb_protocol::Decoder::new();
             let mut peek_buf = [0u8; 4096];
 
-            // Read initial data
-            let n = tcp.read(&mut peek_buf).await?;
+            let n = stream.read(&mut peek_buf).await?;
             if n == 0 {
                 return Ok(());
             }
@@ -423,7 +416,7 @@ impl Server {
                     match ReplicationMessage::from_bytes(&payload) {
                         Ok(msg) if msg.is_auth() => {
                             tracing::info!("[{}] Detected replication connection", addr);
-                            mgr.handle_replica_connection(tcp, msg).await;
+                            mgr.handle_replica_connection(stream, msg).await;
                             return Ok(());
                         }
                         Ok(_) => {
@@ -455,14 +448,14 @@ impl Server {
             // Not a replication connection - proceed with normal handling
             // Feed the already-read data into the connection handler
             return Self::handle_connection(
-                MaybeTlsStream::Plain { stream: tcp },
+                stream,
                 addr,
                 handler,
                 broadcaster,
                 config,
                 shutdown,
                 Some(&peek_buf[..n]),
-                Some(mgr.clone()),
+                Some(mgr),
             )
             .await;
         }
@@ -514,6 +507,138 @@ impl Server {
             std::collections::HashMap::new();
 
         loop {
+            // Drain any complete requests currently in the decoder buffer.
+            // This runs at the top of each iteration so:
+            //  (1) if `initial_data` fed the decoder before the loop, those
+            //      requests are processed before we block on `select!` (otherwise
+            //      the client would deadlock waiting for our response).
+            //  (2) any leftover bytes from a previous read that formed a second
+            //      complete request get processed before we wait for more data.
+            while let Some(request) = decoder.decode_request()? {
+                tracing::info!("[{}] Request: {:?} (id={})", addr, request.op, request.id);
+
+                let response = match request.op {
+                    Operation::WatchInstance => {
+                        match handler.handle_watch_instance(&mut session, &request.params) {
+                            Ok((result, receiver)) => {
+                                let sub_id =
+                                    result["subscription_id"].as_str().unwrap().to_string();
+                                let include_ctx =
+                                    request.params["include_ctx"].as_bool().unwrap_or(true);
+
+                                let task = Self::spawn_subscription_forwarder(
+                                    sub_id.clone(),
+                                    receiver,
+                                    None,
+                                    include_ctx,
+                                    event_tx.clone(),
+                                );
+                                subscription_tasks.insert(sub_id, task);
+
+                                rstmdb_protocol::Response::ok(&request.id, result)
+                            }
+                            Err(e) => rstmdb_protocol::Response::error(
+                                &request.id,
+                                rstmdb_protocol::message::ResponseError::new(
+                                    e.error_code(),
+                                    e.to_string(),
+                                ),
+                            ),
+                        }
+                    }
+                    Operation::WatchAll => {
+                        match handler.handle_watch_all(&mut session, &request.params) {
+                            Ok((result, receiver, filter)) => {
+                                let sub_id =
+                                    result["subscription_id"].as_str().unwrap().to_string();
+                                let include_ctx =
+                                    request.params["include_ctx"].as_bool().unwrap_or(true);
+
+                                let task = Self::spawn_subscription_forwarder(
+                                    sub_id.clone(),
+                                    receiver,
+                                    Some(filter),
+                                    include_ctx,
+                                    event_tx.clone(),
+                                );
+                                subscription_tasks.insert(sub_id, task);
+
+                                rstmdb_protocol::Response::ok(&request.id, result)
+                            }
+                            Err(e) => rstmdb_protocol::Response::error(
+                                &request.id,
+                                rstmdb_protocol::message::ResponseError::new(
+                                    e.error_code(),
+                                    e.to_string(),
+                                ),
+                            ),
+                        }
+                    }
+                    Operation::Unwatch => {
+                        let response = handler.handle(&mut session, &request);
+                        if let Some(sub_id) = request.params["subscription_id"].as_str() {
+                            if let Some(task) = subscription_tasks.remove(sub_id) {
+                                task.abort();
+                            }
+                        }
+                        response
+                    }
+                    _ => handler.handle(&mut session, &request),
+                };
+
+                // Sync replication: wait for ACKs before responding to write operations
+                let response = if let Some(ref mgr) = repl_manager {
+                    if mgr.is_sync()
+                        && response.is_ok()
+                        && CommandHandler::is_write_operation(&request.op)
+                    {
+                        match mgr.await_replication().await {
+                            Ok(()) => response,
+                            Err(msg) => {
+                                tracing::warn!("[{}] Sync replication failed: {}", addr, msg);
+                                rstmdb_protocol::Response::error(
+                                    &request.id,
+                                    rstmdb_protocol::message::ResponseError::new(
+                                        rstmdb_protocol::ErrorCode::ReplicationTimeout,
+                                        msg,
+                                    ),
+                                )
+                            }
+                        }
+                    } else {
+                        response
+                    }
+                } else {
+                    response
+                };
+
+                tracing::info!(
+                    "[{}] Response: {} (id={})",
+                    addr,
+                    if response.is_ok() { "OK" } else { "ERROR" },
+                    response.id
+                );
+
+                let response_bytes = match session.wire_mode() {
+                    WireMode::BinaryJson => Encoder::encode_response(&response)?,
+                    WireMode::Jsonl => {
+                        let mut bytes = serde_json::to_vec(&response)?;
+                        bytes.push(b'\n');
+                        BytesMut::from(&bytes[..])
+                    }
+                };
+
+                tracing::debug!("[{}] Writing {} bytes", addr, response_bytes.len());
+                stream.write_all(&response_bytes).await?;
+
+                if session.state() == SessionState::Closing {
+                    tracing::debug!("[{}] Session closing", addr);
+                    Self::cleanup_subscriptions(&session, &broadcaster);
+                    Self::abort_subscription_tasks(&mut subscription_tasks);
+                    return Ok(());
+                }
+            }
+
             tokio::select! {
                 biased;
 
@@ -595,138 +720,6 @@ impl Server {
                     Self::cleanup_subscriptions(&session, &broadcaster);
                     Self::abort_subscription_tasks(&mut subscription_tasks);
                     return Err(ServerError::ShuttingDown);
-                }
-            }
-
-            // Process any complete requests
-            while let Some(request) = decoder.decode_request()? {
-                tracing::info!("[{}] Request: {:?} (id={})", addr, request.op, request.id);
-
-                // Special handling for watch commands to spawn forwarder tasks
-                let response = match request.op {
-                    Operation::WatchInstance => {
-                        match handler.handle_watch_instance(&mut session, &request.params) {
-                            Ok((result, receiver)) => {
-                                let sub_id =
-                                    result["subscription_id"].as_str().unwrap().to_string();
-                                let include_ctx =
-                                    request.params["include_ctx"].as_bool().unwrap_or(true);
-
-                                // Spawn forwarder task
-                                let task = Self::spawn_subscription_forwarder(
-                                    sub_id.clone(),
-                                    receiver,
-                                    None, // No filter for instance subscriptions
-                                    include_ctx,
-                                    event_tx.clone(),
-                                );
-                                subscription_tasks.insert(sub_id, task);
-
-                                rstmdb_protocol::Response::ok(&request.id, result)
-                            }
-                            Err(e) => rstmdb_protocol::Response::error(
-                                &request.id,
-                                rstmdb_protocol::message::ResponseError::new(
-                                    e.error_code(),
-                                    e.to_string(),
-                                ),
-                            ),
-                        }
-                    }
-                    Operation::WatchAll => {
-                        match handler.handle_watch_all(&mut session, &request.params) {
-                            Ok((result, receiver, filter)) => {
-                                let sub_id =
-                                    result["subscription_id"].as_str().unwrap().to_string();
-                                let include_ctx =
-                                    request.params["include_ctx"].as_bool().unwrap_or(true);
-
-                                // Spawn forwarder task with filter
-                                let task = Self::spawn_subscription_forwarder(
-                                    sub_id.clone(),
-                                    receiver,
-                                    Some(filter),
-                                    include_ctx,
-                                    event_tx.clone(),
-                                );
-                                subscription_tasks.insert(sub_id, task);
-
-                                rstmdb_protocol::Response::ok(&request.id, result)
-                            }
-                            Err(e) => rstmdb_protocol::Response::error(
-                                &request.id,
-                                rstmdb_protocol::message::ResponseError::new(
-                                    e.error_code(),
-                                    e.to_string(),
-                                ),
-                            ),
-                        }
-                    }
-                    Operation::Unwatch => {
-                        let response = handler.handle(&mut session, &request);
-                        // Abort the forwarder task for this subscription
-                        if let Some(sub_id) = request.params["subscription_id"].as_str() {
-                            if let Some(task) = subscription_tasks.remove(sub_id) {
-                                task.abort();
-                            }
-                        }
-                        response
-                    }
-                    _ => handler.handle(&mut session, &request),
-                };
-
-                // Sync replication: wait for ACKs before responding to write operations
-                let response = if let Some(ref mgr) = repl_manager {
-                    if mgr.is_sync()
-                        && response.is_ok()
-                        && CommandHandler::is_write_operation(&request.op)
-                    {
-                        match mgr.await_replication().await {
-                            Ok(()) => response,
-                            Err(msg) => {
-                                tracing::warn!("[{}] Sync replication failed: {}", addr, msg);
-                                rstmdb_protocol::Response::error(
-                                    &request.id,
-                                    rstmdb_protocol::message::ResponseError::new(
-                                        rstmdb_protocol::ErrorCode::ReplicationTimeout,
-                                        msg,
-                                    ),
-                                )
-                            }
-                        }
-                    } else {
-                        response
-                    }
-                } else {
-                    response
-                };
-
-                tracing::info!(
-                    "[{}] Response: {} (id={})",
-                    addr,
-                    if response.is_ok() { "OK" } else { "ERROR" },
-                    response.id
-                );
-
-                // Encode and send response
-                let response_bytes = match session.wire_mode() {
-                    WireMode::BinaryJson => Encoder::encode_response(&response)?,
-                    WireMode::Jsonl => {
-                        let mut bytes = serde_json::to_vec(&response)?;
-                        bytes.push(b'\n');
-                        BytesMut::from(&bytes[..])
-                    }
-                };
-
-                tracing::debug!("[{}] Writing {} bytes", addr, response_bytes.len());
-                stream.write_all(&response_bytes).await?;
-
-                // Check if session is closing
-                if session.state() == SessionState::Closing {
-                    tracing::debug!("[{}] Session closing", addr);
-                    Self::cleanup_subscriptions(&session, &broadcaster);
-                    Self::abort_subscription_tasks(&mut subscription_tasks);
-                    return Ok(());
                 }
             }
         }

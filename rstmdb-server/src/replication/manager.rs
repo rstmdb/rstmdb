@@ -4,9 +4,11 @@
 //! Uses a WAL-tailing approach: a background task continuously reads new
 //! WAL entries and fans them out to all connected replicas.
 
+use crate::auth::TokenValidator;
 use crate::config::{ReplicationConfig, ReplicationMode};
 use crate::metrics::Metrics;
 use crate::replication::protocol::ReplicationMessage;
+use crate::stream::MaybeTlsStream;
 use dashmap::DashMap;
 use rstmdb_core::StateMachineEngine;
 use rstmdb_protocol::{Decoder, Encoder};
@@ -14,8 +16,7 @@ use rstmdb_wal::WalOffset;
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
+use tokio::io::{split, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot, Mutex};
 
 /// Information about a connected replica.
@@ -32,12 +33,21 @@ struct SyncBarrier {
 }
 
 /// Tracks the WAL position the tailer has streamed up to.
+///
+/// Filtering is **offset-based**, not sequence-based, because `wal.append()`
+/// assigns sequences atomically via `fetch_add` BEFORE the actual disk write
+/// completes. Under concurrent writes, sequence N+1 can be written to disk
+/// before sequence N, so sequences are not monotonic in disk order. Offsets
+/// within a segment, however, are always monotonic (each append appends to
+/// the segment's tail).
 struct TailPosition {
-    /// The sequence of the last entry we tailed. 0 if nothing tailed yet.
+    /// Highest sequence we've observed. Kept for logging/metrics only.
     sequence: u64,
-    /// The offset of the last entry we tailed. Used as a lower bound for the
-    /// next `read_from` call; the sequence filter skips the already-tailed entry.
-    last_offset: u64,
+    /// Exclusive upper bound of tailed offsets: entries with `offset >= this`
+    /// are new and should be fanned out; entries with `offset < this` have
+    /// already been tailed. Starts at 0 so the very first WAL entry is always
+    /// picked up (real entry offsets live in segment ≥1, always > 0).
+    next_offset: u64,
 }
 
 /// Primary-side replication manager.
@@ -52,6 +62,11 @@ pub struct ReplicationManager {
     next_replica_id: AtomicU64,
     /// WAL tailer position — protected by mutex since only the tailer task writes it.
     tail_position: Mutex<TailPosition>,
+    /// Wall-clock timestamp (ms) of the most recently tailed WAL entry.
+    /// Used by replicas to compute time-based lag.
+    latest_write_ts_ms: AtomicU64,
+    /// Token validator for replication auth (None = no auth required).
+    token_validator: Option<TokenValidator>,
     /// Optional metrics for replication counters.
     metrics: Option<Arc<Metrics>>,
 }
@@ -66,7 +81,20 @@ impl ReplicationManager {
         metrics: Option<Arc<Metrics>>,
     ) -> Arc<Self> {
         let last_seq = engine.wal().next_sequence().saturating_sub(1);
-        let last_offset = engine.wal().latest_offset().map(|o| o.as_u64()).unwrap_or(0);
+        // Initialize to 0 so the very first WAL entry (at segment 1, offset 0
+        // = packed 1099511627776) is tailed. Do NOT use `latest_offset()` —
+        // that returns the next-write position (segment size), which equals
+        // the first entry's offset on an empty WAL and would cause the
+        // filter to skip it forever.
+        let next_offset = 0u64;
+
+        // Pre-build the token validator from resolved hashes (plaintext token
+        // is hashed here too). None means no replication auth is required.
+        let token_validator = if config.auth_required() {
+            Some(TokenValidator::new(config.resolved_token_hashes()))
+        } else {
+            None
+        };
 
         let manager = Arc::new(Self {
             config,
@@ -76,8 +104,10 @@ impl ReplicationManager {
             next_replica_id: AtomicU64::new(1),
             tail_position: Mutex::new(TailPosition {
                 sequence: last_seq,
-                last_offset,
+                next_offset,
             }),
+            latest_write_ts_ms: AtomicU64::new(0),
+            token_validator,
             metrics,
         });
 
@@ -107,16 +137,11 @@ impl ReplicationManager {
                 continue;
             }
 
-            let current_seq = self.engine.wal().next_sequence().saturating_sub(1);
-
             let mut pos = self.tail_position.lock().await;
-            if current_seq <= pos.sequence {
-                continue;
-            }
 
-            // Read entries from the segment containing our last-tailed offset.
-            // The sequence filter below skips the already-tailed entry itself.
-            let from_offset = WalOffset::from_u64(pos.last_offset);
+            // Read entries from the segment containing our next-to-tail offset.
+            // The filter below skips any entries strictly below `next_offset`.
+            let from_offset = WalOffset::from_u64(pos.next_offset);
             let entries = match self.engine.wal().read_from(from_offset, None) {
                 Ok(e) => e,
                 Err(e) => {
@@ -126,35 +151,79 @@ impl ReplicationManager {
             };
 
             for (seq, offset, entry) in entries {
-                if seq <= pos.sequence {
+                // Offsets within a segment are monotonic on disk (each append
+                // appends to the segment tail under segment-mutex). Sequences
+                // are NOT monotonic in disk order under concurrent writes.
+                if offset.as_u64() < pos.next_offset {
                     continue;
                 }
+
+                let now_ms = now_unix_ms();
+                self.latest_write_ts_ms.store(now_ms, Ordering::Release);
 
                 let msg = ReplicationMessage::ReplicateEntry {
                     sequence: seq,
                     offset: offset.as_u64(),
                     entry,
+                    timestamp_ms: now_ms,
                 };
 
-                // Fan out to all connected replicas
+                // Fan out to all connected replicas. If a replica's channel is
+                // full, it can't keep up — disconnect it so it reconnects and
+                // catches up from WAL instead of silently losing entries.
                 let replica_count = self.replicas.len();
+                let mut slow_replicas: Vec<String> = Vec::new();
                 for replica in self.replicas.iter() {
-                    let _ = replica.value().entry_tx.try_send(msg.clone());
+                    use tokio::sync::mpsc::error::TrySendError;
+                    match replica.value().entry_tx.try_send(msg.clone()) {
+                        Ok(()) => {}
+                        Err(TrySendError::Full(_)) => {
+                            slow_replicas.push(replica.key().clone());
+                        }
+                        Err(TrySendError::Closed(_)) => {
+                            // Already torn down; reader/writer tasks will clean up.
+                            // Don't warn — this is normal during disconnect.
+                        }
+                    }
                 }
 
-                pos.sequence = seq;
-                pos.last_offset = offset.as_u64();
+                for replica_id in &slow_replicas {
+                    tracing::warn!(
+                        "Replica {} cannot keep up (send channel full at seq={}); \
+                         disconnecting — will catch up from WAL on reconnect",
+                        replica_id,
+                        seq,
+                    );
+                    // Dropping the ReplicaInfo drops its entry_tx sender, which
+                    // causes the writer task's entry_rx.recv() to return None,
+                    // triggering connection teardown.
+                    self.replicas.remove(replica_id);
+                    if let Some(ref m) = self.metrics {
+                        m.replication_slow_replica_disconnects_total.inc();
+                    }
+                }
+
+                // Track highest sequence (logging/metrics) and advance
+                // next_offset past this entry.
+                if seq > pos.sequence {
+                    pos.sequence = seq;
+                }
+                let next = offset.as_u64().saturating_add(1);
+                if next > pos.next_offset {
+                    pos.next_offset = next;
+                }
 
                 if let Some(ref m) = self.metrics {
                     m.replication_entries_sent_total.inc();
                     m.replication_connected_replicas
-                        .set(replica_count as f64);
+                        .set(self.replicas.len() as f64);
                 }
 
                 tracing::trace!(
-                    "Replicated WAL entry seq={} to {} replica(s)",
+                    "Replicated WAL entry seq={} to {} replica(s) ({} dropped as slow)",
                     seq,
-                    replica_count
+                    replica_count - slow_replicas.len(),
+                    slow_replicas.len(),
                 );
             }
         }
@@ -205,25 +274,30 @@ impl ReplicationManager {
     }
 
     /// Handles a new replication connection from a replica.
+    /// Accepts `MaybeTlsStream` so replication works over both plain TCP and TLS.
     pub async fn handle_replica_connection(
         self: &Arc<Self>,
-        mut stream: TcpStream,
+        mut stream: MaybeTlsStream,
         auth_msg: ReplicationMessage,
     ) {
-        let (auth_token, last_sequence) = match auth_msg {
+        let (auth_token, last_sequence, last_primary_offset) = match auth_msg {
             ReplicationMessage::ReplicateAuth {
                 auth_token,
                 last_sequence,
-            } => (auth_token, last_sequence),
+                last_primary_offset,
+            } => (auth_token, last_sequence, last_primary_offset),
             _ => {
                 tracing::warn!("Expected ReplicateAuth, got unexpected message");
                 return;
             }
         };
 
-        // Validate auth token
-        if let Some(ref expected) = self.config.auth_token {
-            if auth_token.as_deref() != Some(expected.as_str()) {
+        // Validate auth token against configured hashes (SHA-256).
+        // If no validator is configured, replication auth is disabled.
+        if let Some(ref validator) = self.token_validator {
+            let presented = auth_token.as_deref().unwrap_or("");
+            if !validator.validate(presented) {
+                tracing::warn!("Replica authentication failed");
                 let resp = ReplicationMessage::ReplicateSyncResponse {
                     ok: false,
                     primary_sequence: 0,
@@ -270,8 +344,13 @@ impl ReplicationManager {
             },
         );
 
-        // Catch-up: send WAL entries from replica's last_sequence
-        let catch_up_result = self.send_catchup(&mut stream, last_sequence).await;
+        // Catch-up: send WAL entries the replica doesn't have yet.
+        // Prefer offset-based filtering (monotonic on disk) over sequence
+        // (non-monotonic under concurrent writes). Old replicas send
+        // last_primary_offset=0 and we fall back to sequence filtering.
+        let catch_up_result = self
+            .send_catchup(&mut stream, last_sequence, last_primary_offset)
+            .await;
 
         match &catch_up_result {
             Ok(()) => {
@@ -285,7 +364,7 @@ impl ReplicationManager {
         }
 
         // Live streaming loop
-        let (mut read_half, mut write_half) = stream.into_split();
+        let (mut read_half, mut write_half) = split(stream);
         let mgr = self.clone();
 
         // Spawn writer task: sends entries from channel to replica
@@ -309,10 +388,8 @@ impl ReplicationManager {
                         let primary_seq = mgr.engine.wal().next_sequence().saturating_sub(1);
                         let hb = ReplicationMessage::ReplicateHeartbeat {
                             primary_sequence: primary_seq,
-                            timestamp_ms: std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .unwrap_or_default()
-                                .as_millis() as u64,
+                            timestamp_ms: now_unix_ms(),
+                            primary_latest_write_ts_ms: mgr.latest_write_ts_ms.load(Ordering::Acquire),
                         };
                         let bytes = match serde_json::to_vec(&hb) {
                             Ok(b) => b,
@@ -364,27 +441,51 @@ impl ReplicationManager {
     }
 
     /// Sends catch-up entries from the WAL to a newly connected replica.
-    async fn send_catchup(
+    async fn send_catchup<W>(
         &self,
-        stream: &mut TcpStream,
+        stream: &mut W,
         last_sequence: u64,
-    ) -> Result<(), std::io::Error> {
+        last_primary_offset: u64,
+    ) -> Result<(), std::io::Error>
+    where
+        W: AsyncWrite + Unpin,
+    {
+        // If the replica provided a primary offset (new protocol), read from
+        // that offset onwards — avoids scanning the entire WAL. Fall back to
+        // reading from 0 for old replicas.
+        let read_from = if last_primary_offset > 0 {
+            WalOffset::from_u64(last_primary_offset)
+        } else {
+            WalOffset::from_u64(0)
+        };
         let entries = self
             .engine
             .wal()
-            .read_from(WalOffset::from_u64(0), None)
+            .read_from(read_from, None)
             .map_err(|e| std::io::Error::other(e.to_string()))?;
 
         let mut sent = 0;
         for (seq, offset, entry) in entries {
-            if seq <= last_sequence {
+            // Prefer offset filter (monotonic on disk) when the replica sent
+            // one. Sequence filter is legacy-only and doesn't handle
+            // concurrent-write out-of-order sequences.
+            if last_primary_offset > 0 {
+                if offset.as_u64() <= last_primary_offset {
+                    continue;
+                }
+            } else if seq <= last_sequence {
                 continue;
             }
 
+            // Catch-up entries have no original write timestamp available, so
+            // we mark them as "now" — meaning the replica will compute lag as
+            // ~0 once it applies them. This is fine because catch-up is a
+            // burst, not ongoing lag.
             let msg = ReplicationMessage::ReplicateEntry {
                 sequence: seq,
                 offset: offset.as_u64(),
                 entry,
+                timestamp_ms: now_unix_ms(),
             };
             Self::send_message(stream, &msg).await?;
             sent += 1;
@@ -398,11 +499,11 @@ impl ReplicationManager {
         Ok(())
     }
 
-    /// Sends a single replication message over a stream using RCPX framing.
-    async fn send_message(
-        stream: &mut TcpStream,
-        msg: &ReplicationMessage,
-    ) -> Result<(), std::io::Error> {
+    /// Sends a single replication message over any async stream using RCPX framing.
+    async fn send_message<W>(stream: &mut W, msg: &ReplicationMessage) -> Result<(), std::io::Error>
+    where
+        W: AsyncWrite + Unpin,
+    {
         let bytes = serde_json::to_vec(msg).map_err(std::io::Error::other)?;
         let frame = Encoder::encode_raw(&bytes);
         stream.write_all(&frame).await
@@ -479,4 +580,31 @@ impl ReplicationManager {
     pub fn config(&self) -> &ReplicationConfig {
         &self.config
     }
+
+    /// Returns per-replica stats: `(replica_id, last_acked_sequence, lag_entries)`.
+    /// Lag is computed against the current WAL head sequence on the primary.
+    pub fn replica_stats(&self) -> Vec<(String, u64, u64)> {
+        let primary_seq = self.engine.wal().next_sequence().saturating_sub(1);
+        self.replicas
+            .iter()
+            .map(|r| {
+                let acked = r.value().last_acked_sequence.load(Ordering::Acquire);
+                let lag = primary_seq.saturating_sub(acked);
+                (r.key().clone(), acked, lag)
+            })
+            .collect()
+    }
+
+    /// Returns the timestamp (Unix ms) of the most recently tailed WAL entry.
+    pub fn latest_write_ts_ms(&self) -> u64 {
+        self.latest_write_ts_ms.load(Ordering::Acquire)
+    }
+}
+
+/// Returns the current Unix timestamp in milliseconds (0 if clock is before epoch).
+fn now_unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
