@@ -344,12 +344,44 @@ impl ReplicationManager {
             },
         );
 
-        // Catch-up: send WAL entries the replica doesn't have yet.
-        // Prefer offset-based filtering (monotonic on disk) over sequence
+        // Split the stream BEFORE catchup. The replica ACKs every entry during
+        // catchup; if we don't drain those ACKs concurrently, the primary's TCP
+        // recv buffer fills (~64KB, ~few thousand ACKs), TCP flow control kicks
+        // in, and the whole catchup stalls mid-way. Spawn the reader up front.
+        let (mut read_half, mut write_half) = split(stream);
+
+        // Reader task: reads ACKs from replica (must run concurrently with
+        // catchup to avoid the deadlock described above).
+        let mgr_reader = self.clone();
+        let rid_reader = replica_id.clone();
+        let reader_handle = tokio::spawn(async move {
+            let mut decoder = Decoder::new();
+            let mut buf = [0u8; super::REPLICATION_READ_BUF_SIZE];
+
+            loop {
+                match read_half.read(&mut buf).await {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        decoder.extend(&buf[..n]);
+                        while let Ok(Some(payload)) = decoder.decode_raw() {
+                            if let Ok(ReplicationMessage::ReplicateAck { sequence }) =
+                                ReplicationMessage::from_bytes(&payload)
+                            {
+                                mgr_reader.on_ack(&rid_reader, sequence).await;
+                            }
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        // Catch-up: send WAL entries the replica doesn't have yet via the write
+        // half. Prefer offset-based filtering (monotonic on disk) over sequence
         // (non-monotonic under concurrent writes). Old replicas send
         // last_primary_offset=0 and we fall back to sequence filtering.
         let catch_up_result = self
-            .send_catchup(&mut stream, last_sequence, last_primary_offset)
+            .send_catchup(&mut write_half, last_sequence, last_primary_offset)
             .await;
 
         match &catch_up_result {
@@ -359,12 +391,13 @@ impl ReplicationManager {
             Err(e) => {
                 tracing::warn!("Replica {} catch-up failed: {}", replica_id, e);
                 self.replicas.remove(&replica_id);
+                let _ = write_half.shutdown().await;
+                let _ = reader_handle.await;
                 return;
             }
         }
 
         // Live streaming loop
-        let (mut read_half, mut write_half) = split(stream);
         let mgr = self.clone();
 
         // Spawn writer task: sends entries from channel to replica
@@ -374,16 +407,25 @@ impl ReplicationManager {
 
             loop {
                 tokio::select! {
-                    Some(msg) = entry_rx.recv() => {
-                        let bytes = match serde_json::to_vec(&msg) {
-                            Ok(b) => b,
-                            Err(_) => continue,
-                        };
-                        let frame = Encoder::encode_raw(&bytes);
-                        if write_half.write_all(&frame).await.is_err() {
+                    maybe = entry_rx.recv() => match maybe {
+                        Some(msg) => {
+                            let bytes = match serde_json::to_vec(&msg) {
+                                Ok(b) => b,
+                                Err(_) => continue,
+                            };
+                            let frame = Encoder::encode_raw(&bytes);
+                            if write_half.write_all(&frame).await.is_err() {
+                                break;
+                            }
+                        }
+                        None => {
+                            // Channel closed — primary dropped this replica
+                            // (e.g. slow-replica disconnect). Exit so the TCP
+                            // socket is shut down cleanly below and the replica
+                            // can detect EOF and reconnect.
                             break;
                         }
-                    }
+                    },
                     _ = heartbeat_interval.tick() => {
                         let primary_seq = mgr.engine.wal().next_sequence().saturating_sub(1);
                         let hb = ReplicationMessage::ReplicateHeartbeat {
@@ -403,31 +445,9 @@ impl ReplicationManager {
                     else => break,
                 }
             }
-        });
-
-        // Reader task: reads ACKs from replica
-        let mgr2 = self.clone();
-        let rid2 = replica_id.clone();
-        let reader_handle = tokio::spawn(async move {
-            let mut decoder = Decoder::new();
-            let mut buf = [0u8; super::REPLICATION_READ_BUF_SIZE];
-
-            loop {
-                match read_half.read(&mut buf).await {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        decoder.extend(&buf[..n]);
-                        while let Ok(Some(payload)) = decoder.decode_raw() {
-                            if let Ok(ReplicationMessage::ReplicateAck { sequence }) =
-                                ReplicationMessage::from_bytes(&payload)
-                            {
-                                mgr2.on_ack(&rid2, sequence).await;
-                            }
-                        }
-                    }
-                    Err(_) => break,
-                }
-            }
+            // Ensure the TCP stream is closed so the replica detects disconnect
+            // and enters its reconnect loop instead of blocking on read().
+            let _ = write_half.shutdown().await;
         });
 
         // Wait for either task to finish

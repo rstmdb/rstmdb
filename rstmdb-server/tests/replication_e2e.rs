@@ -18,7 +18,7 @@ mod common;
 use common::{order_machine_def, Cluster, PrimaryOpts, ReplicaOpts, ReplicaNode};
 use rstmdb_server::config::ReplicationMode;
 use serde_json::json;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 // =========================================================================
 // Basic sanity: cluster boots, replicas connect, single write propagates
@@ -1165,6 +1165,242 @@ async fn e2e_catchup_wal_entry_count_exact() {
         "replica WAL entries must exactly match primary ({} vs {})",
         replica_entries, expected
     );
+
+    cluster.shutdown();
+}
+
+// =========================================================================
+// Backpressure: slow replica is disconnected AND its TCP socket is closed
+//
+// Regression guard for two fixes in the writer task:
+//   1. `maybe = entry_rx.recv() => match maybe { None => break, ... }` so the
+//      writer exits when the primary drops the replica (e.g. slow-replica
+//      disconnect). Without this, the heartbeat branch kept the loop alive
+//      forever and the TCP socket stayed open.
+//   2. `write_half.shutdown().await` after the loop, so the primary actually
+//      sends TCP FIN. Without this, a blocking `stream.read()` on the replica
+//      would never return.
+// =========================================================================
+
+#[tokio::test]
+async fn e2e_slow_replica_disconnect_closes_tcp_socket() {
+    use rstmdb_protocol::{Decoder, Encoder};
+    use rstmdb_server::replication::ReplicationMessage;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpStream;
+
+    let cluster = Cluster::spawn(0).await;
+    let primary_addr = cluster.primary.addr;
+
+    // Fake replica: authenticates, reads the sync response, then stops reading.
+    let mut stream = TcpStream::connect(primary_addr).await.unwrap();
+    let auth = ReplicationMessage::ReplicateAuth {
+        auth_token: None,
+        last_sequence: 0,
+        last_primary_offset: 0,
+    };
+    stream
+        .write_all(&Encoder::encode_raw(&auth.to_bytes().unwrap()))
+        .await
+        .unwrap();
+
+    let mut decoder = Decoder::new();
+    let mut buf = [0u8; 16384];
+    loop {
+        let n = stream.read(&mut buf).await.unwrap();
+        assert!(n > 0, "primary closed connection before sync response");
+        decoder.extend(&buf[..n]);
+        if let Ok(Some(payload)) = decoder.decode_raw() {
+            match ReplicationMessage::from_bytes(&payload).unwrap() {
+                ReplicationMessage::ReplicateSyncResponse { ok: true, .. } => break,
+                other => panic!("unexpected handshake response: {:?}", other),
+            }
+        }
+    }
+
+    cluster
+        .wait_for_replica_count(1, Duration::from_secs(5))
+        .await;
+
+    cluster
+        .primary
+        .engine
+        .put_machine("order", 1, &order_machine_def())
+        .unwrap();
+
+    // Flood the primary with enough writes to overflow both the TCP send
+    // buffer (the fake replica isn't reading) and the per-replica channel
+    // (REPLICA_CHANNEL_CAPACITY = 4096). At that point the fan-out should
+    // detect "full" and disconnect.
+    // Need > REPLICA_CHANNEL_CAPACITY (4096) entries on top of filling the TCP
+    // send buffer so the primary's fan-out detects the slow replica.
+    for i in 0..5_000 {
+        cluster
+            .primary
+            .engine
+            .create_instance(&format!("stall-{}", i), "order", 1, json!({}), None)
+            .unwrap();
+    }
+
+    // Wait for the primary to record the slow-replica disconnect.
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_secs(10) {
+        if cluster
+            .primary
+            .metrics
+            .replication_slow_replica_disconnects_total
+            .get()
+            > 0.0
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        cluster
+            .primary
+            .metrics
+            .replication_slow_replica_disconnects_total
+            .get()
+            > 0.0,
+        "primary should have disconnected the slow replica"
+    );
+
+    // Now resume reading. The writer task has buffered messages to flush;
+    // once the channel drains, `entry_rx.recv()` returns None, the writer
+    // breaks, and `write_half.shutdown()` sends TCP FIN. The fake replica
+    // should eventually observe `Ok(0)` from read().
+    //
+    // Without the fix this read hangs forever and the test times out.
+    let eof = tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            match stream.read(&mut buf).await {
+                Ok(0) => return true,
+                Ok(_) => continue,
+                Err(_) => return true,
+            }
+        }
+    })
+    .await;
+    assert!(
+        eof.is_ok() && eof.unwrap(),
+        "primary did not close its end of the TCP socket after disconnecting a \
+         slow replica — the replica would hang forever on read()"
+    );
+
+    cluster.shutdown();
+}
+
+// =========================================================================
+// A real replica that gets disconnected due to backpressure reconnects
+// successfully and converges with the primary.
+// =========================================================================
+
+#[tokio::test]
+async fn e2e_slow_replica_reconnects_and_converges() {
+    // We can't actually make a real replica "slow" without a test hook, so
+    // we simulate the disconnect by spawning a fake replica that authenticates
+    // and stalls (forcing the slow-disconnect path), then spawn a real replica
+    // that arrives after the disconnect and must catch up and converge.
+    use rstmdb_protocol::{Decoder, Encoder};
+    use rstmdb_server::replication::ReplicationMessage;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpStream;
+
+    let mut cluster = Cluster::spawn(0).await;
+    let primary_addr = cluster.primary.addr;
+
+    // Stall a fake replica to trigger the slow-disconnect path on the primary.
+    let mut stall_stream = TcpStream::connect(primary_addr).await.unwrap();
+    let auth = ReplicationMessage::ReplicateAuth {
+        auth_token: None,
+        last_sequence: 0,
+        last_primary_offset: 0,
+    };
+    stall_stream
+        .write_all(&Encoder::encode_raw(&auth.to_bytes().unwrap()))
+        .await
+        .unwrap();
+    let mut decoder = Decoder::new();
+    let mut buf = [0u8; 16384];
+    loop {
+        let n = stall_stream.read(&mut buf).await.unwrap();
+        decoder.extend(&buf[..n]);
+        if let Ok(Some(payload)) = decoder.decode_raw() {
+            if matches!(
+                ReplicationMessage::from_bytes(&payload).unwrap(),
+                ReplicationMessage::ReplicateSyncResponse { ok: true, .. }
+            ) {
+                break;
+            }
+        }
+    }
+    cluster
+        .wait_for_replica_count(1, Duration::from_secs(5))
+        .await;
+
+    // Prewrite some state that the (later) real replica must catch up on.
+    cluster
+        .primary
+        .engine
+        .put_machine("order", 1, &order_machine_def())
+        .unwrap();
+    // Need > REPLICA_CHANNEL_CAPACITY (4096) entries to fill the fan-out
+    // channel and trigger the slow-replica disconnect path.
+    for i in 0..5_000 {
+        cluster
+            .primary
+            .engine
+            .create_instance(&format!("pre-{}", i), "order", 1, json!({}), None)
+            .unwrap();
+    }
+
+    // Wait for the primary to notice the slow replica and disconnect it.
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_secs(10) {
+        if cluster
+            .primary
+            .metrics
+            .replication_slow_replica_disconnects_total
+            .get()
+            > 0.0
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        cluster
+            .primary
+            .metrics
+            .replication_slow_replica_disconnects_total
+            .get()
+            > 0.0,
+        "slow replica was not disconnected"
+    );
+    // Drop the fake replica's stream — we're done with it.
+    drop(stall_stream);
+
+    // Now attach a real replica. It must catch up all prewritten entries and
+    // continue to apply new ones.
+    let replica: ReplicaNode =
+        Cluster::spawn_replica_with(primary_addr, ReplicaOpts::default()).await;
+    cluster.replicas.push(replica);
+    cluster
+        .wait_for_replica_count(1, Duration::from_secs(5))
+        .await;
+
+    // A few more writes after the real replica attaches (live-streaming path).
+    for i in 0..100 {
+        cluster
+            .primary
+            .engine
+            .create_instance(&format!("post-{}", i), "order", 1, json!({}), None)
+            .unwrap();
+    }
+
+    cluster.wait_converged(Duration::from_secs(30)).await;
+    cluster.assert_parity();
 
     cluster.shutdown();
 }

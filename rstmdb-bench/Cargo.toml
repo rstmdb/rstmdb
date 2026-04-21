@@ -20,6 +20,7 @@ criterion.workspace = true
 bytes.workspace = true
 futures = "0.3"
 crc32c.workspace = true
+clap.workspace = true
 
 [[bench]]
 name = "wal_bench"
@@ -36,3 +37,7 @@ harness = false
 [[bench]]
 name = "e2e_bench"
 harness = false
+
+[[bin]]
+name = "load-gen"
+path = "src/bin/load_gen.rs"

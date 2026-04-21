@@ -1269,6 +1269,7 @@ name = "rstmdb-bench"
 version = "0.2.0"
 dependencies = [
  "bytes",
+ "clap",
  "crc32c",
  "criterion",
  "futures",
