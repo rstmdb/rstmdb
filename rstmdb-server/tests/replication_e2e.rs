@@ -636,6 +636,7 @@ async fn e2e_lag_zero_when_caught_up() {
             .unwrap();
     }
     cluster.wait_converged(Duration::from_secs(3)).await;
+    cluster.wait_acks_caught_up(Duration::from_secs(3)).await;
 
     // Primary-side view: per-replica lag should be 0
     let stats = cluster.primary.manager.replica_stats();
@@ -693,6 +694,7 @@ async fn e2e_lag_increases_then_recovers() {
 
     // Eventually lag must reach 0
     cluster.wait_converged(Duration::from_secs(10)).await;
+    cluster.wait_acks_caught_up(Duration::from_secs(5)).await;
     let stats = cluster.primary.manager.replica_stats();
     assert_eq!(stats.len(), 1);
     assert_eq!(stats[0].2, 0, "lag should be 0 after catch-up");
@@ -720,6 +722,7 @@ async fn e2e_primary_sees_per_replica_sequence() {
             .unwrap();
     }
     cluster.wait_converged(Duration::from_secs(5)).await;
+    cluster.wait_acks_caught_up(Duration::from_secs(5)).await;
 
     let stats = cluster.primary.manager.replica_stats();
     assert_eq!(stats.len(), 3);

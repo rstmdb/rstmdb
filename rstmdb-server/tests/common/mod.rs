@@ -289,6 +289,30 @@ impl Cluster {
         }
     }
 
+    /// Polls until the primary has received ACKs from every replica up to the
+    /// current WAL head (i.e. per-replica lag is 0). `wait_converged` only
+    /// checks the replica's WAL — ACKs travel back over TCP after each apply,
+    /// so on slow systems they can be briefly in flight after WAL sequences
+    /// match. Tests that assert on `replica_stats` should call this too.
+    pub async fn wait_acks_caught_up(&self, timeout: Duration) {
+        let start = Instant::now();
+        loop {
+            let stats = self.primary.manager.replica_stats();
+            let expected = self.replicas.len();
+            let all_acked = stats.len() == expected && stats.iter().all(|(_, _, lag)| *lag == 0);
+            if all_acked {
+                return;
+            }
+            if start.elapsed() > timeout {
+                panic!(
+                    "acks not caught up in {:?} — replica_stats = {:?}",
+                    timeout, stats
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
     /// Asserts that every replica mirrors the primary's in-memory state:
     /// same machines, same instance IDs with same state + context.
     pub fn assert_parity(&self) {
