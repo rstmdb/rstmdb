@@ -1211,24 +1211,30 @@ mod tests {
 
         // First replicate the machine definition
         engine
-            .apply_replicated_entry(0, WalEntry::PutMachine {
-                machine: "order".to_string(),
-                version: 1,
-                definition_hash: "abc".to_string(),
-                definition: sample_definition(),
-            })
+            .apply_replicated_entry(
+                0,
+                WalEntry::PutMachine {
+                    machine: "order".to_string(),
+                    version: 1,
+                    definition_hash: "abc".to_string(),
+                    definition: sample_definition(),
+                },
+            )
             .unwrap();
 
         // Then replicate instance creation
         let (seq, offset) = engine
-            .apply_replicated_entry(0, WalEntry::CreateInstance {
-                instance_id: "i-repl-1".to_string(),
-                machine: "order".to_string(),
-                version: 1,
-                initial_state: "created".to_string(),
-                initial_ctx: json!({"source": "primary"}),
-                idempotency_key: None,
-            })
+            .apply_replicated_entry(
+                0,
+                WalEntry::CreateInstance {
+                    instance_id: "i-repl-1".to_string(),
+                    machine: "order".to_string(),
+                    version: 1,
+                    initial_state: "created".to_string(),
+                    initial_ctx: json!({"source": "primary"}),
+                    idempotency_key: None,
+                },
+            )
             .unwrap();
 
         assert_eq!(seq, 2);
@@ -1246,37 +1252,46 @@ mod tests {
 
         // Set up machine + instance via replication
         engine
-            .apply_replicated_entry(0, WalEntry::PutMachine {
-                machine: "order".to_string(),
-                version: 1,
-                definition_hash: "abc".to_string(),
-                definition: sample_definition(),
-            })
+            .apply_replicated_entry(
+                0,
+                WalEntry::PutMachine {
+                    machine: "order".to_string(),
+                    version: 1,
+                    definition_hash: "abc".to_string(),
+                    definition: sample_definition(),
+                },
+            )
             .unwrap();
 
         engine
-            .apply_replicated_entry(0, WalEntry::CreateInstance {
-                instance_id: "i-repl-2".to_string(),
-                machine: "order".to_string(),
-                version: 1,
-                initial_state: "created".to_string(),
-                initial_ctx: json!({}),
-                idempotency_key: None,
-            })
+            .apply_replicated_entry(
+                0,
+                WalEntry::CreateInstance {
+                    instance_id: "i-repl-2".to_string(),
+                    machine: "order".to_string(),
+                    version: 1,
+                    initial_state: "created".to_string(),
+                    initial_ctx: json!({}),
+                    idempotency_key: None,
+                },
+            )
             .unwrap();
 
         // Replicate an event application
         let (seq, _) = engine
-            .apply_replicated_entry(0, WalEntry::ApplyEvent {
-                instance_id: "i-repl-2".to_string(),
-                event: "PAY".to_string(),
-                from_state: "created".to_string(),
-                to_state: "paid".to_string(),
-                payload: json!({"amount": 42}),
-                ctx: json!({"amount": 42}),
-                event_id: Some("evt-1".to_string()),
-                idempotency_key: None,
-            })
+            .apply_replicated_entry(
+                0,
+                WalEntry::ApplyEvent {
+                    instance_id: "i-repl-2".to_string(),
+                    event: "PAY".to_string(),
+                    from_state: "created".to_string(),
+                    to_state: "paid".to_string(),
+                    payload: json!({"amount": 42}),
+                    ctx: json!({"amount": 42}),
+                    event_id: Some("evt-1".to_string()),
+                    idempotency_key: None,
+                },
+            )
             .unwrap();
 
         assert_eq!(seq, 3);
@@ -1292,23 +1307,29 @@ mod tests {
         let (_dir, engine) = test_engine();
 
         engine
-            .apply_replicated_entry(0, WalEntry::PutMachine {
-                machine: "order".to_string(),
-                version: 1,
-                definition_hash: "abc".to_string(),
-                definition: sample_definition(),
-            })
+            .apply_replicated_entry(
+                0,
+                WalEntry::PutMachine {
+                    machine: "order".to_string(),
+                    version: 1,
+                    definition_hash: "abc".to_string(),
+                    definition: sample_definition(),
+                },
+            )
             .unwrap();
 
         engine
-            .apply_replicated_entry(0, WalEntry::CreateInstance {
-                instance_id: "i-repl-del".to_string(),
-                machine: "order".to_string(),
-                version: 1,
-                initial_state: "created".to_string(),
-                initial_ctx: json!({}),
-                idempotency_key: None,
-            })
+            .apply_replicated_entry(
+                0,
+                WalEntry::CreateInstance {
+                    instance_id: "i-repl-del".to_string(),
+                    machine: "order".to_string(),
+                    version: 1,
+                    initial_state: "created".to_string(),
+                    initial_ctx: json!({}),
+                    idempotency_key: None,
+                },
+            )
             .unwrap();
 
         // Instance exists
@@ -1316,10 +1337,13 @@ mod tests {
 
         // Replicate deletion
         let (seq, _) = engine
-            .apply_replicated_entry(0, WalEntry::DeleteInstance {
-                instance_id: "i-repl-del".to_string(),
-                idempotency_key: None,
-            })
+            .apply_replicated_entry(
+                0,
+                WalEntry::DeleteInstance {
+                    instance_id: "i-repl-del".to_string(),
+                    idempotency_key: None,
+                },
+            )
             .unwrap();
 
         assert_eq!(seq, 3);
@@ -1340,36 +1364,45 @@ mod tests {
             let engine = StateMachineEngine::new(config).unwrap();
 
             engine
-                .apply_replicated_entry(0, WalEntry::PutMachine {
-                    machine: "order".to_string(),
-                    version: 1,
-                    definition_hash: "abc".to_string(),
-                    definition: sample_definition(),
-                })
+                .apply_replicated_entry(
+                    0,
+                    WalEntry::PutMachine {
+                        machine: "order".to_string(),
+                        version: 1,
+                        definition_hash: "abc".to_string(),
+                        definition: sample_definition(),
+                    },
+                )
                 .unwrap();
 
             engine
-                .apply_replicated_entry(0, WalEntry::CreateInstance {
-                    instance_id: "i-persist".to_string(),
-                    machine: "order".to_string(),
-                    version: 1,
-                    initial_state: "created".to_string(),
-                    initial_ctx: json!({"replicated": true}),
-                    idempotency_key: None,
-                })
+                .apply_replicated_entry(
+                    0,
+                    WalEntry::CreateInstance {
+                        instance_id: "i-persist".to_string(),
+                        machine: "order".to_string(),
+                        version: 1,
+                        initial_state: "created".to_string(),
+                        initial_ctx: json!({"replicated": true}),
+                        idempotency_key: None,
+                    },
+                )
                 .unwrap();
 
             engine
-                .apply_replicated_entry(0, WalEntry::ApplyEvent {
-                    instance_id: "i-persist".to_string(),
-                    event: "PAY".to_string(),
-                    from_state: "created".to_string(),
-                    to_state: "paid".to_string(),
-                    payload: json!({"amount": 100}),
-                    ctx: json!({"replicated": true, "amount": 100}),
-                    event_id: None,
-                    idempotency_key: None,
-                })
+                .apply_replicated_entry(
+                    0,
+                    WalEntry::ApplyEvent {
+                        instance_id: "i-persist".to_string(),
+                        event: "PAY".to_string(),
+                        from_state: "created".to_string(),
+                        to_state: "paid".to_string(),
+                        payload: json!({"amount": 100}),
+                        ctx: json!({"replicated": true, "amount": 100}),
+                        event_id: None,
+                        idempotency_key: None,
+                    },
+                )
                 .unwrap();
         }
 
@@ -1396,49 +1429,61 @@ mod tests {
 
         // Replicate a full workflow: machine → instance → event → event → delete
         engine
-            .apply_replicated_entry(0, WalEntry::PutMachine {
-                machine: "order".to_string(),
-                version: 1,
-                definition_hash: "abc".to_string(),
-                definition: sample_definition(),
-            })
+            .apply_replicated_entry(
+                0,
+                WalEntry::PutMachine {
+                    machine: "order".to_string(),
+                    version: 1,
+                    definition_hash: "abc".to_string(),
+                    definition: sample_definition(),
+                },
+            )
             .unwrap();
 
         engine
-            .apply_replicated_entry(0, WalEntry::CreateInstance {
-                instance_id: "i-full".to_string(),
-                machine: "order".to_string(),
-                version: 1,
-                initial_state: "created".to_string(),
-                initial_ctx: json!({"items_ready": true}),
-                idempotency_key: None,
-            })
+            .apply_replicated_entry(
+                0,
+                WalEntry::CreateInstance {
+                    instance_id: "i-full".to_string(),
+                    machine: "order".to_string(),
+                    version: 1,
+                    initial_state: "created".to_string(),
+                    initial_ctx: json!({"items_ready": true}),
+                    idempotency_key: None,
+                },
+            )
             .unwrap();
 
         engine
-            .apply_replicated_entry(0, WalEntry::ApplyEvent {
-                instance_id: "i-full".to_string(),
-                event: "PAY".to_string(),
-                from_state: "created".to_string(),
-                to_state: "paid".to_string(),
-                payload: json!({}),
-                ctx: json!({"items_ready": true}),
-                event_id: None,
-                idempotency_key: None,
-            })
+            .apply_replicated_entry(
+                0,
+                WalEntry::ApplyEvent {
+                    instance_id: "i-full".to_string(),
+                    event: "PAY".to_string(),
+                    from_state: "created".to_string(),
+                    to_state: "paid".to_string(),
+                    payload: json!({}),
+                    ctx: json!({"items_ready": true}),
+                    event_id: None,
+                    idempotency_key: None,
+                },
+            )
             .unwrap();
 
         engine
-            .apply_replicated_entry(0, WalEntry::ApplyEvent {
-                instance_id: "i-full".to_string(),
-                event: "SHIP".to_string(),
-                from_state: "paid".to_string(),
-                to_state: "shipped".to_string(),
-                payload: json!({"tracking": "XYZ"}),
-                ctx: json!({"items_ready": true, "tracking": "XYZ"}),
-                event_id: None,
-                idempotency_key: None,
-            })
+            .apply_replicated_entry(
+                0,
+                WalEntry::ApplyEvent {
+                    instance_id: "i-full".to_string(),
+                    event: "SHIP".to_string(),
+                    from_state: "paid".to_string(),
+                    to_state: "shipped".to_string(),
+                    payload: json!({"tracking": "XYZ"}),
+                    ctx: json!({"items_ready": true, "tracking": "XYZ"}),
+                    event_id: None,
+                    idempotency_key: None,
+                },
+            )
             .unwrap();
 
         let instance = engine.get_instance("i-full").unwrap();
@@ -1446,10 +1491,13 @@ mod tests {
         assert_eq!(instance.ctx["tracking"], "XYZ");
 
         engine
-            .apply_replicated_entry(0, WalEntry::DeleteInstance {
-                instance_id: "i-full".to_string(),
-                idempotency_key: None,
-            })
+            .apply_replicated_entry(
+                0,
+                WalEntry::DeleteInstance {
+                    instance_id: "i-full".to_string(),
+                    idempotency_key: None,
+                },
+            )
             .unwrap();
 
         assert!(engine.get_instance("i-full").is_err());
@@ -1460,36 +1508,45 @@ mod tests {
         let (_dir, engine) = test_engine();
 
         let (seq1, off1) = engine
-            .apply_replicated_entry(0, WalEntry::PutMachine {
-                machine: "m1".to_string(),
-                version: 1,
-                definition_hash: "a".to_string(),
-                definition: sample_definition(),
-            })
+            .apply_replicated_entry(
+                0,
+                WalEntry::PutMachine {
+                    machine: "m1".to_string(),
+                    version: 1,
+                    definition_hash: "a".to_string(),
+                    definition: sample_definition(),
+                },
+            )
             .unwrap();
 
         let (seq2, off2) = engine
-            .apply_replicated_entry(0, WalEntry::CreateInstance {
-                instance_id: "i1".to_string(),
-                machine: "m1".to_string(),
-                version: 1,
-                initial_state: "created".to_string(),
-                initial_ctx: json!({}),
-                idempotency_key: None,
-            })
+            .apply_replicated_entry(
+                0,
+                WalEntry::CreateInstance {
+                    instance_id: "i1".to_string(),
+                    machine: "m1".to_string(),
+                    version: 1,
+                    initial_state: "created".to_string(),
+                    initial_ctx: json!({}),
+                    idempotency_key: None,
+                },
+            )
             .unwrap();
 
         let (seq3, off3) = engine
-            .apply_replicated_entry(0, WalEntry::ApplyEvent {
-                instance_id: "i1".to_string(),
-                event: "PAY".to_string(),
-                from_state: "created".to_string(),
-                to_state: "paid".to_string(),
-                payload: json!({}),
-                ctx: json!({}),
-                event_id: None,
-                idempotency_key: None,
-            })
+            .apply_replicated_entry(
+                0,
+                WalEntry::ApplyEvent {
+                    instance_id: "i1".to_string(),
+                    event: "PAY".to_string(),
+                    from_state: "created".to_string(),
+                    to_state: "paid".to_string(),
+                    payload: json!({}),
+                    ctx: json!({}),
+                    event_id: None,
+                    idempotency_key: None,
+                },
+            )
             .unwrap();
 
         assert_eq!(seq1, 1);
@@ -1505,12 +1562,15 @@ mod tests {
 
         // Snapshot and Checkpoint entries should be accepted but not affect state
         let (seq1, _) = engine
-            .apply_replicated_entry(0, WalEntry::Snapshot {
-                instance_id: "nonexistent".to_string(),
-                snapshot_id: "snap-1".to_string(),
-                state: "s".to_string(),
-                ctx: json!({}),
-            })
+            .apply_replicated_entry(
+                0,
+                WalEntry::Snapshot {
+                    instance_id: "nonexistent".to_string(),
+                    snapshot_id: "snap-1".to_string(),
+                    state: "s".to_string(),
+                    ctx: json!({}),
+                },
+            )
             .unwrap();
 
         let (seq2, _) = engine

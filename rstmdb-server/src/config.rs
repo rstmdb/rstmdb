@@ -715,8 +715,8 @@ impl ReplicationConfig {
     /// Call after `Config::load()` to merge external secrets into `auth_token_hashes`.
     pub fn load_secrets(&mut self) -> Result<(), ConfigError> {
         if let Some(ref path) = self.auth_secrets_file {
-            let content = std::fs::read_to_string(path)
-                .map_err(|e| ConfigError::IoError(path.clone(), e))?;
+            let content =
+                std::fs::read_to_string(path).map_err(|e| ConfigError::IoError(path.clone(), e))?;
             for line in content.lines() {
                 let line = line.trim();
                 if !line.is_empty() && !line.starts_with('#') {

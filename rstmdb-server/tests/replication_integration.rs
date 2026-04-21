@@ -6,8 +6,8 @@
 use rstmdb_core::StateMachineEngine;
 use rstmdb_protocol::message::{Operation, Request};
 use rstmdb_protocol::{Decoder, Encoder};
-use rstmdb_server::config::{ReplicationConfig, ReplicationMode, ReplicationRole};
 use rstmdb_server::auth::TokenValidator;
+use rstmdb_server::config::{ReplicationConfig, ReplicationMode, ReplicationRole};
 use rstmdb_server::handler::CommandHandler;
 use rstmdb_server::session::Session;
 use rstmdb_wal::{FsyncPolicy, WalConfig, WalEntry};
@@ -208,23 +208,29 @@ fn test_replica_rejects_all_writes() {
 
     // Replicate a machine so we have something to read
     engine
-        .apply_replicated_entry(0, WalEntry::PutMachine {
-            machine: "order".to_string(),
-            version: 1,
-            definition_hash: "abc".to_string(),
-            definition: sample_definition(),
-        })
+        .apply_replicated_entry(
+            0,
+            WalEntry::PutMachine {
+                machine: "order".to_string(),
+                version: 1,
+                definition_hash: "abc".to_string(),
+                definition: sample_definition(),
+            },
+        )
         .unwrap();
 
     engine
-        .apply_replicated_entry(0, WalEntry::CreateInstance {
-            instance_id: "i-1".to_string(),
-            machine: "order".to_string(),
-            version: 1,
-            initial_state: "created".to_string(),
-            initial_ctx: json!({}),
-            idempotency_key: None,
-        })
+        .apply_replicated_entry(
+            0,
+            WalEntry::CreateInstance {
+                instance_id: "i-1".to_string(),
+                machine: "order".to_string(),
+                version: 1,
+                initial_state: "created".to_string(),
+                initial_ctx: json!({}),
+                idempotency_key: None,
+            },
+        )
         .unwrap();
 
     let handler = CommandHandler::new(engine)
@@ -246,10 +252,7 @@ fn test_replica_rejects_all_writes() {
             Operation::ApplyEvent,
             json!({"instance_id": "i-1", "event": "PAY"}),
         ),
-        (
-            Operation::DeleteInstance,
-            json!({"instance_id": "i-1"}),
-        ),
+        (Operation::DeleteInstance, json!({"instance_id": "i-1"})),
         (Operation::FlushAll, json!({})),
         (Operation::Compact, json!({})),
     ];
@@ -463,34 +466,43 @@ fn test_replicated_data_survives_restart() {
     {
         let engine = make_engine(dir.path());
         engine
-            .apply_replicated_entry(0, WalEntry::PutMachine {
-                machine: "order".to_string(),
-                version: 1,
-                definition_hash: "abc".to_string(),
-                definition: sample_definition(),
-            })
+            .apply_replicated_entry(
+                0,
+                WalEntry::PutMachine {
+                    machine: "order".to_string(),
+                    version: 1,
+                    definition_hash: "abc".to_string(),
+                    definition: sample_definition(),
+                },
+            )
             .unwrap();
         engine
-            .apply_replicated_entry(0, WalEntry::CreateInstance {
-                instance_id: "survive".to_string(),
-                machine: "order".to_string(),
-                version: 1,
-                initial_state: "created".to_string(),
-                initial_ctx: json!({"durable": true}),
-                idempotency_key: None,
-            })
+            .apply_replicated_entry(
+                0,
+                WalEntry::CreateInstance {
+                    instance_id: "survive".to_string(),
+                    machine: "order".to_string(),
+                    version: 1,
+                    initial_state: "created".to_string(),
+                    initial_ctx: json!({"durable": true}),
+                    idempotency_key: None,
+                },
+            )
             .unwrap();
         engine
-            .apply_replicated_entry(0, WalEntry::ApplyEvent {
-                instance_id: "survive".to_string(),
-                event: "PAY".to_string(),
-                from_state: "created".to_string(),
-                to_state: "paid".to_string(),
-                payload: json!({"amount": 42}),
-                ctx: json!({"durable": true, "amount": 42}),
-                event_id: None,
-                idempotency_key: None,
-            })
+            .apply_replicated_entry(
+                0,
+                WalEntry::ApplyEvent {
+                    instance_id: "survive".to_string(),
+                    event: "PAY".to_string(),
+                    from_state: "created".to_string(),
+                    to_state: "paid".to_string(),
+                    payload: json!({"amount": 42}),
+                    ctx: json!({"durable": true, "amount": 42}),
+                    event_id: None,
+                    idempotency_key: None,
+                },
+            )
             .unwrap();
     }
 
@@ -644,23 +656,29 @@ fn test_replica_serves_all_read_operations() {
 
     // Set up state via replication
     engine
-        .apply_replicated_entry(0, WalEntry::PutMachine {
-            machine: "order".to_string(),
-            version: 1,
-            definition_hash: "abc".to_string(),
-            definition: sample_definition(),
-        })
+        .apply_replicated_entry(
+            0,
+            WalEntry::PutMachine {
+                machine: "order".to_string(),
+                version: 1,
+                definition_hash: "abc".to_string(),
+                definition: sample_definition(),
+            },
+        )
         .unwrap();
     for i in 0..3 {
         engine
-            .apply_replicated_entry(0, WalEntry::CreateInstance {
-                instance_id: format!("inst-{}", i),
-                machine: "order".to_string(),
-                version: 1,
-                initial_state: "created".to_string(),
-                initial_ctx: json!({"idx": i}),
-                idempotency_key: None,
-            })
+            .apply_replicated_entry(
+                0,
+                WalEntry::CreateInstance {
+                    instance_id: format!("inst-{}", i),
+                    machine: "order".to_string(),
+                    version: 1,
+                    initial_state: "created".to_string(),
+                    initial_ctx: json!({"idx": i}),
+                    idempotency_key: None,
+                },
+            )
             .unwrap();
     }
 
@@ -694,8 +712,7 @@ fn test_replica_serves_all_read_operations() {
     // GetInstance
     let r = handler.handle(
         &mut session,
-        &Request::new("5", Operation::GetInstance)
-            .with_params(json!({"instance_id": "inst-0"})),
+        &Request::new("5", Operation::GetInstance).with_params(json!({"instance_id": "inst-0"})),
     );
     assert!(r.is_ok());
     assert_eq!(r.result.unwrap()["state"], "created");
@@ -703,8 +720,7 @@ fn test_replica_serves_all_read_operations() {
     // ListInstances
     let r = handler.handle(
         &mut session,
-        &Request::new("6", Operation::ListInstances)
-            .with_params(json!({"machine": "order"})),
+        &Request::new("6", Operation::ListInstances).with_params(json!({"machine": "order"})),
     );
     assert!(r.is_ok());
     assert_eq!(r.result.unwrap()["total"], 3);
@@ -717,8 +733,7 @@ fn test_replica_serves_all_read_operations() {
     // WalRead
     let r = handler.handle(
         &mut session,
-        &Request::new("8", Operation::WalRead)
-            .with_params(json!({"from_offset": 0, "limit": 10})),
+        &Request::new("8", Operation::WalRead).with_params(json!({"from_offset": 0, "limit": 10})),
     );
     assert!(r.is_ok());
     let records = r.result.unwrap()["records"].as_array().unwrap().len();
@@ -1011,12 +1026,15 @@ fn test_replica_handler_full_session_lifecycle() {
     let engine = make_engine(dir.path());
 
     engine
-        .apply_replicated_entry(0, WalEntry::PutMachine {
-            machine: "order".to_string(),
-            version: 1,
-            definition_hash: "abc".to_string(),
-            definition: sample_definition(),
-        })
+        .apply_replicated_entry(
+            0,
+            WalEntry::PutMachine {
+                machine: "order".to_string(),
+                version: 1,
+                definition_hash: "abc".to_string(),
+                definition: sample_definition(),
+            },
+        )
         .unwrap();
 
     let handler = CommandHandler::new(engine).with_read_only(true);
@@ -1202,15 +1220,7 @@ fn test_replica_in_memory_offset_matches_primary() {
         .create_instance("offset-test", "order", 1, json!({}), None)
         .unwrap();
     let result = primary
-        .apply_event(
-            "offset-test",
-            "PAY",
-            json!({}),
-            None,
-            None,
-            None,
-            None,
-        )
+        .apply_event("offset-test", "PAY", json!({}), None, None, None, None)
         .unwrap();
 
     let primary_offset = result.wal_offset;
@@ -1245,11 +1255,15 @@ fn test_large_batch_replication() {
     let replica = make_engine(replica_dir.path());
 
     primary
-        .put_machine("counter", 1, &json!({
-            "states": ["active"],
-            "initial": "active",
-            "transitions": [{"from": "active", "event": "INC", "to": "active"}]
-        }))
+        .put_machine(
+            "counter",
+            1,
+            &json!({
+                "states": ["active"],
+                "initial": "active",
+                "transitions": [{"from": "active", "event": "INC", "to": "active"}]
+            }),
+        )
         .unwrap();
 
     // Create 50 instances, each with 10 events = 551 WAL entries

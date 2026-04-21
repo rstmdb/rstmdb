@@ -171,7 +171,10 @@ where
         ops_failed: AtomicU64::new(0),
     });
 
-    println!("\n[{}] starting — {} items, {} workers", phase_name, total, args.workers);
+    println!(
+        "\n[{}] starting — {} items, {} workers",
+        phase_name, total, args.workers
+    );
     let started = Instant::now();
 
     // Per-worker channels so workers can pull independently
@@ -315,7 +318,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             &args,
             |client, (_i, name)| async move {
                 let def = machine_def();
-                client.put_machine(&name, 1, def).await.map_err(|e| e.to_string())?;
+                client
+                    .put_machine(&name, 1, def)
+                    .await
+                    .map_err(|e| e.to_string())?;
                 Ok(())
             },
             |(i, _)| *i, // machine index as key; distinct keys → full parallelism
@@ -327,9 +333,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // -------- Phase 2: instances --------
     if !args.skip_instances && args.instances_per_machine > 0 {
-        let mut items: Vec<(u64, u64, String, String)> = Vec::with_capacity(
-            (args.machines * args.instances_per_machine) as usize,
-        );
+        let mut items: Vec<(u64, u64, String, String)> =
+            Vec::with_capacity((args.machines * args.instances_per_machine) as usize);
         for m in 0..args.machines {
             for i in 0..args.instances_per_machine {
                 items.push((

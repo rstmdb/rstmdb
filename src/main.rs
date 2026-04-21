@@ -104,7 +104,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     match config.replication.role {
         ReplicationRole::Primary => {
             let auth_state = if config.replication.auth_required() {
-                format!("auth: {} hash(es)", config.replication.resolved_token_hashes().len())
+                format!(
+                    "auth: {} hash(es)",
+                    config.replication.resolved_token_hashes().len()
+                )
             } else {
                 "auth: disabled".to_string()
             };

@@ -15,7 +15,7 @@
 
 mod common;
 
-use common::{order_machine_def, Cluster, PrimaryOpts, ReplicaOpts, ReplicaNode};
+use common::{order_machine_def, Cluster, PrimaryOpts, ReplicaNode, ReplicaOpts};
 use rstmdb_server::config::ReplicationMode;
 use serde_json::json;
 use std::time::{Duration, Instant};
@@ -149,13 +149,7 @@ async fn e2e_concurrent_put_machine_plus_instances() {
             // but not enough to serialize fully. Retry on MachineNotFound
             // since the race can legitimately produce that.
             for attempt in 0..50 {
-                match e.create_instance(
-                    &format!("mix-{}", i),
-                    "order",
-                    1,
-                    json!({"i": i}),
-                    None,
-                ) {
+                match e.create_instance(&format!("mix-{}", i), "order", 1, json!({"i": i}), None) {
                     Ok(_) => return,
                     Err(_) if attempt < 49 => {
                         tokio::time::sleep(Duration::from_millis(5)).await;
@@ -261,20 +255,14 @@ async fn e2e_apply_events_update_state() {
     let cluster = Cluster::spawn(1).await;
     let engine = &cluster.primary.engine;
 
-    engine.put_machine("order", 1, &order_machine_def()).unwrap();
+    engine
+        .put_machine("order", 1, &order_machine_def())
+        .unwrap();
     engine
         .create_instance("o-1", "order", 1, json!({"customer": "alice"}), None)
         .unwrap();
     engine
-        .apply_event(
-            "o-1",
-            "PAY",
-            json!({"amount": 100}),
-            None,
-            None,
-            None,
-            None,
-        )
+        .apply_event("o-1", "PAY", json!({"amount": 100}), None, None, None, None)
         .unwrap();
     engine
         .apply_event(
@@ -311,17 +299,16 @@ async fn e2e_delete_replicates() {
     let cluster = Cluster::spawn(1).await;
     let engine = &cluster.primary.engine;
 
-    engine.put_machine("order", 1, &order_machine_def()).unwrap();
+    engine
+        .put_machine("order", 1, &order_machine_def())
+        .unwrap();
     engine
         .create_instance("to-delete", "order", 1, json!({}), None)
         .unwrap();
     cluster.wait_converged(Duration::from_secs(3)).await;
 
     // Verify it's on the replica first
-    assert!(cluster.replicas[0]
-        .engine
-        .get_instance("to-delete")
-        .is_ok());
+    assert!(cluster.replicas[0].engine.get_instance("to-delete").is_ok());
 
     engine.delete_instance("to-delete", None).unwrap();
     cluster.wait_converged(Duration::from_secs(3)).await;
@@ -344,7 +331,9 @@ async fn e2e_wal_offsets_match_across_nodes() {
     let cluster = Cluster::spawn(2).await;
     let engine = &cluster.primary.engine;
 
-    engine.put_machine("order", 1, &order_machine_def()).unwrap();
+    engine
+        .put_machine("order", 1, &order_machine_def())
+        .unwrap();
     engine
         .create_instance("check", "order", 1, json!({}), None)
         .unwrap();
@@ -379,7 +368,9 @@ async fn e2e_two_replicas_same_state() {
     let cluster = Cluster::spawn(2).await;
     let engine = &cluster.primary.engine;
 
-    engine.put_machine("order", 1, &order_machine_def()).unwrap();
+    engine
+        .put_machine("order", 1, &order_machine_def())
+        .unwrap();
     for i in 0..20 {
         engine
             .create_instance(&format!("i-{}", i), "order", 1, json!({"n": i}), None)
@@ -405,10 +396,8 @@ async fn e2e_two_replicas_same_state() {
     // Replicas should be byte-for-byte identical in memory
     let r0 = cluster.replicas[0].engine.get_all_instances();
     let r1 = cluster.replicas[1].engine.get_all_instances();
-    let r0_map: std::collections::HashMap<_, _> =
-        r0.iter().map(|i| (&i.id, i)).collect();
-    let r1_map: std::collections::HashMap<_, _> =
-        r1.iter().map(|i| (&i.id, i)).collect();
+    let r0_map: std::collections::HashMap<_, _> = r0.iter().map(|i| (&i.id, i)).collect();
+    let r1_map: std::collections::HashMap<_, _> = r1.iter().map(|i| (&i.id, i)).collect();
     for (id, inst0) in &r0_map {
         let inst1 = r1_map.get(id).expect("replica 1 missing instance");
         assert_eq!(inst0.state, inst1.state);
@@ -452,11 +441,7 @@ async fn e2e_primary_metrics_update() {
         .wal()
         .next_sequence()
         .saturating_sub(1);
-    let sent = cluster
-        .primary
-        .metrics
-        .replication_entries_sent_total
-        .get() as u64;
+    let sent = cluster.primary.metrics.replication_entries_sent_total.get() as u64;
     assert_eq!(
         sent, wal_entries,
         "entries_sent_total ({}) must equal WAL entries ({})",
@@ -475,7 +460,9 @@ async fn e2e_large_batch_replicates() {
     let cluster = Cluster::spawn(2).await;
     let engine = cluster.primary.engine.clone();
 
-    engine.put_machine("order", 1, &order_machine_def()).unwrap();
+    engine
+        .put_machine("order", 1, &order_machine_def())
+        .unwrap();
 
     // 100 instances × 3 events each = 301 entries (incl. put_machine)
     for i in 0..100 {
@@ -532,7 +519,11 @@ async fn e2e_replica_reconnects_after_shutdown() {
     // pointing at the same primary. The fresh replica must catch up.
     let mut cluster = Cluster::spawn(2).await;
 
-    cluster.primary.engine.put_machine("order", 1, &order_machine_def()).unwrap();
+    cluster
+        .primary
+        .engine
+        .put_machine("order", 1, &order_machine_def())
+        .unwrap();
     for i in 0..5 {
         cluster
             .primary
@@ -580,7 +571,11 @@ async fn e2e_replica_reconnects_via_reconnect_loop() {
     // encounters connection close and auto-reconnects (exponential backoff).
     // Writes that happen during the gap are recovered via catch-up.
     let mut cluster = Cluster::spawn(1).await;
-    cluster.primary.engine.put_machine("order", 1, &order_machine_def()).unwrap();
+    cluster
+        .primary
+        .engine
+        .put_machine("order", 1, &order_machine_def())
+        .unwrap();
     cluster.wait_converged(Duration::from_secs(3)).await;
 
     // Take the single replica down, write many entries, bring up a fresh one
@@ -628,7 +623,11 @@ async fn e2e_replica_reconnects_via_reconnect_loop() {
 #[tokio::test]
 async fn e2e_lag_zero_when_caught_up() {
     let cluster = Cluster::spawn(2).await;
-    cluster.primary.engine.put_machine("order", 1, &order_machine_def()).unwrap();
+    cluster
+        .primary
+        .engine
+        .put_machine("order", 1, &order_machine_def())
+        .unwrap();
     for i in 0..10 {
         cluster
             .primary
@@ -660,7 +659,11 @@ async fn e2e_lag_increases_then_recovers() {
     // replica comes back, the primary-side per-replica stats should briefly
     // show lag, then go to 0 after catch-up completes.
     let mut cluster = Cluster::spawn(1).await;
-    cluster.primary.engine.put_machine("order", 1, &order_machine_def()).unwrap();
+    cluster
+        .primary
+        .engine
+        .put_machine("order", 1, &order_machine_def())
+        .unwrap();
     cluster.wait_converged(Duration::from_secs(3)).await;
 
     // Take the replica down
@@ -704,7 +707,11 @@ async fn e2e_lag_increases_then_recovers() {
 #[tokio::test]
 async fn e2e_primary_sees_per_replica_sequence() {
     let cluster = Cluster::spawn(3).await;
-    cluster.primary.engine.put_machine("order", 1, &order_machine_def()).unwrap();
+    cluster
+        .primary
+        .engine
+        .put_machine("order", 1, &order_machine_def())
+        .unwrap();
     for i in 0..10 {
         cluster
             .primary
@@ -716,10 +723,19 @@ async fn e2e_primary_sees_per_replica_sequence() {
 
     let stats = cluster.primary.manager.replica_stats();
     assert_eq!(stats.len(), 3);
-    let primary_seq = cluster.primary.engine.wal().next_sequence().saturating_sub(1);
+    let primary_seq = cluster
+        .primary
+        .engine
+        .wal()
+        .next_sequence()
+        .saturating_sub(1);
     for (id, acked, lag) in &stats {
         assert_eq!(*lag, 0, "replica {} lag should be 0", id);
-        assert_eq!(*acked, primary_seq, "replica {} acked sequence mismatch", id);
+        assert_eq!(
+            *acked, primary_seq,
+            "replica {} acked sequence mismatch",
+            id
+        );
     }
 
     cluster.shutdown();
@@ -783,7 +799,11 @@ async fn e2e_auth_correct_plaintext_token_accepted() {
         .wait_for_replica_count(1, Duration::from_secs(5))
         .await;
 
-    cluster.primary.engine.put_machine("order", 1, &order_machine_def()).unwrap();
+    cluster
+        .primary
+        .engine
+        .put_machine("order", 1, &order_machine_def())
+        .unwrap();
     cluster.wait_converged(Duration::from_secs(3)).await;
 
     assert!(cluster.replicas[0].engine.get_machine("order", 1).is_ok());
@@ -863,7 +883,11 @@ async fn e2e_auth_hashed_token_accepted() {
         .wait_for_replica_count(1, Duration::from_secs(5))
         .await;
 
-    cluster.primary.engine.put_machine("order", 1, &order_machine_def()).unwrap();
+    cluster
+        .primary
+        .engine
+        .put_machine("order", 1, &order_machine_def())
+        .unwrap();
     cluster.wait_converged(Duration::from_secs(3)).await;
 
     assert!(cluster.replicas[0].engine.get_machine("order", 1).is_ok());
@@ -905,15 +929,27 @@ async fn e2e_sync_mode_waits_for_ack() {
         .await;
 
     // Write something — the tailer will fan out and replica will ACK
-    cluster.primary.engine.put_machine("order", 1, &order_machine_def()).unwrap();
-    cluster.primary.engine.create_instance("x", "order", 1, json!({}), None).unwrap();
+    cluster
+        .primary
+        .engine
+        .put_machine("order", 1, &order_machine_def())
+        .unwrap();
+    cluster
+        .primary
+        .engine
+        .create_instance("x", "order", 1, json!({}), None)
+        .unwrap();
 
     // Wait for replica to apply (so ACK is sent)
     cluster.wait_converged(Duration::from_secs(3)).await;
 
     // Now await_replication should succeed quickly (replica is up to date)
     let result = cluster.primary.manager.await_replication().await;
-    assert!(result.is_ok(), "sync replication should succeed: {:?}", result);
+    assert!(
+        result.is_ok(),
+        "sync replication should succeed: {:?}",
+        result
+    );
 
     cluster.shutdown();
 }
@@ -936,10 +972,16 @@ async fn e2e_sync_mode_times_out_without_replicas() {
     .await;
 
     // Write without any replica connected
-    primary.engine.put_machine("order", 1, &order_machine_def()).unwrap();
+    primary
+        .engine
+        .put_machine("order", 1, &order_machine_def())
+        .unwrap();
 
     let result = primary.manager.await_replication().await;
-    assert!(result.is_err(), "sync replication must fail with no replicas");
+    assert!(
+        result.is_err(),
+        "sync replication must fail with no replicas"
+    );
     let msg = result.unwrap_err();
     assert!(
         msg.contains("no replicas") || msg.contains("timeout"),
@@ -960,7 +1002,11 @@ async fn e2e_replica_wal_persists_across_restart() {
     // (shutdown + spawn new one on same dir) and verify state is recovered.
     let mut cluster = Cluster::spawn(0).await;
 
-    cluster.primary.engine.put_machine("order", 1, &order_machine_def()).unwrap();
+    cluster
+        .primary
+        .engine
+        .put_machine("order", 1, &order_machine_def())
+        .unwrap();
     for i in 0..5 {
         cluster
             .primary
@@ -1049,7 +1095,11 @@ async fn e2e_replica_wal_persists_across_restart() {
 async fn e2e_idempotency_keys_work_under_replication() {
     let cluster = Cluster::spawn(1).await;
 
-    cluster.primary.engine.put_machine("order", 1, &order_machine_def()).unwrap();
+    cluster
+        .primary
+        .engine
+        .put_machine("order", 1, &order_machine_def())
+        .unwrap();
     cluster
         .primary
         .engine
@@ -1087,7 +1137,11 @@ async fn e2e_idempotency_keys_work_under_replication() {
 #[tokio::test]
 async fn e2e_mixed_workload_multiple_replicas() {
     let cluster = Cluster::spawn(3).await;
-    cluster.primary.engine.put_machine("order", 1, &order_machine_def()).unwrap();
+    cluster
+        .primary
+        .engine
+        .put_machine("order", 1, &order_machine_def())
+        .unwrap();
 
     // Mix of creates and events
     let engine = cluster.primary.engine.clone();
@@ -1133,7 +1187,11 @@ async fn e2e_catchup_wal_entry_count_exact() {
     let mut cluster = Cluster::spawn(0).await;
 
     // Prewrite data without any replica connected
-    cluster.primary.engine.put_machine("order", 1, &order_machine_def()).unwrap();
+    cluster
+        .primary
+        .engine
+        .put_machine("order", 1, &order_machine_def())
+        .unwrap();
     for i in 0..25 {
         cluster
             .primary
@@ -1142,7 +1200,12 @@ async fn e2e_catchup_wal_entry_count_exact() {
             .unwrap();
     }
 
-    let expected = cluster.primary.engine.wal().next_sequence().saturating_sub(1);
+    let expected = cluster
+        .primary
+        .engine
+        .wal()
+        .next_sequence()
+        .saturating_sub(1);
     assert_eq!(expected, 26); // 1 put_machine + 25 creates
 
     // Now attach a replica — it must catch up ALL entries

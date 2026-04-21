@@ -249,9 +249,8 @@ impl ReplicaClient {
                         // whole WAL while the live tailer also fans out from
                         // a stale pos.next_offset). Without this dedup, the
                         // replica's WAL would double each overlapping entry.
-                        let already_applied = self
-                            .last_applied_primary_offset
-                            .load(Ordering::Acquire);
+                        let already_applied =
+                            self.last_applied_primary_offset.load(Ordering::Acquire);
                         if offset != 0 && offset <= already_applied {
                             // Still ACK so the primary's sync barrier (if any)
                             // can resolve.
@@ -417,7 +416,13 @@ mod tests {
 
         for attempt in 1..20 {
             let delay = backoff_with_jitter(base, max, attempt);
-            assert!(delay <= max, "attempt {}: delay {:?} > max {:?}", attempt, delay, max);
+            assert!(
+                delay <= max,
+                "attempt {}: delay {:?} > max {:?}",
+                attempt,
+                delay,
+                max
+            );
         }
     }
 

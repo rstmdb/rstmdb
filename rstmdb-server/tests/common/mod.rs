@@ -9,9 +9,7 @@
 
 use rstmdb_core::StateMachineEngine;
 use rstmdb_server::config::{ReplicationConfig, ReplicationMode, ReplicationRole};
-use rstmdb_server::{
-    Metrics, ReplicaClient, ReplicationManager, Server, ServerConfig,
-};
+use rstmdb_server::{Metrics, ReplicaClient, ReplicationManager, Server, ServerConfig};
 use rstmdb_wal::{FsyncPolicy, WalConfig};
 use serde_json::{json, Value};
 use std::net::SocketAddr;
@@ -263,8 +261,7 @@ impl Cluster {
     pub async fn wait_converged(&self, timeout: Duration) {
         let start = Instant::now();
         loop {
-            let primary_wal_entries =
-                self.primary.engine.wal().next_sequence().saturating_sub(1);
+            let primary_wal_entries = self.primary.engine.wal().next_sequence().saturating_sub(1);
 
             let all_caught_up = self.replicas.iter().all(|r| {
                 let replica_wal_entries = r.engine.wal().next_sequence().saturating_sub(1);
