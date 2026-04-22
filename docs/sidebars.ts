@@ -50,6 +50,7 @@ const sidebars: SidebarsConfig = {
         'operations/monitoring',
         'operations/backup-recovery',
         'operations/security',
+        'operations/replication',
       ],
     },
     {

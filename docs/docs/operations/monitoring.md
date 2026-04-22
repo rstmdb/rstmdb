@@ -67,6 +67,21 @@ curl http://localhost:9090/metrics
 | `rstmdb_subscriptions_active` | Gauge | Active subscriptions |
 | `rstmdb_events_broadcast_total` | Counter | Events broadcast to subscribers |
 
+### Replication Metrics
+
+Emitted only when the server has `replication.role` set to `primary` or `replica`. See [Replication](./replication) for setup.
+
+| Metric | Type | Emitted by | Description |
+|--------|------|------------|-------------|
+| `rstmdb_replication_connected_replicas` | Gauge | primary | Replicas currently connected to this primary |
+| `rstmdb_replication_entries_sent_total` | Counter | primary | WAL entries fanned out to replicas |
+| `rstmdb_replication_sync_timeouts_total` | Counter | primary | Writes that exceeded `sync_timeout_ms` in sync mode |
+| `rstmdb_replication_slow_replica_disconnects_total` | Counter | primary | Replicas dropped because their fan-out channel filled |
+| `rstmdb_replication_replica_lag_entries{replica_id}` | GaugeVec | primary | Per-replica lag (entries) from the primary's view |
+| `rstmdb_replication_replica_last_acked_sequence{replica_id}` | GaugeVec | primary | Per-replica last-ACKed WAL sequence |
+| `rstmdb_replication_lag_entries` | Gauge | replica | Entries this replica is behind the primary |
+| `rstmdb_replication_lag_seconds` | Gauge | replica | Time lag versus the primary's latest write |
+
 ### System Metrics
 
 | Metric | Type | Description |

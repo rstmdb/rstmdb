@@ -56,31 +56,36 @@ Expand language support with official client libraries.
 - [x] Streaming support
 - [x] NuGet package
 
-### Java Client
+### Java Client ✅
 
-- [ ] CompletableFuture async API
-- [ ] Synchronous wrappers
-- [ ] Streaming support (Flow.Publisher)
-- [ ] Maven Central package
+- [x] CompletableFuture async API
+- [x] Synchronous wrappers
+- [x] Streaming support (Flow.Publisher)
+- [x] Maven Central package
 
 ## Phase 2: High Availability
 
-**Status:** Planning
+**Status:** In progress — core WAL streaming replication is shipped; failover tooling is next.
 
 Enable read replicas for horizontal read scaling and improved availability.
 
 ### WAL Streaming Replication
 
-- [ ] WAL segment streaming to replicas
-- [ ] Configurable replication lag limits
-- [ ] Read-only replica mode
-- [ ] Automatic replica catch-up
+- [x] WAL entry streaming to replicas
+- [x] Configurable replication lag thresholds
+- [x] Read-only replica mode
+- [x] Automatic replica catch-up (offset-based)
+- [x] Async and sync replication modes
+- [x] Backpressure handling (slow-replica disconnect)
+- [x] TLS for replication connections
+- [x] Hashed auth tokens with rotation
 
 ### Health & Monitoring
 
-- [ ] Replica lag monitoring
+- [x] Replica lag monitoring (entries and seconds)
+- [x] Per-replica primary-side metrics
+- [x] Replication metrics (Prometheus) + Grafana dashboard
 - [ ] Health check endpoints
-- [ ] Replication metrics
 
 ### Failover Support
 
@@ -193,8 +198,8 @@ See [CONTRIBUTING.md](https://github.com/rstmdb/rstmdb/blob/main/CONTRIBUTING.md
 | Version | Target   | Focus                                             |
 | ------- | -------- | ------------------------------------------------- |
 | 0.2.0   | Released | Client libraries, FLUSH_ALL, instance re-creation |
-| 0.3.0   | Q2 2026  | WAL streaming replication                         |
-| 0.4.0   | Q3 2026  | Raft consensus                                    |
+| 0.3.0   | Released | WAL streaming replication                         |
+| 0.4.0   | Q3 2026  | Failover tooling, Raft consensus                  |
 | 1.0.0   | Q4 2026  | Production ready                                  |
 
 _Dates are estimates and subject to change based on community feedback and contributions._

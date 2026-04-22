@@ -4,7 +4,7 @@ sidebar_position: 3
 
 # Architecture
 
-rstmdb is designed as a single-node, in-memory state machine database with durable storage through Write-Ahead Logging (WAL).
+rstmdb is an in-memory state machine database with durable storage through Write-Ahead Logging (WAL). It runs as a single writer with optional read-only replicas streamed from that writer's WAL — see [Replication](./operations/replication) for the multi-node topology.
 
 ## System Overview
 
@@ -292,15 +292,15 @@ The RCP (rstmdb Command Protocol) uses a simple request-response model:
 
 ### Current Limitations
 
-- **Single node only** - No replication or clustering yet
+- **Single writer** - Only one node accepts writes; reads can be scaled horizontally via [replicas](./operations/replication)
+- **No automatic failover** - Promoting a replica is operator-driven (Raft consensus planned)
 - **Memory-bound** - All instances must fit in RAM
 - **No transactions** - Each operation is atomic, but no multi-operation transactions
 
 ### Planned Features
 
-- WAL streaming replication for read replicas
 - Raft consensus for automatic failover
-- Sharding for horizontal scaling
+- Sharding for horizontal write scaling
 
 ## Crate Structure
 

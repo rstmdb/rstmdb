@@ -82,6 +82,45 @@ tls:
   # CA certificate for client verification
   client_ca_path: "/etc/rstmdb/client-ca.pem"
 
+# Replication settings (omit or use role: standalone for a single-node server)
+replication:
+  # Role: standalone (default), primary, or replica
+  role: standalone
+
+  # Mode: async (default) or sync (primary waits for replica ACKs)
+  mode: async
+
+  # Replica only: host:port of the primary
+  # upstream: "primary.internal:7401"
+
+  # Sync mode (primary): min ACKs required, timeout
+  sync_replicas: 1
+  sync_timeout_ms: 5000
+
+  # Alerting thresholds
+  max_lag_entries: 10000
+  max_lag_seconds: 30
+
+  # Auth (primary): SHA-256 hashed tokens — rstmdb-cli hash-token <token>
+  # auth_token_hashes:
+  #   - "ec46c1b607eb52e1db74a115a1ec14a872b19f47909a5ce1d57a651d7d7b116c"
+  # auth_secrets_file: "/etc/rstmdb/replication-tokens"
+
+  # Auth (replica): plaintext token to present to the primary
+  # auth_token: "my-replica-token"
+
+  # Tuning
+  poll_interval_ms: 10
+  heartbeat_interval_secs: 5
+  reconnect_delay_secs: 1
+  reconnect_max_delay_secs: 60
+  lag_check_interval_secs: 10
+
+  # TLS (replica → primary)
+  tls_enabled: false
+  # tls_ca_path: "/etc/rstmdb/ca.pem"
+  # tls_insecure: false
+
 # Automatic compaction settings
 compaction:
   # Enable automatic compaction
@@ -162,6 +201,29 @@ All configuration options can be set via environment variables:
 | `RSTMDB_COMPACT_EVENTS` | `compaction.events_threshold` | `10000` |
 | `RSTMDB_COMPACT_SIZE_MB` | `compaction.size_threshold_mb` | `100` |
 | `RSTMDB_COMPACT_INTERVAL` | `compaction.min_interval_secs` | `60` |
+
+### Replication
+
+See [Replication](./operations/replication) for how the pieces fit together.
+
+| Variable | Config Path | Default |
+|----------|-------------|---------|
+| `RSTMDB_REPL_ROLE` | `replication.role` | `standalone` |
+| `RSTMDB_REPL_MODE` | `replication.mode` | `async` |
+| `RSTMDB_REPL_UPSTREAM` | `replication.upstream` | None |
+| `RSTMDB_REPL_SYNC_REPLICAS` | `replication.sync_replicas` | `1` |
+| `RSTMDB_REPL_SYNC_TIMEOUT_MS` | `replication.sync_timeout_ms` | `5000` |
+| `RSTMDB_REPL_AUTH_TOKEN` | `replication.auth_token` | None |
+| `RSTMDB_REPL_AUTH_TOKEN_HASH` | appends to `replication.auth_token_hashes` | None |
+| `RSTMDB_REPL_AUTH_SECRETS_FILE` | `replication.auth_secrets_file` | None |
+| `RSTMDB_REPL_POLL_INTERVAL_MS` | `replication.poll_interval_ms` | `10` |
+| `RSTMDB_REPL_HEARTBEAT_INTERVAL_SECS` | `replication.heartbeat_interval_secs` | `5` |
+| `RSTMDB_REPL_RECONNECT_DELAY_SECS` | `replication.reconnect_delay_secs` | `1` |
+| `RSTMDB_REPL_RECONNECT_MAX_DELAY_SECS` | `replication.reconnect_max_delay_secs` | `60` |
+| `RSTMDB_REPL_LAG_CHECK_INTERVAL_SECS` | `replication.lag_check_interval_secs` | `10` |
+| `RSTMDB_REPL_TLS_ENABLED` | `replication.tls_enabled` | `false` |
+| `RSTMDB_REPL_TLS_CA` | `replication.tls_ca_path` | None |
+| `RSTMDB_REPL_TLS_INSECURE` | `replication.tls_insecure` | `false` |
 
 ### Metrics
 
