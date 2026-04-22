@@ -1356,4 +1356,3 @@ async fn e2e_slow_replica_disconnect_closes_tcp_socket() {
 
     cluster.shutdown();
 }
-
