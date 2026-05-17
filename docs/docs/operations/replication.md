@@ -320,9 +320,12 @@ Pair this with the bundled Grafana dashboard (`grafana/dashboards/rstmdb.json`) 
 
 ## Limitations
 
-- **Single primary** — no automatic failover or leader election (planned via Raft in a future release).
-- **Manual promotion** — promoting a replica to primary is operator-driven: stop writes, pick the most-caught-up replica, update its config to `role: primary`, and repoint clients and other replicas.
+- **Single primary** — no automatic failover or leader election. This is deferred to Phase 3 (Raft consensus) because safe promotion without a consensus layer requires external fencing to avoid split-brain.
+- **No in-band promotion** — a running replica cannot be promoted to primary at runtime. To change roles today, operators must **(a)** fence the old primary (stop it / drop its network / revoke its writes), **(b)** stop the chosen replica, **(c)** restart it with `replication.role: primary` in its config, and **(d)** update every other replica's `replication.upstream` to point at the new primary and restart them. There is no built-in orchestration for this — use your own runbook or scheduler (Kubernetes StatefulSet, systemd, etc.).
+- **Split-brain risk during partition** — if the old primary is alive but unreachable from the replicas, promoting a replica without fencing the old primary produces two writers. Both accept writes and diverge. Always fence first.
 - **No partial replication** — every replica mirrors the entire dataset; no per-machine sharding.
+
+See the [roadmap](../roadmap) for the planned failover work (Phase 2 hooks, Phase 3 Raft).
 
 ## See Also
 

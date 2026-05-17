@@ -331,6 +331,11 @@ impl ReplicaClient {
         Ok(())
     }
 
+    /// Returns the upstream primary address this replica is dialing.
+    pub fn primary_addr(&self) -> &str {
+        &self.upstream
+    }
+
     /// Returns the last applied sequence number.
     pub fn last_applied_sequence(&self) -> u64 {
         self.last_applied_sequence.load(Ordering::Acquire)

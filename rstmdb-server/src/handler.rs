@@ -5,7 +5,7 @@ use crate::broadcast::{EventBroadcaster, EventFilter, InstanceEvent};
 use crate::config::AuthConfig;
 use crate::error::ServerError;
 use crate::metrics::Metrics;
-use crate::replication::ReplicationManager;
+use crate::replication::{ReplicaClient, ReplicationManager};
 use crate::session::{Session, SessionState, WireMode};
 use rstmdb_core::instance::InstanceSnapshot;
 use rstmdb_core::StateMachineEngine;
@@ -16,7 +16,7 @@ use rstmdb_storage::SnapshotStore;
 use serde_json::{json, Value};
 use std::collections::HashSet;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use tokio::sync::broadcast;
 
 /// Server capabilities and limits.
@@ -92,8 +92,12 @@ pub struct CommandHandler {
     allow_flush_all: bool,
     /// Whether this handler is in read-only mode (replica).
     read_only: bool,
-    /// Replication manager (primary mode).
-    replication_manager: Option<Arc<ReplicationManager>>,
+    /// Replication manager (primary mode). Set after construction via
+    /// `set_replication_manager`; read-only thereafter.
+    replication_manager: OnceLock<Arc<ReplicationManager>>,
+    /// Replica client (replica mode). Set after construction via
+    /// `set_replica_client`; read-only thereafter.
+    replica_client: OnceLock<Arc<ReplicaClient>>,
 }
 
 impl CommandHandler {
@@ -110,7 +114,8 @@ impl CommandHandler {
             metrics: None,
             allow_flush_all: false,
             read_only: false,
-            replication_manager: None,
+            replication_manager: OnceLock::new(),
+            replica_client: OnceLock::new(),
         }
     }
 
@@ -133,7 +138,8 @@ impl CommandHandler {
             metrics: None,
             allow_flush_all: false,
             read_only: false,
-            replication_manager: None,
+            replication_manager: OnceLock::new(),
+            replica_client: OnceLock::new(),
         }
     }
 
@@ -154,7 +160,8 @@ impl CommandHandler {
             metrics: None,
             allow_flush_all: false,
             read_only: false,
-            replication_manager: None,
+            replication_manager: OnceLock::new(),
+            replica_client: OnceLock::new(),
         })
     }
 
@@ -182,7 +189,8 @@ impl CommandHandler {
             metrics: None,
             allow_flush_all: false,
             read_only: false,
-            replication_manager: None,
+            replication_manager: OnceLock::new(),
+            replica_client: OnceLock::new(),
         })
     }
 
@@ -199,7 +207,8 @@ impl CommandHandler {
             metrics: None,
             allow_flush_all: false,
             read_only: false,
-            replication_manager: None,
+            replication_manager: OnceLock::new(),
+            replica_client: OnceLock::new(),
         }
     }
 
@@ -233,10 +242,17 @@ impl CommandHandler {
         self
     }
 
-    /// Sets the replication manager (for primaries).
-    pub fn with_replication_manager(mut self, manager: Arc<ReplicationManager>) -> Self {
-        self.replication_manager = Some(manager);
-        self
+    /// Sets the replication manager (for primaries). Can only be set once.
+    /// Subsequent calls are silently ignored.
+    pub fn set_replication_manager(&self, manager: Arc<ReplicationManager>) {
+        let _ = self.replication_manager.set(manager);
+    }
+
+    /// Sets the replica client (for replicas). Used by
+    /// `handle_replication_status` to report this replica's lag and primary
+    /// connection state. Can only be set once.
+    pub fn set_replica_client(&self, client: Arc<ReplicaClient>) {
+        let _ = self.replica_client.set(client);
     }
 
     /// Returns a reference to the broadcaster, if set.
@@ -343,6 +359,7 @@ impl CommandHandler {
             Operation::Ping => self.handle_ping(),
             Operation::Bye => self.handle_bye(session),
             Operation::Info => self.handle_info(),
+            Operation::ReplicationStatus => self.handle_replication_status(),
             Operation::PutMachine => self.handle_put_machine(&request.params),
             Operation::GetMachine => self.handle_get_machine(&request.params),
             Operation::ListMachines => self.handle_list_machines(&request.params),
@@ -392,6 +409,7 @@ impl CommandHandler {
             Operation::Ping => "PING",
             Operation::Bye => "BYE",
             Operation::Info => "INFO",
+            Operation::ReplicationStatus => "REPLICATION_STATUS",
             Operation::PutMachine => "PUT_MACHINE",
             Operation::GetMachine => "GET_MACHINE",
             Operation::ListMachines => "LIST_MACHINES",
@@ -542,6 +560,43 @@ impl CommandHandler {
             "max_frame_bytes": self.info.max_frame_bytes,
             "max_batch_ops": self.info.max_batch_ops,
         }))
+    }
+
+    fn handle_replication_status(&self) -> Result<Value, ServerError> {
+        if let Some(mgr) = self.replication_manager.get() {
+            let primary_seq = self.engine.wal().next_sequence().saturating_sub(1);
+            let replicas: Vec<Value> = mgr
+                .replica_stats()
+                .into_iter()
+                .map(|(id, acked, lag)| {
+                    json!({
+                        "replica_id": id,
+                        "last_acked_sequence": acked,
+                        "lag_entries": lag,
+                    })
+                })
+                .collect();
+            return Ok(json!({
+                "role": "primary",
+                "mode": if mgr.is_sync() { "sync" } else { "async" },
+                "primary_sequence": primary_seq,
+                "connected_replicas": mgr.connected_replica_count(),
+                "replicas": replicas,
+            }));
+        }
+
+        if let Some(client) = self.replica_client.get() {
+            return Ok(json!({
+                "role": "replica",
+                "upstream": client.primary_addr(),
+                "last_applied_sequence": client.last_applied_sequence(),
+                "primary_sequence": client.primary_sequence(),
+                "lag_entries": client.lag_entries(),
+                "lag_seconds": client.lag_seconds(),
+            }));
+        }
+
+        Ok(json!({ "role": "standalone" }))
     }
 
     fn handle_put_machine(&self, params: &Value) -> Result<Value, ServerError> {
@@ -2534,5 +2589,88 @@ mod tests {
         }));
         let response = handler.handle(&mut session, &request);
         assert!(response.is_ok());
+    }
+
+    // =========================================================================
+    // REPLICATION_STATUS
+    // =========================================================================
+
+    #[test]
+    fn test_replication_status_standalone() {
+        let (_dir, handler, mut session) = test_handler();
+        let req = Request::new("1", Operation::ReplicationStatus);
+        let resp = handler.handle(&mut session, &req);
+        assert!(resp.is_ok(), "standalone status should succeed");
+        let result = resp.result.unwrap();
+        assert_eq!(result["role"], "standalone");
+    }
+
+    #[test]
+    fn test_replication_status_primary_no_replicas() {
+        use crate::config::{ReplicationConfig, ReplicationRole};
+        use crate::replication::ReplicationManager;
+
+        // ReplicationManager::new spawns a tailer task so we need a runtime.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let (_dir, handler, mut session) = test_handler();
+
+        rt.block_on(async {
+            let config = ReplicationConfig {
+                role: ReplicationRole::Primary,
+                ..Default::default()
+            };
+            let (_tx, rx) = tokio::sync::broadcast::channel(1);
+            let mgr = ReplicationManager::new(config, handler.engine.clone(), rx, None);
+            handler.set_replication_manager(mgr);
+
+            let req = Request::new("1", Operation::ReplicationStatus);
+            let resp = handler.handle(&mut session, &req);
+            assert!(resp.is_ok());
+            let result = resp.result.unwrap();
+            assert_eq!(result["role"], "primary");
+            assert_eq!(result["mode"], "async");
+            assert_eq!(result["connected_replicas"], 0);
+            assert_eq!(
+                result["replicas"].as_array().unwrap().len(),
+                0,
+                "no replicas expected"
+            );
+        });
+    }
+
+    #[test]
+    fn test_replication_status_replica_shape() {
+        use crate::config::{ReplicationConfig, ReplicationRole};
+        use crate::replication::ReplicaClient;
+
+        let (_dir, handler, mut session) = test_handler();
+
+        // Build a ReplicaClient pointing at a bogus upstream (it never needs
+        // to connect for the status path — we only read in-memory state).
+        let config = ReplicationConfig {
+            role: ReplicationRole::Replica,
+            upstream: Some("127.0.0.1:1".to_string()),
+            ..Default::default()
+        };
+        let client = ReplicaClient::new(
+            config,
+            handler.engine.clone(),
+            "127.0.0.1:1".to_string(),
+            None,
+        )
+        .unwrap();
+        handler.set_replica_client(Arc::new(client));
+
+        let req = Request::new("1", Operation::ReplicationStatus);
+        let resp = handler.handle(&mut session, &req);
+        assert!(resp.is_ok());
+        let result = resp.result.unwrap();
+        assert_eq!(result["role"], "replica");
+        assert_eq!(result["upstream"], "127.0.0.1:1");
+        // Fresh replica: no entries applied, no heartbeats — all zero.
+        assert_eq!(result["last_applied_sequence"], 0);
+        assert_eq!(result["primary_sequence"], 0);
+        assert_eq!(result["lag_entries"], 0);
+        assert_eq!(result["lag_seconds"].as_f64().unwrap(), 0.0);
     }
 }

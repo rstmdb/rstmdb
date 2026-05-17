@@ -66,6 +66,9 @@ enum Commands {
     /// Get server info
     Info,
 
+    /// Show replication status (connected replicas, lag, mode)
+    ReplicationStatus,
+
     /// Register a machine definition
     PutMachine {
         /// Machine name

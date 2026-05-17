@@ -260,16 +260,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let replica_handle = if config.replication.is_replica() {
         let upstream = config.replication.upstream.clone().unwrap();
         let auth_token = config.replication.auth_token.clone();
-        let replica_client = ReplicaClient::new(
-            config.replication.clone(),
-            engine.clone(),
-            upstream,
-            auth_token,
-        )
-        .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+        let replica_client = Arc::new(
+            ReplicaClient::new(
+                config.replication.clone(),
+                engine.clone(),
+                upstream,
+                auth_token,
+            )
+            .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?,
+        );
+        // Give the server's handler a handle so `REPLICATION_STATUS` requests
+        // can read this replica's lag.
+        server.set_replica_client(replica_client.clone());
         let shutdown_rx = server.subscribe_shutdown();
+        let client_for_task = replica_client.clone();
         Some(tokio::spawn(async move {
-            replica_client.run(shutdown_rx).await;
+            client_for_task.run(shutdown_rx).await;
         }))
     } else {
         None

@@ -246,9 +246,21 @@ impl Server {
         })
     }
 
-    /// Sets the replication manager (for primary mode).
+    /// Sets the replication manager (for primary mode). Plumbs the same Arc
+    /// into the command handler so `handle_replication_status` can report
+    /// primary-side replica stats.
     pub fn set_replication_manager(&mut self, manager: Arc<ReplicationManager>) {
+        self.handler.set_replication_manager(manager.clone());
         self.replication_manager = Some(manager);
+    }
+
+    /// Sets the replica client (for replica mode). Plumbs the Arc into the
+    /// command handler so `handle_replication_status` can report this
+    /// replica's own lag and primary connection state. Takes `&self` because
+    /// replicas are typically wired in after the server has already been
+    /// wrapped in `Arc`.
+    pub fn set_replica_client(&self, client: Arc<crate::replication::ReplicaClient>) {
+        self.handler.set_replica_client(client);
     }
 
     /// Returns a subscribe receiver for shutdown signals.

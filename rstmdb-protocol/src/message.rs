@@ -18,6 +18,7 @@ pub enum Operation {
 
     // Server info
     Info,
+    ReplicationStatus,
 
     // Machine definition management
     PutMachine,
