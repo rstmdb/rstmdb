@@ -16,7 +16,9 @@ storage:
   fsync_policy: every_write
   max_machine_versions: 0
   allow_instance_recreate: true
-  allow_flush_all: true
+  # Must be false when replication is enabled — FLUSH_ALL does not replicate and
+  # would diverge the cluster, so the server refuses to start with both set.
+  allow_flush_all: false
 
 compaction:
   enabled: true

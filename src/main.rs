@@ -94,6 +94,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err(e.into());
     }
 
+    // Validate cross-section constraints (e.g. FLUSH_ALL vs replication).
+    if let Err(e) = config.validate() {
+        tracing::error!("Configuration error: {}", e);
+        return Err(e.into());
+    }
+
     // Warn if a plaintext replication token is configured
     if config.replication.auth_token.is_some() {
         tracing::warn!(

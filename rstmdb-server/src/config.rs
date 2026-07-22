@@ -64,6 +64,26 @@ impl Config {
         config
     }
 
+    /// Validates cross-section constraints that individual section validators
+    /// can't see on their own. Call this at startup after loading and applying
+    /// env overrides; a returned error means the server must refuse to start.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        // FLUSH_ALL wipes all state, but it is NOT a replicated operation: on a
+        // primary it would clear the primary while leaving replicas holding the
+        // old data (silent divergence), and on a replica it's a local-only write
+        // that breaks WAL parity with the primary. Refuse to start rather than
+        // ship a data-loss / split-brain footgun — even when explicitly enabled.
+        if !self.replication.is_standalone() && self.storage.allow_flush_all {
+            return Err(ConfigError::ValidationError(format!(
+                "storage.allow_flush_all=true is not permitted when replication is enabled \
+                 (replication.role={:?}). FLUSH_ALL does not replicate and would diverge the \
+                 cluster; set storage.allow_flush_all=false, or run replication.role=standalone.",
+                self.replication.role
+            )));
+        }
+        Ok(())
+    }
+
     /// Applies environment variable overrides to the configuration.
     fn apply_env_overrides(&mut self) {
         self.network.apply_env_overrides();
@@ -821,6 +841,40 @@ mod tests {
         assert_eq!(config.storage.max_machine_versions, 0); // unlimited by default
         assert!(config.compaction.enabled);
         assert!(config.replication.is_standalone());
+    }
+
+    #[test]
+    fn test_flush_all_forbidden_when_replication_enabled() {
+        // Standalone: allow_flush_all is permitted.
+        let mut config = Config::default();
+        config.storage.allow_flush_all = true;
+        assert!(config.replication.is_standalone());
+        assert!(
+            config.validate().is_ok(),
+            "standalone + flush-all should be OK"
+        );
+
+        // Primary: allow_flush_all must be rejected.
+        config.replication.role = ReplicationRole::Primary;
+        assert!(
+            config.validate().is_err(),
+            "primary + flush-all must fail validation"
+        );
+
+        // Replica: allow_flush_all must be rejected.
+        config.replication.role = ReplicationRole::Replica;
+        config.replication.upstream = Some("primary:7401".to_string());
+        assert!(
+            config.validate().is_err(),
+            "replica + flush-all must fail validation"
+        );
+
+        // With flush-all off, replication roles validate fine.
+        config.storage.allow_flush_all = false;
+        assert!(
+            config.validate().is_ok(),
+            "replica without flush-all should be OK"
+        );
     }
 
     #[test]
