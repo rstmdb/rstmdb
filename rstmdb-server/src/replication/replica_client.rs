@@ -254,7 +254,10 @@ impl ReplicaClient {
                         if offset != 0 && offset <= already_applied {
                             // Still ACK so the primary's sync barrier (if any)
                             // can resolve.
-                            let ack = ReplicationMessage::ReplicateAck { sequence };
+                            let ack = ReplicationMessage::ReplicateAck {
+                                sequence,
+                                applied_offset: offset,
+                            };
                             Self::send_message(&mut stream, &ack).await?;
                             tracing::debug!(
                                 "Skipped duplicate replicated entry: primary_offset={} already_applied={}",
@@ -285,15 +288,38 @@ impl ReplicaClient {
                                     local_seq
                                 );
 
-                                let ack = ReplicationMessage::ReplicateAck { sequence };
+                                let ack = ReplicationMessage::ReplicateAck {
+                                    sequence,
+                                    applied_offset: offset,
+                                };
                                 Self::send_message(&mut stream, &ack).await?;
                             }
                             Err(e) => {
+                                // A failed apply means this entry is NOT durable
+                                // locally. We must not skip it and carry on: the
+                                // next successful apply would fetch_max our
+                                // offset past the gap, so a reconnect would never
+                                // re-request it — silent, permanent divergence,
+                                // while the primary still counts us as a healthy
+                                // replica. Instead, surface the error and tear
+                                // the connection down. `run()` reconnects with
+                                // backoff and catch-up resumes from our last
+                                // durable offset (unchanged, since this entry
+                                // never applied), giving the entry another chance
+                                // if the fault was transient — and making a
+                                // persistent fault loud (visible disconnect)
+                                // rather than silent.
                                 tracing::error!(
-                                    "Failed to apply replicated entry seq={}: {}",
+                                    "Failed to apply replicated entry seq={}: {} — \
+                                     dropping connection to avoid silent divergence",
                                     sequence,
                                     e
                                 );
+                                return Err(format!(
+                                    "failed to apply replicated entry seq={}: {}",
+                                    sequence, e
+                                )
+                                .into());
                             }
                         }
                     }

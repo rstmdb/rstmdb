@@ -406,59 +406,58 @@ impl Server {
         if let Some(mgr) = repl_manager.as_ref() {
             let mgr = mgr.clone();
 
-            // Peek at the first frame to detect replication
+            // Peek at the first frame to detect replication. Read in a LOOP so a
+            // handshake split across TCP segments (or TLS records) is still
+            // recognized: a single read() can return only part of the first
+            // frame, and giving up after one read would misroute the replica to
+            // the client handler (M4). Keep every byte read so it can be handed
+            // to the client handler if this turns out not to be replication.
             let mut decoder = rstmdb_protocol::Decoder::new();
             let mut peek_buf = [0u8; 4096];
+            let mut consumed: Vec<u8> = Vec::new();
 
-            let n = stream.read(&mut peek_buf).await?;
-            if n == 0 {
+            // A ReplicateAuth frame is tiny (< 1 KiB). If we can't decode a
+            // complete first frame within this many bytes, it isn't a replica —
+            // treat it as a client (whose first frame may legitimately be large;
+            // the client handler will read the remainder).
+            const MAX_DETECT_PEEK: usize = 64 * 1024;
+
+            let auth_msg = loop {
+                let n = stream.read(&mut peek_buf).await?;
+                if n == 0 {
+                    if consumed.is_empty() {
+                        return Ok(());
+                    }
+                    break None; // closed mid-frame — hand the partial to client
+                }
+                consumed.extend_from_slice(&peek_buf[..n]);
+                decoder.extend(&peek_buf[..n]);
+
+                match decoder.decode_raw() {
+                    Ok(Some(payload)) => match ReplicationMessage::from_bytes(&payload) {
+                        Ok(msg) if msg.is_auth() => break Some(msg),
+                        Ok(_) => break None,  // valid frame, not ReplicateAuth
+                        Err(_) => break None, // not replication JSON
+                    },
+                    Ok(None) => {
+                        // Incomplete first frame — keep reading unless we've
+                        // buffered more than any handshake could need.
+                        if consumed.len() >= MAX_DETECT_PEEK {
+                            break None;
+                        }
+                        continue;
+                    }
+                    Err(_) => break None, // undecodable framing
+                }
+            };
+
+            if let Some(msg) = auth_msg {
+                tracing::info!("[{}] Detected replication connection", addr);
+                mgr.handle_replica_connection(stream, msg).await;
                 return Ok(());
             }
-            decoder.extend(&peek_buf[..n]);
-            tracing::debug!(
-                "[{}] Read {} initial bytes, checking for replication",
-                addr,
-                n
-            );
 
-            // Try to decode the first frame as a replication message
-            match decoder.decode_raw() {
-                Ok(Some(payload)) => {
-                    tracing::debug!("[{}] Decoded frame, payload {} bytes", addr, payload.len());
-                    match ReplicationMessage::from_bytes(&payload) {
-                        Ok(msg) if msg.is_auth() => {
-                            tracing::info!("[{}] Detected replication connection", addr);
-                            mgr.handle_replica_connection(stream, msg).await;
-                            return Ok(());
-                        }
-                        Ok(_) => {
-                            tracing::debug!(
-                                "[{}] First frame is not ReplicateAuth, treating as client",
-                                addr
-                            );
-                        }
-                        Err(e) => {
-                            tracing::debug!(
-                                "[{}] First frame is not replication JSON ({}), treating as client",
-                                addr,
-                                e
-                            );
-                        }
-                    }
-                }
-                Ok(None) => {
-                    tracing::debug!(
-                        "[{}] Incomplete frame in initial read, treating as client",
-                        addr
-                    );
-                }
-                Err(e) => {
-                    tracing::debug!("[{}] Frame decode error ({}), treating as client", addr, e);
-                }
-            }
-
-            // Not a replication connection - proceed with normal handling
-            // Feed the already-read data into the connection handler
+            // Not a replication connection — hand off everything we read.
             return Self::handle_connection(
                 stream,
                 addr,
@@ -466,7 +465,7 @@ impl Server {
                 broadcaster,
                 config,
                 shutdown,
-                Some(&peek_buf[..n]),
+                Some(consumed.as_slice()),
                 Some(mgr),
             )
             .await;

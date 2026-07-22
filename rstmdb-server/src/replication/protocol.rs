@@ -42,7 +42,18 @@ pub enum ReplicationMessage {
     },
 
     /// Replica → Primary: confirms entry was applied.
-    ReplicateAck { sequence: u64 },
+    ReplicateAck {
+        sequence: u64,
+        /// The **primary** WAL offset of the applied entry. The primary's sync
+        /// barrier tracks durability by offset, not sequence: offsets are
+        /// monotonic on disk and applied in order, so "acked offset >= X" means
+        /// every entry up to X is durable — whereas "acked sequence >= N" does
+        /// NOT, because sequences can be non-monotonic vs offset under
+        /// concurrent writes. Defaults to 0 for old replicas (which only sent a
+        /// sequence); such acks can't advance the offset barrier.
+        #[serde(default)]
+        applied_offset: u64,
+    },
 
     /// Primary → Replica: periodic heartbeat with current sequence for lag calculation.
     ReplicateHeartbeat {
@@ -161,12 +172,36 @@ mod tests {
 
     #[test]
     fn test_replicate_ack_roundtrip() {
-        let msg = ReplicationMessage::ReplicateAck { sequence: 99 };
+        let msg = ReplicationMessage::ReplicateAck {
+            sequence: 99,
+            applied_offset: 1099511628123,
+        };
         let bytes = msg.to_bytes().unwrap();
         let parsed = ReplicationMessage::from_bytes(&bytes).unwrap();
         match parsed {
-            ReplicationMessage::ReplicateAck { sequence } => {
+            ReplicationMessage::ReplicateAck {
+                sequence,
+                applied_offset,
+            } => {
                 assert_eq!(sequence, 99);
+                assert_eq!(applied_offset, 1099511628123);
+            }
+            _ => panic!("unexpected message type"),
+        }
+    }
+
+    #[test]
+    fn test_replicate_ack_backward_compat_no_offset() {
+        // Old replica sends only a sequence — applied_offset defaults to 0.
+        let json = r#"{ "type": "replicate_ack", "sequence": 7 }"#;
+        let parsed = ReplicationMessage::from_bytes(json.as_bytes()).unwrap();
+        match parsed {
+            ReplicationMessage::ReplicateAck {
+                sequence,
+                applied_offset,
+            } => {
+                assert_eq!(sequence, 7);
+                assert_eq!(applied_offset, 0);
             }
             _ => panic!("unexpected message type"),
         }

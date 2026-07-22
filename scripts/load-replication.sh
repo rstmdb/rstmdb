@@ -168,51 +168,76 @@ trap "rm -rf '$WORK_DIR'" EXIT
 #   Phase 1: all create-instance calls (no inter-dependency)
 #   Phase 2: all apply-event calls (depend on create, but safe once phase 1 is done)
 CREATES_FILE="$WORK_DIR/creates.txt"
-EVENTS_FILE="$WORK_DIR/events.txt"
+# Events are split into two order-independent phases so they can run
+# concurrently without racing per-instance transition order: every instance
+# must be STARTed (created → active) before any STEP (active → active). Running
+# all STARTs first, then all STEPs, means each phase is safe to parallelize —
+# interleaving them (the old single events file) let a STEP fire before its
+# START and fail with an invalid-transition error.
+STARTS_FILE="$WORK_DIR/starts.txt"
+STEPS_FILE="$WORK_DIR/steps.txt"
 INSTANCE_IDS=()
-RUN_STAMP=$(date +%s%N)
+RUN_STAMP=$(date +%s)-$$
 for i in $(seq 1 "$INSTANCES"); do
     ID="load-$RUN_STAMP-$i"
     INSTANCE_IDS+=("$ID")
     echo "$ID" >> "$CREATES_FILE"
-    # First event: START (created → active); then (N-1) × STEP
-    echo "$ID|START" >> "$EVENTS_FILE"
+    echo "$ID|START" >> "$STARTS_FILE"
     for _ in $(seq 2 "$EVENTS_PER_INSTANCE"); do
-        echo "$ID|STEP" >> "$EVENTS_FILE"
+        echo "$ID|STEP" >> "$STEPS_FILE"
     done
 done
 
 CREATE_COUNT=$(wc -l < "$CREATES_FILE")
-EVENT_COUNT=$(wc -l < "$EVENTS_FILE")
+EVENT_COUNT=$(( $(wc -l < "$STARTS_FILE" 2>/dev/null || echo 0) + $(wc -l < "$STEPS_FILE" 2>/dev/null || echo 0) ))
 TOTAL_OPS=$((CREATE_COUNT + EVENT_COUNT))
 log "Generated $CREATE_COUNT creates + $EVENT_COUNT events = $TOTAL_OPS operations"
-
-do_create() {
-    "$CLI" -s "$PRIMARY" create-instance -m "$MACHINE" -V 1 -i "$1" >/dev/null 2>&1 \
-        || return 1
-}
-do_event() {
-    local id="${1%%|*}" ev="${1#*|}"
-    "$CLI" -s "$PRIMARY" apply-event -i "$id" -e "$ev" >/dev/null 2>&1 \
-        || return 1
-}
-export -f do_create do_event
-export CLI PRIMARY MACHINE
 
 FAIL_FILE="$WORK_DIR/failures"
 : > "$FAIL_FILE"
 
+# Self-contained worker scripts invoked DIRECTLY by xargs. We deliberately do
+# NOT use `export -f fn` + `xargs bash -c 'fn'`: that pattern silently fails to
+# run the worker under macOS's stock bash 3.2 (exported functions aren't
+# imported into the xargs child), so the whole workload no-ops while reporting
+# "no failures". Baking config into a plain script and calling it directly is
+# portable across bash/dash/zsh. Config values are expanded at write time; the
+# per-item argument (`$1`) stays literal.
+CREATE_HELPER="$WORK_DIR/do_create.sh"
+cat > "$CREATE_HELPER" <<HELPER
+#!/usr/bin/env bash
+"$CLI" -s "$PRIMARY" create-instance -m "$MACHINE" -V 1 -i "\$1" >/dev/null 2>&1 \\
+    || echo "C" >> "$FAIL_FILE"
+HELPER
+EVENT_HELPER="$WORK_DIR/do_event.sh"
+cat > "$EVENT_HELPER" <<HELPER
+#!/usr/bin/env bash
+arg="\$1"; id="\${arg%%|*}"; ev="\${arg#*|}"
+"$CLI" -s "$PRIMARY" apply-event -i "\$id" -e "\$ev" >/dev/null 2>&1 \\
+    || echo "E" >> "$FAIL_FILE"
+HELPER
+chmod +x "$CREATE_HELPER" "$EVENT_HELPER"
+
 START_TIME=$(date +%s)
 
-# Phase 1: creates
+# Phase 1: creates.
+# NOTE: read the work list from STDIN (`< file`), NOT `xargs -a file` — the
+# `-a` flag is a GNU extension that BSD/macOS xargs rejects with "invalid
+# option -- a", which (under `2>/dev/null || true`) silently ran zero ops.
 log "  phase 1: creating $CREATE_COUNT instances..."
-xargs -a "$CREATES_FILE" -P "$WORKERS" -I{} \
-    bash -c 'do_create "$@" || echo "C" >> "'"$FAIL_FILE"'"' _ {} 2>/dev/null || true
+xargs -P "$WORKERS" -I{} "$CREATE_HELPER" {} < "$CREATES_FILE" 2>/dev/null || true
 
-# Phase 2: events
-log "  phase 2: applying $EVENT_COUNT events..."
-xargs -a "$EVENTS_FILE" -P "$WORKERS" -I{} \
-    bash -c 'do_event "$@" || echo "E" >> "'"$FAIL_FILE"'"' _ {} 2>/dev/null || true
+# Phase 2a: START every instance (created -> active). One per instance, so safe
+# to run concurrently.
+log "  phase 2a: starting instances (START)..."
+[[ -s "$STARTS_FILE" ]] && \
+    xargs -P "$WORKERS" -I{} "$EVENT_HELPER" {} < "$STARTS_FILE" 2>/dev/null || true
+
+# Phase 2b: STEP (active -> active). Safe now that every instance is active;
+# concurrent STEPs on the same instance are all valid.
+log "  phase 2b: applying STEP events..."
+[[ -s "$STEPS_FILE" ]] && \
+    xargs -P "$WORKERS" -I{} "$EVENT_HELPER" {} < "$STEPS_FILE" 2>/dev/null || true
 
 END_TIME=$(date +%s)
 ELAPSED=$((END_TIME - START_TIME))
@@ -227,6 +252,21 @@ if [[ $FAILURES -eq 0 ]]; then
 else
     warn "Submitted $TOTAL_OPS ops in ${ELAPSED}s (~${RATE}/s, failures: $CREATE_FAILS create + $EVENT_FAILS event = $FAILURES)"
 fi
+
+# Guard: verify the workload actually LANDED on the primary. Catches the class
+# of failure where ops "succeed" but nothing is written (e.g. a broken worker
+# invocation) — otherwise the convergence check below just waits out its timeout
+# on a primary that never grew.
+sleep 1
+POST_ENTRIES=$(get_metric "$PRIMARY_METRICS" "rstmdb_wal_entries")
+GROWTH=$(( ${POST_ENTRIES:-0} - ${START_ENTRIES:-0} ))
+EXPECTED_MIN=$(( TOTAL_OPS / 2 ))  # allow for legit idempotency/no-op events
+if [[ $GROWTH -lt $EXPECTED_MIN ]]; then
+    fail "workload did not land: primary WAL grew by $GROWTH (expected ~$TOTAL_OPS). \
+Writes were not applied — aborting before the convergence check."
+    exit 1
+fi
+log "workload landed: primary WAL grew by $GROWTH entries"
 
 # ---------- watch replication converge ----------
 section "Replication convergence"

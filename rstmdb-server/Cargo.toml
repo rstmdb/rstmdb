@@ -40,3 +40,6 @@ http-body-util = "0.1"
 [dev-dependencies]
 tempfile.workspace = true
 tokio-test.workspace = true
+# Enable WAL test hooks for deterministic interleaving tests (e.g. the H2 sync
+# barrier reproduction). This only affects test/bench builds, not `cargo build`.
+rstmdb-wal = { workspace = true, features = ["test-hooks"] }

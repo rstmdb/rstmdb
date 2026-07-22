@@ -8,7 +8,9 @@
 #![allow(dead_code)] // helpers used by multiple test files
 
 use rstmdb_core::StateMachineEngine;
-use rstmdb_server::config::{ReplicationConfig, ReplicationMode, ReplicationRole};
+use rstmdb_protocol::{Decoder, Encoder};
+use rstmdb_server::config::{AuthConfig, ReplicationConfig, ReplicationMode, ReplicationRole};
+use rstmdb_server::replication::ReplicationMessage;
 use rstmdb_server::{Metrics, ReplicaClient, ReplicationManager, Server, ServerConfig};
 use rstmdb_wal::{FsyncPolicy, WalConfig};
 use serde_json::{json, Value};
@@ -17,7 +19,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
-use tokio::net::TcpListener;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 
@@ -55,9 +58,17 @@ pub struct PrimaryOpts {
     pub sync_replicas: u32,
     pub sync_timeout_ms: u64,
     /// Plaintext auth token (if Some, hashed and added to `auth_token_hashes`).
+    /// This is the **replication** auth token, distinct from client auth below.
     pub auth_token: Option<String>,
-    /// Pre-hashed tokens (SHA-256 hex) accepted by the primary.
+    /// Pre-hashed tokens (SHA-256 hex) accepted by the primary for replication.
     pub auth_token_hashes: Vec<String>,
+    /// Enables **client** authentication on the server command path (the
+    /// separate `auth.required` knob). This is independent of replication auth
+    /// above — a primary can have client auth on while replication auth is off.
+    /// `client_auth_token_hashes` are the SHA-256 hex token hashes accepted for
+    /// client commands.
+    pub client_auth_required: bool,
+    pub client_auth_token_hashes: Vec<String>,
 }
 
 impl Default for PrimaryOpts {
@@ -71,17 +82,36 @@ impl Default for PrimaryOpts {
             sync_timeout_ms: 500,
             auth_token: None,
             auth_token_hashes: Vec::new(),
+            client_auth_required: false,
+            client_auth_token_hashes: Vec::new(),
         }
     }
 }
 
 /// Options for spawning a replica.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct ReplicaOpts {
     /// If Some, reuse this wal_dir instead of creating a fresh one.
     pub wal_dir: Option<PathBuf>,
     /// Auth token to send in ReplicateAuth.
     pub auth_token: Option<String>,
+    /// Base reconnect delay (seconds). Default 0 (immediate) matches the fast
+    /// test defaults; set higher to keep a disconnected replica from racing
+    /// back before an assertion can observe it.
+    pub reconnect_delay_secs: u64,
+    /// Max reconnect delay (seconds). Default 1.
+    pub reconnect_max_delay_secs: u64,
+}
+
+impl Default for ReplicaOpts {
+    fn default() -> Self {
+        Self {
+            wal_dir: None,
+            auth_token: None,
+            reconnect_delay_secs: 0,
+            reconnect_max_delay_secs: 1,
+        }
+    }
 }
 
 /// A primary + N replicas, all in-process.
@@ -144,17 +174,43 @@ impl Cluster {
 
         let (shutdown_tx, shutdown_rx) = broadcast::channel(4);
         let mgr_shutdown_rx = shutdown_tx.subscribe();
+        // Client-auth validator used as the replication fallback (mirrors the
+        // production wiring in main.rs). When client auth is required, an
+        // unauthenticated replica must be rejected even if replication auth is
+        // unset — this is the H1 side-door fix.
+        let fallback_validator = if opts.client_auth_required {
+            Some(rstmdb_server::auth::TokenValidator::new(
+                opts.client_auth_token_hashes.clone(),
+            ))
+        } else {
+            None
+        };
         let manager = ReplicationManager::new(
             repl_config,
             engine.clone(),
             mgr_shutdown_rx,
             Some(metrics.clone()),
+            fallback_validator,
         );
 
         let mut server_config = ServerConfig::new(addr);
         server_config.allow_flush_all = true;
         server_config.metrics = Some(metrics.clone());
-        let mut server = Server::new(server_config, engine.clone());
+        server_config.auth_required = opts.client_auth_required;
+
+        // Build the server with client auth on or off. Note this is fully
+        // independent of the replication auth configured on `repl_config`
+        // above — which is exactly the confusable pair the H1 test exercises.
+        let mut server = if opts.client_auth_required {
+            let auth_config = AuthConfig {
+                required: true,
+                token_hashes: opts.client_auth_token_hashes.clone(),
+                secrets_file: None,
+            };
+            Server::with_auth(server_config, engine.clone(), &auth_config)
+        } else {
+            Server::new(server_config, engine.clone())
+        };
         server.set_replication_manager(manager.clone());
         let server = Arc::new(server);
 
@@ -208,8 +264,8 @@ impl Cluster {
         let repl_config = ReplicationConfig {
             role: ReplicationRole::Replica,
             upstream: Some(primary_addr.to_string()),
-            reconnect_delay_secs: 0,
-            reconnect_max_delay_secs: 1,
+            reconnect_delay_secs: opts.reconnect_delay_secs,
+            reconnect_max_delay_secs: opts.reconnect_max_delay_secs,
             lag_check_interval_secs: 1,
             auth_token: opts.auth_token.clone(),
             ..Default::default()
@@ -395,6 +451,80 @@ async fn wait_until_listening(addr: SocketAddr, timeout: Duration) {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     panic!("primary not listening on {:?} after {:?}", addr, timeout);
+}
+
+/// Result of probing a primary's replication port with a raw, hand-built
+/// replica handshake — no real `ReplicaClient` involved.
+pub struct ReplicationProbe {
+    /// The `ok` field of the primary's `ReplicateSyncResponse`, if one arrived.
+    /// `None` means the primary closed the connection without responding.
+    pub sync_ok: Option<bool>,
+    /// Error string from the sync response (populated on rejection).
+    pub sync_error: Option<String>,
+    /// WAL entries the primary streamed back during the collection window.
+    pub entries: Vec<ReplicationMessage>,
+}
+
+/// Opens a raw TCP connection to a primary's listening port and performs a
+/// replica handshake by hand: sends one `ReplicateAuth` frame with the given
+/// token (from offset 0, so the primary streams its entire WAL as catch-up),
+/// reads the sync response, then collects whatever the primary streams for
+/// `collect_for`.
+///
+/// This is the adversary's view: anyone who can open a TCP socket to the
+/// replication port and speak the framing. Used by the H1 auth side-door test
+/// to prove whether an unauthenticated peer can exfiltrate the WAL.
+pub async fn probe_replication_stream(
+    addr: SocketAddr,
+    auth_token: Option<String>,
+    collect_for: Duration,
+) -> ReplicationProbe {
+    let mut stream = TcpStream::connect(addr).await.expect("connect to primary");
+
+    let auth = ReplicationMessage::ReplicateAuth {
+        auth_token,
+        last_sequence: 0,
+        last_primary_offset: 0,
+    };
+    stream
+        .write_all(&Encoder::encode_raw(&auth.to_bytes().unwrap()))
+        .await
+        .expect("send ReplicateAuth");
+
+    let mut decoder = Decoder::new();
+    let mut buf = [0u8; 16384];
+    let mut probe = ReplicationProbe {
+        sync_ok: None,
+        sync_error: None,
+        entries: Vec::new(),
+    };
+
+    let deadline = Instant::now() + collect_for;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        let n = match tokio::time::timeout(remaining, stream.read(&mut buf)).await {
+            Ok(Ok(0)) => break, // primary closed the connection
+            Ok(Ok(n)) => n,
+            Ok(Err(_)) => break, // connection error
+            Err(_) => break,     // collection window elapsed
+        };
+        decoder.extend(&buf[..n]);
+        while let Ok(Some(payload)) = decoder.decode_raw() {
+            match ReplicationMessage::from_bytes(&payload) {
+                Ok(ReplicationMessage::ReplicateSyncResponse { ok, error, .. }) => {
+                    probe.sync_ok = Some(ok);
+                    probe.sync_error = error;
+                }
+                Ok(other) => probe.entries.push(other),
+                Err(_) => {}
+            }
+        }
+    }
+
+    probe
 }
 
 pub fn order_machine_def() -> Value {

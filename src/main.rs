@@ -3,6 +3,7 @@
 //! A TCP-based state machine database with WAL durability and snapshot compaction.
 
 use rstmdb_core::StateMachineEngine;
+use rstmdb_server::auth::TokenValidator;
 use rstmdb_server::{
     run_metrics_server, tls, CompactionManager, Config, Metrics, ReplicaClient, ReplicationManager,
     ReplicationRole, Server, ServerConfig,
@@ -206,11 +207,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Set up replication based on role
     let _replication_manager = if config.replication.is_primary() {
         let repl_shutdown = server.subscribe_shutdown();
+        // Client-auth validator, used as the replication fallback so an
+        // operator who enables client auth but forgets a replication token
+        // doesn't leave replication as an unauthenticated side-door. Built even
+        // when token_hashes is empty (required but misconfigured) so it fails
+        // closed rather than open.
+        let fallback_validator = if config.auth.required {
+            Some(TokenValidator::new(config.auth.token_hashes.clone()))
+        } else {
+            None
+        };
         let mgr = ReplicationManager::new(
             config.replication.clone(),
             engine.clone(),
             repl_shutdown,
             metrics.clone(),
+            fallback_validator,
         );
         server.set_replication_manager(mgr.clone());
         Some(mgr)

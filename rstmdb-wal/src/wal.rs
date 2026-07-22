@@ -129,6 +129,12 @@ pub struct WalStats {
     pub fsyncs: u64,
 }
 
+/// Test-only hook invoked with each entry's assigned sequence number, right
+/// after the sequence is allocated and BEFORE the segment write. Lets tests
+/// force a specific interleaving of concurrent appends.
+#[cfg(feature = "test-hooks")]
+pub type AppendHook = std::sync::Arc<dyn Fn(u64) + Send + Sync>;
+
 /// Write-Ahead Log.
 pub struct Wal {
     config: WalConfig,
@@ -148,6 +154,9 @@ pub struct Wal {
     stats_writes: AtomicU64,
     stats_reads: AtomicU64,
     stats_fsyncs: AtomicU64,
+    /// Test-only append hook (see [`AppendHook`]).
+    #[cfg(feature = "test-hooks")]
+    append_hook: parking_lot::Mutex<Option<AppendHook>>,
 }
 
 impl Wal {
@@ -193,6 +202,8 @@ impl Wal {
             stats_writes: AtomicU64::new(0),
             stats_reads: AtomicU64::new(0),
             stats_fsyncs: AtomicU64::new(0),
+            #[cfg(feature = "test-hooks")]
+            append_hook: parking_lot::Mutex::new(None),
         };
 
         // Recover existing segments
@@ -276,6 +287,20 @@ impl Wal {
     }
 
     /// Appends an entry to the WAL.
+    /// Installs a test-only [`AppendHook`] invoked with each entry's assigned
+    /// sequence, immediately after allocation and before the segment write.
+    /// Available only under the `test-hooks` feature.
+    #[cfg(feature = "test-hooks")]
+    pub fn set_append_hook(&self, hook: AppendHook) {
+        *self.append_hook.lock() = Some(hook);
+    }
+
+    /// Clears any installed test append hook.
+    #[cfg(feature = "test-hooks")]
+    pub fn clear_append_hook(&self) {
+        *self.append_hook.lock() = None;
+    }
+
     pub fn append(&self, entry: &WalEntry) -> Result<(u64, WalOffset), WalError> {
         if self.closed.load(Ordering::Acquire) {
             return Err(WalError::Closed);
@@ -283,6 +308,20 @@ impl Wal {
 
         let payload = serde_json::to_vec(entry)?;
         let sequence = self.next_sequence.fetch_add(1, Ordering::SeqCst);
+
+        // Test-only interleaving hook: fires after the sequence is allocated but
+        // before the segment write, so a test can block this writer and let a
+        // later-sequenced append win the segment-lock race — producing the
+        // non-monotonic sequence/offset ordering that concurrent writes cause in
+        // production. Compiled out entirely without the `test-hooks` feature.
+        #[cfg(feature = "test-hooks")]
+        {
+            let hook = self.append_hook.lock().clone();
+            if let Some(hook) = hook {
+                hook(sequence);
+            }
+        }
+
         let record = WalRecord::new(entry.entry_type(), sequence, Bytes::from(payload));
         let record_size = record.disk_size();
 

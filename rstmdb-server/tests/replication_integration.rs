@@ -429,7 +429,10 @@ fn test_replication_message_framing_roundtrip() {
             },
             timestamp_ms: 1_700_000_000_000,
         },
-        ReplicationMessage::ReplicateAck { sequence: 1 },
+        ReplicationMessage::ReplicateAck {
+            sequence: 1,
+            applied_offset: 0,
+        },
         ReplicationMessage::ReplicateHeartbeat {
             primary_sequence: 50,
             timestamp_ms: 1_234_567_890,
@@ -1129,7 +1132,7 @@ fn test_manager_replica_stats_empty_when_no_replicas() {
         role: ReplicationRole::Primary,
         ..Default::default()
     };
-    let mgr = ReplicationManager::new(config, engine, shutdown_rx, None);
+    let mgr = ReplicationManager::new(config, engine, shutdown_rx, None, None);
 
     let stats = mgr.replica_stats();
     assert!(stats.is_empty());
@@ -1159,7 +1162,7 @@ fn test_slow_replica_lag_visibility_via_stats() {
             role: ReplicationRole::Primary,
             ..Default::default()
         };
-        let mgr = ReplicationManager::new(config, engine.clone(), shutdown_rx, None);
+        let mgr = ReplicationManager::new(config, engine.clone(), shutdown_rx, None, None);
 
         // Write some entries to primary — they bump next_sequence.
         engine

@@ -2620,7 +2620,7 @@ mod tests {
                 ..Default::default()
             };
             let (_tx, rx) = tokio::sync::broadcast::channel(1);
-            let mgr = ReplicationManager::new(config, handler.engine.clone(), rx, None);
+            let mgr = ReplicationManager::new(config, handler.engine.clone(), rx, None, None);
             handler.set_replication_manager(mgr);
 
             let req = Request::new("1", Operation::ReplicationStatus);

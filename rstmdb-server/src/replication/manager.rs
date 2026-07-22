@@ -13,23 +13,23 @@ use dashmap::DashMap;
 use rstmdb_core::StateMachineEngine;
 use rstmdb_protocol::{Decoder, Encoder};
 use rstmdb_wal::WalOffset;
-use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::io::{split, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::sync::{mpsc, oneshot, Mutex};
+use tokio::sync::{mpsc, Mutex};
 
 /// Information about a connected replica.
 struct ReplicaInfo {
     /// Channel to send entries to this replica's streaming task.
     entry_tx: mpsc::Sender<ReplicationMessage>,
-    /// Last sequence ACKed by this replica.
+    /// Last sequence ACKed by this replica. Kept for lag observability only.
     last_acked_sequence: Arc<AtomicU64>,
-}
-
-/// A pending sync barrier waiting for replica ACKs.
-struct SyncBarrier {
-    senders: Vec<oneshot::Sender<()>>,
+    /// Highest **primary WAL offset** ACKed by this replica. This — not the
+    /// sequence — is what the sync barrier waits on: offsets are monotonic on
+    /// disk and applied in order, so "acked offset >= X" durably covers every
+    /// entry up to X. Sequences can't provide that guarantee under concurrent
+    /// writes (sequence N+1 can land at a lower offset than N).
+    last_acked_offset: Arc<AtomicU64>,
 }
 
 /// Tracks the WAL position the tailer has streamed up to.
@@ -56,12 +56,23 @@ pub struct ReplicationManager {
     engine: Arc<StateMachineEngine>,
     /// Connected replicas by ID.
     replicas: DashMap<String, ReplicaInfo>,
-    /// Sync barriers: sequence -> barrier (used in sync mode).
-    sync_barriers: Mutex<BTreeMap<u64, SyncBarrier>>,
     /// Next replica ID counter.
     next_replica_id: AtomicU64,
     /// WAL tailer position — protected by mutex since only the tailer task writes it.
     tail_position: Mutex<TailPosition>,
+    /// Highest **offset** the tailer has streamed to replicas. The sync barrier
+    /// targets this: once a write's entry has been streamed, this is >= that
+    /// entry's offset, so waiting for replicas to ack up to it durably covers
+    /// the write regardless of sequence/offset non-monotonicity.
+    latest_streamed_offset: AtomicU64,
+    /// Highest **sequence** the tailer has streamed. Used by the barrier to
+    /// confirm a just-made write has actually been picked up by the tailer
+    /// before it samples `latest_streamed_offset`.
+    latest_streamed_sequence: AtomicU64,
+    /// Woken whenever the streamed high-water advances (tailer/catch-up) or a
+    /// replica acks a higher offset. `await_replication` waits on this instead
+    /// of polling, so sync writes complete the instant durability is reached.
+    barrier_notify: tokio::sync::Notify,
     /// Wall-clock timestamp (ms) of the most recently tailed WAL entry.
     /// Used by replicas to compute time-based lag.
     latest_write_ts_ms: AtomicU64,
@@ -74,11 +85,20 @@ pub struct ReplicationManager {
 impl ReplicationManager {
     /// Creates a new replication manager and spawns the WAL tailer.
     /// The tailer stops when the shutdown signal is received.
+    ///
+    /// `fallback_validator` is the server's **client-auth** token validator (or
+    /// `None` if the server requires no client auth). Replication auth resolves
+    /// as: replication-specific tokens if configured, else the client-auth
+    /// validator, else no auth. This ensures replication is never a side-door
+    /// around client auth — if the operator requires client auth but forgets to
+    /// set a replication token, replicas must still authenticate (with client
+    /// credentials) rather than streaming the WAL to anyone.
     pub fn new(
         config: ReplicationConfig,
         engine: Arc<StateMachineEngine>,
         shutdown: tokio::sync::broadcast::Receiver<()>,
         metrics: Option<Arc<Metrics>>,
+        fallback_validator: Option<TokenValidator>,
     ) -> Arc<Self> {
         let last_seq = engine.wal().next_sequence().saturating_sub(1);
         // Initialize to 0 so the very first WAL entry (at segment 1, offset 0
@@ -88,24 +108,32 @@ impl ReplicationManager {
         // filter to skip it forever.
         let next_offset = 0u64;
 
-        // Pre-build the token validator from resolved hashes (plaintext token
-        // is hashed here too). None means no replication auth is required.
+        // Resolve the replication token validator. Replication-specific auth
+        // (plaintext token hashed here too) wins; otherwise fall back to the
+        // server's client-auth validator so replication can never be less
+        // protected than the server's overall auth posture. `None` on both
+        // means the server has no auth at all.
         let token_validator = if config.auth_required() {
             Some(TokenValidator::new(config.resolved_token_hashes()))
         } else {
-            None
+            fallback_validator
         };
 
         let manager = Arc::new(Self {
             config,
             engine,
             replicas: DashMap::new(),
-            sync_barriers: Mutex::new(BTreeMap::new()),
             next_replica_id: AtomicU64::new(1),
             tail_position: Mutex::new(TailPosition {
                 sequence: last_seq,
                 next_offset,
             }),
+            latest_streamed_offset: AtomicU64::new(0),
+            // Starts at 0 (not last_seq): the barrier only trusts offsets that
+            // have actually been streamed, so the tailer/catch-up must advance
+            // this before a write is considered replicated.
+            latest_streamed_sequence: AtomicU64::new(0),
+            barrier_notify: tokio::sync::Notify::new(),
             latest_write_ts_ms: AtomicU64::new(0),
             token_validator,
             metrics,
@@ -133,10 +161,6 @@ impl ReplicationManager {
                 }
             }
 
-            if self.replicas.is_empty() {
-                continue;
-            }
-
             let mut pos = self.tail_position.lock().await;
 
             // Read entries from the segment containing our next-to-tail offset.
@@ -150,6 +174,13 @@ impl ReplicationManager {
                 }
             };
 
+            // Fan out only when replicas are connected — but ALWAYS advance the
+            // tail cursor below, even with no replicas. Otherwise the cursor
+            // would freeze at its old position and a replica that joins later
+            // (after catching up out-of-band) would trigger a full replay of all
+            // history into its bounded channel and overflow it (the H4 hazard).
+            let have_replicas = !self.replicas.is_empty();
+
             for (seq, offset, entry) in entries {
                 // Offsets within a segment are monotonic on disk (each append
                 // appends to the segment tail under segment-mutex). Sequences
@@ -158,116 +189,77 @@ impl ReplicationManager {
                     continue;
                 }
 
-                let now_ms = now_unix_ms();
-                self.latest_write_ts_ms.store(now_ms, Ordering::Release);
+                if have_replicas {
+                    let now_ms = now_unix_ms();
+                    self.latest_write_ts_ms.store(now_ms, Ordering::Release);
 
-                let msg = ReplicationMessage::ReplicateEntry {
-                    sequence: seq,
-                    offset: offset.as_u64(),
-                    entry,
-                    timestamp_ms: now_ms,
-                };
+                    let msg = ReplicationMessage::ReplicateEntry {
+                        sequence: seq,
+                        offset: offset.as_u64(),
+                        entry,
+                        timestamp_ms: now_ms,
+                    };
 
-                // Fan out to all connected replicas. If a replica's channel is
-                // full, it can't keep up — disconnect it so it reconnects and
-                // catches up from WAL instead of silently losing entries.
-                let replica_count = self.replicas.len();
-                let mut slow_replicas: Vec<String> = Vec::new();
-                for replica in self.replicas.iter() {
-                    use tokio::sync::mpsc::error::TrySendError;
-                    match replica.value().entry_tx.try_send(msg.clone()) {
-                        Ok(()) => {}
-                        Err(TrySendError::Full(_)) => {
-                            slow_replicas.push(replica.key().clone());
-                        }
-                        Err(TrySendError::Closed(_)) => {
-                            // Already torn down; reader/writer tasks will clean up.
-                            // Don't warn — this is normal during disconnect.
+                    // Fan out to all connected replicas. If a replica's channel
+                    // is full, it can't keep up with LIVE load — disconnect it so
+                    // it reconnects and catches up from WAL. (Replicas still
+                    // catching up are NOT in this map, so they can't be hit here.)
+                    let replica_count = self.replicas.len();
+                    let mut slow_replicas: Vec<String> = Vec::new();
+                    for replica in self.replicas.iter() {
+                        use tokio::sync::mpsc::error::TrySendError;
+                        match replica.value().entry_tx.try_send(msg.clone()) {
+                            Ok(()) => {}
+                            Err(TrySendError::Full(_)) => {
+                                slow_replicas.push(replica.key().clone());
+                            }
+                            Err(TrySendError::Closed(_)) => {
+                                // Already torn down; reader/writer tasks clean up.
+                            }
                         }
                     }
-                }
 
-                for replica_id in &slow_replicas {
-                    tracing::warn!(
-                        "Replica {} cannot keep up (send channel full at seq={}); \
-                         disconnecting — will catch up from WAL on reconnect",
-                        replica_id,
-                        seq,
-                    );
-                    // Dropping the ReplicaInfo drops its entry_tx sender, which
-                    // causes the writer task's entry_rx.recv() to return None,
-                    // triggering connection teardown.
-                    self.replicas.remove(replica_id);
+                    for replica_id in &slow_replicas {
+                        tracing::warn!(
+                            "Replica {} cannot keep up (send channel full at seq={}); \
+                             disconnecting — will catch up from WAL on reconnect",
+                            replica_id,
+                            seq,
+                        );
+                        self.replicas.remove(replica_id);
+                        if let Some(ref m) = self.metrics {
+                            m.replication_slow_replica_disconnects_total.inc();
+                        }
+                    }
+
+                    // Publish streamed high-water marks for the sync barrier.
+                    self.latest_streamed_offset
+                        .fetch_max(offset.as_u64(), Ordering::AcqRel);
+                    self.latest_streamed_sequence
+                        .fetch_max(seq, Ordering::AcqRel);
+                    self.barrier_notify.notify_waiters();
+
                     if let Some(ref m) = self.metrics {
-                        m.replication_slow_replica_disconnects_total.inc();
+                        m.replication_entries_sent_total.inc();
+                        m.replication_connected_replicas
+                            .set(self.replicas.len() as f64);
                     }
+
+                    tracing::trace!(
+                        "Replicated WAL entry seq={} to {} replica(s) ({} dropped as slow)",
+                        seq,
+                        replica_count - slow_replicas.len(),
+                        slow_replicas.len(),
+                    );
                 }
 
-                // Track highest sequence (logging/metrics) and advance
-                // next_offset past this entry.
+                // Always advance the tail cursor past this entry.
                 if seq > pos.sequence {
                     pos.sequence = seq;
                 }
                 let next = offset.as_u64().saturating_add(1);
                 if next > pos.next_offset {
                     pos.next_offset = next;
-                }
-
-                if let Some(ref m) = self.metrics {
-                    m.replication_entries_sent_total.inc();
-                    m.replication_connected_replicas
-                        .set(self.replicas.len() as f64);
-                }
-
-                tracing::trace!(
-                    "Replicated WAL entry seq={} to {} replica(s) ({} dropped as slow)",
-                    seq,
-                    replica_count - slow_replicas.len(),
-                    slow_replicas.len(),
-                );
-            }
-        }
-    }
-
-    /// Called when a replica ACKs a sequence number.
-    async fn on_ack(&self, replica_id: &str, sequence: u64) {
-        if let Some(replica) = self.replicas.get(replica_id) {
-            replica
-                .last_acked_sequence
-                .fetch_max(sequence, Ordering::Release);
-        }
-        self.check_and_resolve_barriers(sequence).await;
-    }
-
-    /// Checks if enough replicas have ACKed to resolve barriers at or below the given sequence.
-    async fn check_and_resolve_barriers(&self, up_to_sequence: u64) {
-        let required_acks = self.config.sync_replicas as usize;
-
-        let mut barriers = self.sync_barriers.lock().await;
-        let mut resolved_sequences = Vec::new();
-
-        for (&seq, _) in barriers.iter() {
-            if seq > up_to_sequence {
-                break;
-            }
-
-            // Count how many replicas have ACKed >= this sequence
-            let ack_count = self
-                .replicas
-                .iter()
-                .filter(|r| r.last_acked_sequence.load(Ordering::Acquire) >= seq)
-                .count();
-
-            if ack_count >= required_acks {
-                resolved_sequences.push(seq);
-            }
-        }
-
-        // Resolve all satisfied barriers
-        for seq in resolved_sequences {
-            if let Some(barrier) = barriers.remove(&seq) {
-                for sender in barrier.senders {
-                    let _ = sender.send(());
                 }
             }
         }
@@ -331,29 +323,26 @@ impl ReplicationManager {
             primary_sequence
         );
 
-        // Create entry channel for this replica
-        let (entry_tx, mut entry_rx) =
-            mpsc::channel::<ReplicationMessage>(super::REPLICA_CHANNEL_CAPACITY);
-        let last_acked = Arc::new(AtomicU64::new(0));
+        // Shared ACK watermarks, updated by the reader during BOTH catch-up and
+        // live streaming. Created before catch-up (and before the replica joins
+        // the fan-out map) so catch-up ACKs aren't lost — when the replica later
+        // joins the map its offset watermark already reflects catch-up progress,
+        // so a sync barrier can resolve even if no live writes follow.
+        let last_acked_sequence = Arc::new(AtomicU64::new(0));
+        let last_acked_offset = Arc::new(AtomicU64::new(0));
 
-        self.replicas.insert(
-            replica_id.clone(),
-            ReplicaInfo {
-                entry_tx,
-                last_acked_sequence: last_acked.clone(),
-            },
-        );
-
-        // Split the stream BEFORE catchup. The replica ACKs every entry during
-        // catchup; if we don't drain those ACKs concurrently, the primary's TCP
+        // Split the stream BEFORE catch-up. The replica ACKs every entry during
+        // catch-up; if we don't drain those ACKs concurrently, the primary's TCP
         // recv buffer fills (~64KB, ~few thousand ACKs), TCP flow control kicks
-        // in, and the whole catchup stalls mid-way. Spawn the reader up front.
+        // in, and the whole catch-up stalls mid-way. Spawn the reader up front.
         let (mut read_half, mut write_half) = split(stream);
 
-        // Reader task: reads ACKs from replica (must run concurrently with
-        // catchup to avoid the deadlock described above).
+        // Reader task: updates the ACK watermarks and wakes any sync barrier.
+        // It shares the watermark Arcs (not a map lookup) so ACKs are recorded
+        // even while the replica has not yet joined the fan-out map.
         let mgr_reader = self.clone();
-        let rid_reader = replica_id.clone();
+        let ack_seq = last_acked_sequence.clone();
+        let ack_off = last_acked_offset.clone();
         let reader_handle = tokio::spawn(async move {
             let mut decoder = Decoder::new();
             let mut buf = [0u8; super::REPLICATION_READ_BUF_SIZE];
@@ -364,10 +353,18 @@ impl ReplicationManager {
                     Ok(n) => {
                         decoder.extend(&buf[..n]);
                         while let Ok(Some(payload)) = decoder.decode_raw() {
-                            if let Ok(ReplicationMessage::ReplicateAck { sequence }) =
-                                ReplicationMessage::from_bytes(&payload)
+                            if let Ok(ReplicationMessage::ReplicateAck {
+                                sequence,
+                                applied_offset,
+                            }) = ReplicationMessage::from_bytes(&payload)
                             {
-                                mgr_reader.on_ack(&rid_reader, sequence).await;
+                                ack_seq.fetch_max(sequence, Ordering::Release);
+                                if applied_offset > 0 {
+                                    let prev = ack_off.fetch_max(applied_offset, Ordering::Release);
+                                    if applied_offset > prev {
+                                        mgr_reader.barrier_notify.notify_waiters();
+                                    }
+                                }
                             }
                         }
                     }
@@ -376,25 +373,51 @@ impl ReplicationManager {
             }
         });
 
-        // Catch-up: send WAL entries the replica doesn't have yet via the write
-        // half. Prefer offset-based filtering (monotonic on disk) over sequence
-        // (non-monotonic under concurrent writes). Old replicas send
-        // last_primary_offset=0 and we fall back to sequence filtering.
-        let catch_up_result = self
-            .send_catchup(&mut write_half, last_sequence, last_primary_offset)
-            .await;
-
-        match &catch_up_result {
-            Ok(()) => {
-                tracing::info!("Replica {} catch-up complete", replica_id);
-            }
+        // Catch up to the live tail WITHOUT joining the fan-out map, so live
+        // writes during a long catch-up can't overflow a bounded channel and
+        // trigger a spurious slow-replica disconnect (the H4 livelock). Streams
+        // straight from the WAL by offset cursor, looping until it converges.
+        let cursor = match self
+            .catch_up_until_converged(&mut write_half, last_sequence, last_primary_offset)
+            .await
+        {
+            Ok(c) => c,
             Err(e) => {
                 tracing::warn!("Replica {} catch-up failed: {}", replica_id, e);
-                self.replicas.remove(&replica_id);
                 let _ = write_half.shutdown().await;
                 let _ = reader_handle.await;
                 return;
             }
+        };
+        tracing::info!("Replica {} catch-up complete", replica_id);
+
+        // Now caught up: join the fan-out. Live entries flow via the channel; if
+        // this replica can't keep up with LIVE load, the tailer's bounded channel
+        // fills and it's disconnected as genuinely slow (the intended behavior).
+        let (entry_tx, mut entry_rx) =
+            mpsc::channel::<ReplicationMessage>(super::REPLICA_CHANNEL_CAPACITY);
+        self.replicas.insert(
+            replica_id.clone(),
+            ReplicaInfo {
+                entry_tx,
+                last_acked_sequence: last_acked_sequence.clone(),
+                last_acked_offset: last_acked_offset.clone(),
+            },
+        );
+
+        // Gap-fill: entries written between convergence and joining the map are
+        // not in the channel (the tailer fans out only from its current position
+        // onward). Stream anything the WAL has past our cursor; the replica
+        // dedups overlaps with the tailer's live sends by offset.
+        if let Err(e) = self
+            .catch_up_until_converged(&mut write_half, 0, cursor)
+            .await
+        {
+            tracing::warn!("Replica {} gap-fill failed: {}", replica_id, e);
+            self.replicas.remove(&replica_id);
+            let _ = write_half.shutdown().await;
+            let _ = reader_handle.await;
+            return;
         }
 
         // Live streaming loop
@@ -460,37 +483,65 @@ impl ReplicationManager {
         self.replicas.remove(&replica_id);
     }
 
-    /// Sends catch-up entries from the WAL to a newly connected replica.
-    async fn send_catchup<W>(
+    /// Streams catch-up entries to a replica, repeatedly, until it converges on
+    /// the current WAL head — i.e. a pass sends nothing new. Returns the final
+    /// offset cursor reached.
+    ///
+    /// This runs while the replica is NOT in the fan-out map, so live writes
+    /// during a long catch-up cannot overflow a bounded channel and trigger a
+    /// spurious slow-replica disconnect (the H4 livelock). Each pass reads the
+    /// WAL directly, so it is naturally flow-controlled by TCP backpressure.
+    async fn catch_up_until_converged<W>(
         &self,
         stream: &mut W,
         last_sequence: u64,
-        last_primary_offset: u64,
-    ) -> Result<(), std::io::Error>
+        from_offset: u64,
+    ) -> Result<u64, std::io::Error>
     where
         W: AsyncWrite + Unpin,
     {
-        // If the replica provided a primary offset (new protocol), read from
-        // that offset onwards — avoids scanning the entire WAL. Fall back to
-        // reading from 0 for old replicas.
-        let read_from = if last_primary_offset > 0 {
-            WalOffset::from_u64(last_primary_offset)
-        } else {
-            WalOffset::from_u64(0)
-        };
+        let mut cursor = from_offset;
+        loop {
+            let new_cursor = self
+                .send_catchup_pass(stream, last_sequence, cursor)
+                .await?;
+            // No offset advance ⇒ nothing new was sent ⇒ caught up.
+            if new_cursor == cursor {
+                break;
+            }
+            cursor = new_cursor;
+        }
+        Ok(cursor)
+    }
+
+    /// Sends one catch-up pass: every WAL entry after `from_offset` (or, when
+    /// `from_offset == 0`, every entry after `last_sequence` — the legacy
+    /// sequence filter). Returns the highest offset sent, or `from_offset` if
+    /// nothing was sent.
+    async fn send_catchup_pass<W>(
+        &self,
+        stream: &mut W,
+        last_sequence: u64,
+        from_offset: u64,
+    ) -> Result<u64, std::io::Error>
+    where
+        W: AsyncWrite + Unpin,
+    {
         let entries = self
             .engine
             .wal()
-            .read_from(read_from, None)
+            .read_from(WalOffset::from_u64(from_offset), None)
             .map_err(|e| std::io::Error::other(e.to_string()))?;
 
+        let mut max_offset = from_offset;
         let mut sent = 0;
         for (seq, offset, entry) in entries {
-            // Prefer offset filter (monotonic on disk) when the replica sent
-            // one. Sequence filter is legacy-only and doesn't handle
-            // concurrent-write out-of-order sequences.
-            if last_primary_offset > 0 {
-                if offset.as_u64() <= last_primary_offset {
+            let o = offset.as_u64();
+            // Prefer offset filter (monotonic on disk) when we have a cursor.
+            // Sequence filter is legacy-only (replica sent no offset) and
+            // doesn't handle concurrent-write out-of-order sequences.
+            if from_offset > 0 {
+                if o <= from_offset {
                     continue;
                 }
             } else if seq <= last_sequence {
@@ -498,16 +549,25 @@ impl ReplicationManager {
             }
 
             // Catch-up entries have no original write timestamp available, so
-            // we mark them as "now" — meaning the replica will compute lag as
-            // ~0 once it applies them. This is fine because catch-up is a
-            // burst, not ongoing lag.
+            // we mark them as "now" — the replica computes lag as ~0 once it
+            // applies them. Fine, because catch-up is a burst, not ongoing lag.
             let msg = ReplicationMessage::ReplicateEntry {
                 sequence: seq,
-                offset: offset.as_u64(),
+                offset: o,
                 entry,
                 timestamp_ms: now_unix_ms(),
             };
             Self::send_message(stream, &msg).await?;
+            // Catch-up also advances the streamed high-water: a write can reach
+            // replicas via catch-up rather than the live tailer, and the sync
+            // barrier must account for it.
+            self.latest_streamed_offset.fetch_max(o, Ordering::AcqRel);
+            self.latest_streamed_sequence
+                .fetch_max(seq, Ordering::AcqRel);
+            self.barrier_notify.notify_waiters();
+            if o > max_offset {
+                max_offset = o;
+            }
             sent += 1;
         }
 
@@ -516,7 +576,7 @@ impl ReplicationManager {
             tracing::info!("Sent {} catch-up entries to replica", sent);
         }
 
-        Ok(())
+        Ok(max_offset)
     }
 
     /// Sends a single replication message over any async stream using RCPX framing.
@@ -529,11 +589,32 @@ impl ReplicationManager {
         stream.write_all(&frame).await
     }
 
-    /// Waits until the current WAL head sequence has been ACKed by enough replicas,
-    /// or returns an error on timeout. Used by the server for sync replication mode.
+    /// Waits until the current WAL head is durable on enough replicas, or
+    /// returns an error on timeout. Used by the server for sync replication.
+    ///
+    /// Durability is tracked by **offset**, not sequence. Sequences are assigned
+    /// by `fetch_add` before the disk write, so under concurrent writes sequence
+    /// N+1 can land at a lower offset than N. A replica acking a sequence at or
+    /// above the head therefore does NOT imply it has applied every entry the
+    /// primary has — a lower-sequence, higher-offset write can still be missing.
+    /// Offsets are monotonic on disk and applied in order, so a replica acking
+    /// an offset at or above the target durably covers everything up to it.
+    ///
+    /// Two phases: (1) wait for the tailer/catch-up to have streamed our write
+    /// (by sequence), so the streamed-offset high-water includes it; then
+    /// (2) wait for `sync_replicas` replicas to ack an offset at or above that
+    /// high-water. Both phases wait on `barrier_notify` (woken by the tailer,
+    /// catch-up, and acks) rather than polling.
+    ///
+    /// Note on compatibility: a legacy replica that acks with `applied_offset =
+    /// 0` (pre-upgrade wire format) cannot advance the offset barrier and so
+    /// cannot count toward a sync quorum — the write will time out. This is the
+    /// safe outcome (we cannot prove durability by offset for such a replica),
+    /// but it means sync mode requires offset-aware replicas; during a rolling
+    /// upgrade, sync writes may time out until replicas are upgraded.
     pub async fn await_replication(&self) -> Result<(), String> {
-        let sequence = self.engine.wal().next_sequence().saturating_sub(1);
-        if sequence == 0 {
+        let head_sequence = self.engine.wal().next_sequence().saturating_sub(1);
+        if head_sequence == 0 {
             return Ok(());
         }
 
@@ -541,46 +622,53 @@ impl ReplicationManager {
             return Err("no replicas connected for sync replication".to_string());
         }
 
-        // Check if already satisfied
-        let ack_count = self
-            .replicas
-            .iter()
-            .filter(|r| r.last_acked_sequence.load(Ordering::Acquire) >= sequence)
-            .count();
-        if ack_count >= self.config.sync_replicas as usize {
-            return Ok(());
-        }
-
-        // Create barrier
-        let (tx, rx) = oneshot::channel();
-        {
-            let mut barriers = self.sync_barriers.lock().await;
-            let barrier = barriers.entry(sequence).or_insert_with(|| SyncBarrier {
-                senders: Vec::new(),
-            });
-            barrier.senders.push(tx);
-        }
-
-        // Re-check after registering (race with ACKs arriving)
-        self.check_and_resolve_barriers(sequence).await;
-
-        // Wait with timeout
+        let required_acks = self.config.sync_replicas as usize;
         let timeout = self.config.sync_timeout();
-        match tokio::time::timeout(timeout, rx).await {
-            Ok(Ok(())) => Ok(()),
-            Ok(Err(_)) => Err("sync barrier dropped".to_string()),
-            Err(_) => {
-                // Timeout — clean up barrier
-                let mut barriers = self.sync_barriers.lock().await;
-                barriers.remove(&sequence);
 
+        let waited = tokio::time::timeout(timeout, async {
+            // Phase 1: ensure our write has actually been streamed, so the
+            // offset high-water reflects it (regardless of seq/offset ordering).
+            loop {
+                // Register interest BEFORE checking, so a notify that fires
+                // between the check and the await is not lost.
+                let notified = self.barrier_notify.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                if self.latest_streamed_sequence.load(Ordering::Acquire) >= head_sequence {
+                    break;
+                }
+                notified.await;
+            }
+            // Every entry up to our write now has offset <= this high-water.
+            let target_offset = self.latest_streamed_offset.load(Ordering::Acquire);
+
+            // Phase 2: wait for enough replicas to durably cover `target_offset`.
+            loop {
+                let notified = self.barrier_notify.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                let ack_count = self
+                    .replicas
+                    .iter()
+                    .filter(|r| r.last_acked_offset.load(Ordering::Acquire) >= target_offset)
+                    .count();
+                if ack_count >= required_acks {
+                    return target_offset;
+                }
+                notified.await;
+            }
+        })
+        .await;
+
+        match waited {
+            Ok(_target) => Ok(()),
+            Err(_) => {
                 if let Some(ref m) = self.metrics {
                     m.replication_sync_timeouts_total.inc();
                 }
-
                 Err(format!(
-                    "sync replication timeout after {}ms (sequence={}, need {} ACKs)",
-                    self.config.sync_timeout_ms, sequence, self.config.sync_replicas
+                    "sync replication timeout after {}ms (head_sequence={}, need {} ACKs)",
+                    self.config.sync_timeout_ms, head_sequence, self.config.sync_replicas
                 ))
             }
         }
@@ -599,6 +687,18 @@ impl ReplicationManager {
     /// Returns the replication config.
     pub fn config(&self) -> &ReplicationConfig {
         &self.config
+    }
+
+    /// Highest WAL offset the tailer/catch-up has streamed to replicas. Exposed
+    /// for observability and tests that need to know a specific write has been
+    /// fanned out (its offset now contributes to the sync barrier target).
+    pub fn latest_streamed_offset(&self) -> u64 {
+        self.latest_streamed_offset.load(Ordering::Acquire)
+    }
+
+    /// Highest WAL sequence the tailer/catch-up has streamed to replicas.
+    pub fn latest_streamed_sequence(&self) -> u64 {
+        self.latest_streamed_sequence.load(Ordering::Acquire)
     }
 
     /// Returns per-replica stats: `(replica_id, last_acked_sequence, lag_entries)`.

@@ -9,6 +9,12 @@ readme = "README.md"
 keywords = ["wal", "write-ahead-log", "database", "durability"]
 categories = ["database"]
 
+[features]
+# Enables test-only append hooks used to force specific write interleavings
+# (e.g. non-monotonic sequence/offset ordering) in deterministic tests. Never
+# enabled in production builds — carries zero cost when off.
+test-hooks = []
+
 [dependencies]
 thiserror.workspace = true
 bytes.workspace = true
