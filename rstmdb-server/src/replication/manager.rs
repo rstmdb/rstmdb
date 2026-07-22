@@ -328,8 +328,15 @@ impl ReplicationManager {
         // the fan-out map) so catch-up ACKs aren't lost — when the replica later
         // joins the map its offset watermark already reflects catch-up progress,
         // so a sync barrier can resolve even if no live writes follow.
-        let last_acked_sequence = Arc::new(AtomicU64::new(0));
-        let last_acked_offset = Arc::new(AtomicU64::new(0));
+        //
+        // Seed them with the position the replica reported in its handshake: a
+        // reconnecting replica that is already caught up sends no ACKs (there's
+        // nothing to re-stream), so starting from 0 would leave it looking
+        // permanently lagged (`lag = primary_seq - 0`) even though it holds all
+        // the data. Seeding from the handshake reflects what the replica already
+        // has; subsequent ACKs only advance it.
+        let last_acked_sequence = Arc::new(AtomicU64::new(last_sequence));
+        let last_acked_offset = Arc::new(AtomicU64::new(last_primary_offset));
 
         // Split the stream BEFORE catch-up. The replica ACKs every entry during
         // catch-up; if we don't drain those ACKs concurrently, the primary's TCP
@@ -409,8 +416,17 @@ impl ReplicationManager {
         // not in the channel (the tailer fans out only from its current position
         // onward). Stream anything the WAL has past our cursor; the replica
         // dedups overlaps with the tailer's live sends by offset.
+        //
+        // Pass the ORIGINAL `last_sequence` (not 0): when the replica sent
+        // `last_primary_offset == 0` (e.g. after a restart), the first pass
+        // filtered by sequence and left `cursor == 0`, so the gap-fill would run
+        // the sequence filter too. With `last_sequence == 0` it would match
+        // `seq <= 0` (nothing), re-streaming the ENTIRE WAL every restart —
+        // re-applying every entry and bloating the replica's WAL. Using the
+        // replica's real `last_sequence` keeps the seq filter correct, and when
+        // `cursor > 0` the offset filter is used and `last_sequence` is ignored.
         if let Err(e) = self
-            .catch_up_until_converged(&mut write_half, 0, cursor)
+            .catch_up_until_converged(&mut write_half, last_sequence, cursor)
             .await
         {
             tracing::warn!("Replica {} gap-fill failed: {}", replica_id, e);

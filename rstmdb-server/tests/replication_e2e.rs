@@ -1091,6 +1091,105 @@ async fn e2e_replica_wal_persists_across_restart() {
 }
 
 // =========================================================================
+// Restart efficiency: a caught-up replica must NOT re-stream/re-apply its
+// whole WAL on restart, and the primary's lag stats must be correct
+// immediately (regression guard for the catch-up gap-fill + ack-seed logic).
+// =========================================================================
+
+#[tokio::test]
+async fn e2e_replica_restart_no_reapply_and_correct_lag() {
+    let mut cluster = Cluster::spawn(0).await;
+
+    cluster
+        .primary
+        .engine
+        .put_machine("order", 1, &order_machine_def())
+        .unwrap();
+    for i in 0..20 {
+        cluster
+            .primary
+            .engine
+            .create_instance(&format!("i-{}", i), "order", 1, json!({}), None)
+            .unwrap();
+    }
+
+    // Attach a replica on a persistent WAL dir and let it fully converge.
+    let persistent = tempfile::TempDir::new().unwrap();
+    let primary_addr = cluster.primary.addr;
+    cluster.replicas.push(
+        Cluster::spawn_replica_with(
+            primary_addr,
+            ReplicaOpts {
+                wal_dir: Some(persistent.path().to_path_buf()),
+                ..Default::default()
+            },
+        )
+        .await,
+    );
+    cluster
+        .wait_for_replica_count(1, Duration::from_secs(5))
+        .await;
+    cluster.wait_converged(Duration::from_secs(5)).await;
+    cluster.wait_acks_caught_up(Duration::from_secs(5)).await;
+
+    let entries_before = cluster.replicas[0]
+        .engine
+        .wal()
+        .next_sequence()
+        .saturating_sub(1);
+    assert_eq!(entries_before, 21, "expected 1 machine + 20 instances");
+
+    // "Restart" the replica on the SAME WAL dir.
+    let dead = cluster.replicas.pop().unwrap();
+    let _ = dead.shutdown_tx.send(());
+    drop(dead);
+    cluster
+        .wait_for_replica_count(0, Duration::from_secs(5))
+        .await;
+    cluster.replicas.push(
+        Cluster::spawn_replica_with(
+            primary_addr,
+            ReplicaOpts {
+                wal_dir: Some(persistent.path().to_path_buf()),
+                ..Default::default()
+            },
+        )
+        .await,
+    );
+    cluster
+        .wait_for_replica_count(1, Duration::from_secs(5))
+        .await;
+    // Give the primary a chance to (wrongly) re-stream if the bug were present.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // No re-apply: the replica's WAL must NOT have grown. The bug re-streamed
+    // the entire WAL on every restart, doubling the replica's local WAL.
+    let entries_after = cluster.replicas[0]
+        .engine
+        .wal()
+        .next_sequence()
+        .saturating_sub(1);
+    assert_eq!(
+        entries_after, entries_before,
+        "replica re-applied its WAL on restart (bloat): {} -> {}",
+        entries_before, entries_after
+    );
+
+    // Correct stats: the primary must report lag 0 for the already-caught-up
+    // replica, not a stale full-lag from an ACK watermark reset to 0.
+    cluster.wait_acks_caught_up(Duration::from_secs(3)).await;
+    let stats = cluster.primary.manager.replica_stats();
+    assert_eq!(stats.len(), 1);
+    assert_eq!(
+        stats[0].2, 0,
+        "primary reports non-zero lag for a caught-up restarted replica: {:?}",
+        stats
+    );
+
+    cluster.shutdown();
+}
+
+// =========================================================================
 // Idempotency: same idempotency_key across writes
 // =========================================================================
 
