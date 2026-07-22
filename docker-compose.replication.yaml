@@ -42,7 +42,7 @@ services:
       RSTMDB_REPL_AUTH_TOKEN_HASH: "acbbe5ae3f2637d9e80ff79de0f379252df03b174797f9a9cc21790568281b13"
       RSTMDB_METRICS_ENABLED: "true"
       RSTMDB_METRICS_BIND: "0.0.0.0:9090"
-      RSTMDB_ALLOW_FLUSH_ALL: "true"
+      RSTMDB_ALLOW_FLUSH_ALL: "false"
     healthcheck:
       test: ["CMD", "rstmdb-cli", "-s", "127.0.0.1:7401", "ping"]
       interval: 10s
@@ -131,9 +131,9 @@ services:
     ports:
       - "9093:9090"
     command:
-      - '--config.file=/etc/prometheus/prometheus.yml'
-      - '--storage.tsdb.path=/prometheus'
-      - '--web.enable-lifecycle'
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--web.enable-lifecycle"
     depends_on:
       - primary
       - replica1
