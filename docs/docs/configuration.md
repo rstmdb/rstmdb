@@ -50,7 +50,9 @@ storage:
   # Allow re-creating instances after deletion with the same ID
   allow_instance_recreate: true
 
-  # Allow the FLUSH_ALL operation to clear all data (disabled by default)
+  # Allow the FLUSH_ALL operation to clear all data (disabled by default).
+  # Must be false when replication is enabled — FLUSH_ALL does not replicate and
+  # would diverge the cluster, so the server refuses to start with both set.
   allow_flush_all: false
 
 # Authentication settings

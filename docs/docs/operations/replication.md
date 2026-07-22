@@ -318,12 +318,35 @@ Pair this with the bundled Grafana dashboard (`grafana/dashboards/rstmdb.json`) 
 - Give replicas the **same or better I/O** than the primary. A replica slower than the primary will always lag.
 - Replica `data_dir` should never be shared with the primary — each node needs its own WAL.
 
+## FLUSH_ALL and replication
+
+`FLUSH_ALL` clears all instances and machine definitions, but it is **not a replicated operation**. In a replicated cluster it is unsafe:
+
+- On a **primary**, the flush clears the primary's in-memory state while replicas keep the old data — the cluster silently diverges (replicas hold instances the primary no longer has).
+- On a **replica**, it is a local-only mutation that breaks WAL parity with the primary.
+
+Because of this, the server **refuses to start** when `storage.allow_flush_all: true` is combined with any replication role (`primary` or `replica`) — even if you set the flag explicitly:
+
+```text
+Configuration error: storage.allow_flush_all=true is not permitted when replication
+is enabled (replication.role=Primary). FLUSH_ALL does not replicate and would diverge
+the cluster; set storage.allow_flush_all=false, or run replication.role=standalone.
+```
+
+To resolve:
+
+- Keep `storage.allow_flush_all: false` on every primary and replica (this is the default), **or**
+- Run the node as `replication.role: standalone` if you genuinely need `FLUSH_ALL` (e.g. a local dev instance).
+
+To reset a replicated cluster, stop all nodes, delete each node's `data_dir`, and restart — do not rely on `FLUSH_ALL`.
+
 ## Limitations
 
 - **Single primary** — no automatic failover or leader election. This is deferred to Phase 3 (Raft consensus) because safe promotion without a consensus layer requires external fencing to avoid split-brain.
 - **No in-band promotion** — a running replica cannot be promoted to primary at runtime. To change roles today, operators must **(a)** fence the old primary (stop it / drop its network / revoke its writes), **(b)** stop the chosen replica, **(c)** restart it with `replication.role: primary` in its config, and **(d)** update every other replica's `replication.upstream` to point at the new primary and restart them. There is no built-in orchestration for this — use your own runbook or scheduler (Kubernetes StatefulSet, systemd, etc.).
 - **Split-brain risk during partition** — if the old primary is alive but unreachable from the replicas, promoting a replica without fencing the old primary produces two writers. Both accept writes and diverge. Always fence first.
 - **No partial replication** — every replica mirrors the entire dataset; no per-machine sharding.
+- **`FLUSH_ALL` is not available with replication** — the operation is not replicated, so it would clear the primary while leaving replicas holding the old data (silent divergence). The server therefore **refuses to start** if `storage.allow_flush_all: true` is combined with any replication role. See [`FLUSH_ALL` and replication](#flush_all-and-replication) below.
 
 See the [roadmap](../roadmap) for the planned failover work (Phase 2 hooks, Phase 3 Raft).
 

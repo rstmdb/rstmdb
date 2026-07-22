@@ -392,6 +392,10 @@ Database flushed
 This is a destructive operation that removes all in-memory state. It does not clear the WAL — use `compact` after `flush-all` for a full reset. This command is disabled by default and must be explicitly enabled in the server configuration.
 :::
 
+:::danger Not available with replication
+`FLUSH_ALL` does not replicate and would diverge a cluster, so `storage.allow_flush_all: true` cannot be combined with a `primary` or `replica` role — the server refuses to start. It works only on `standalone` nodes. See [FLUSH_ALL and replication](./operations/replication#flush_all-and-replication).
+:::
+
 ---
 
 ## Environment Variables
