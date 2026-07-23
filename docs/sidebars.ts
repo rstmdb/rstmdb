@@ -50,6 +50,7 @@ const sidebars: SidebarsConfig = {
         'operations/monitoring',
         'operations/backup-recovery',
         'operations/security',
+        'operations/replication',
       ],
     },
     {
@@ -62,6 +63,7 @@ const sidebars: SidebarsConfig = {
         'clients/go',
         'clients/typescript',
         'clients/csharp',
+        'clients/java',
       ],
     },
     'roadmap',

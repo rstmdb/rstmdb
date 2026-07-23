@@ -67,6 +67,23 @@ pub struct Metrics {
     pub wal_fsyncs_total: Counter,
     /// Last reported WAL stats (for computing counter deltas).
     last_wal_stats: Arc<Mutex<WalStats>>,
+    /// Replication lag in entries (per replica for primary, single value for replica).
+    pub replication_lag_entries: Gauge,
+    /// Replication lag in seconds.
+    pub replication_lag_seconds: Gauge,
+    /// Number of connected replicas (primary only).
+    pub replication_connected_replicas: Gauge,
+    /// Total replication entries sent (primary only).
+    pub replication_entries_sent_total: Counter,
+    /// Total sync replication timeouts (primary only).
+    pub replication_sync_timeouts_total: Counter,
+    /// Total times a replica was disconnected because its send channel filled
+    /// up (slow replica). The replica will catch up from WAL on reconnect.
+    pub replication_slow_replica_disconnects_total: Counter,
+    /// Per-replica lag in entries (primary only), labeled by replica_id.
+    pub replication_replica_lag_entries: GaugeVec,
+    /// Per-replica last-acked sequence (primary only), labeled by replica_id.
+    pub replication_replica_last_acked_sequence: GaugeVec,
 }
 
 impl Metrics {
@@ -200,6 +217,61 @@ impl Metrics {
         ))?;
         registry.register(Box::new(wal_fsyncs_total.clone()))?;
 
+        // Replication metrics
+        let replication_lag_entries = Gauge::with_opts(Opts::new(
+            "rstmdb_replication_lag_entries",
+            "Replication lag in entries",
+        ))?;
+        registry.register(Box::new(replication_lag_entries.clone()))?;
+
+        let replication_lag_seconds = Gauge::with_opts(Opts::new(
+            "rstmdb_replication_lag_seconds",
+            "Replication lag in seconds",
+        ))?;
+        registry.register(Box::new(replication_lag_seconds.clone()))?;
+
+        let replication_connected_replicas = Gauge::with_opts(Opts::new(
+            "rstmdb_replication_connected_replicas",
+            "Number of connected replicas",
+        ))?;
+        registry.register(Box::new(replication_connected_replicas.clone()))?;
+
+        let replication_entries_sent_total = Counter::with_opts(Opts::new(
+            "rstmdb_replication_entries_sent_total",
+            "Total replication entries sent to replicas",
+        ))?;
+        registry.register(Box::new(replication_entries_sent_total.clone()))?;
+
+        let replication_sync_timeouts_total = Counter::with_opts(Opts::new(
+            "rstmdb_replication_sync_timeouts_total",
+            "Total sync replication timeouts",
+        ))?;
+        registry.register(Box::new(replication_sync_timeouts_total.clone()))?;
+
+        let replication_slow_replica_disconnects_total = Counter::with_opts(Opts::new(
+            "rstmdb_replication_slow_replica_disconnects_total",
+            "Total times a replica was disconnected due to a full send channel (slow replica)",
+        ))?;
+        registry.register(Box::new(replication_slow_replica_disconnects_total.clone()))?;
+
+        let replication_replica_lag_entries = GaugeVec::new(
+            Opts::new(
+                "rstmdb_replication_replica_lag_entries",
+                "Per-replica lag in entries (primary side), labeled by replica_id",
+            ),
+            &["replica_id"],
+        )?;
+        registry.register(Box::new(replication_replica_lag_entries.clone()))?;
+
+        let replication_replica_last_acked_sequence = GaugeVec::new(
+            Opts::new(
+                "rstmdb_replication_replica_last_acked_sequence",
+                "Per-replica last-acked WAL sequence (primary side), labeled by replica_id",
+            ),
+            &["replica_id"],
+        )?;
+        registry.register(Box::new(replication_replica_last_acked_sequence.clone()))?;
+
         Ok(Self {
             registry,
             connections_total,
@@ -220,6 +292,14 @@ impl Metrics {
             wal_reads_total,
             wal_fsyncs_total,
             last_wal_stats: Arc::new(Mutex::new(WalStats::default())),
+            replication_lag_entries,
+            replication_lag_seconds,
+            replication_connected_replicas,
+            replication_entries_sent_total,
+            replication_sync_timeouts_total,
+            replication_slow_replica_disconnects_total,
+            replication_replica_lag_entries,
+            replication_replica_last_acked_sequence,
         })
     }
 
@@ -271,6 +351,54 @@ impl Metrics {
     /// Returns a reference to the registry.
     pub fn registry(&self) -> &Registry {
         &self.registry
+    }
+}
+
+/// Refreshes engine-derived gauge metrics (instance count, machine count,
+/// WAL entries/segments/size, WAL I/O counters) from the current engine state.
+///
+/// This is safe to call from any thread. The primary also updates these
+/// from write handlers, but replicas only receive data via
+/// `apply_replicated_entry` — which doesn't update gauges — so a periodic
+/// refresher is needed to keep replica-side metrics accurate.
+pub fn refresh_engine_gauges(engine: &rstmdb_core::StateMachineEngine, metrics: &Metrics) {
+    let instances = engine.get_all_instances();
+    metrics.instances_total.set(instances.len() as f64);
+
+    let machines = engine.list_machines();
+    let machine_count: usize = machines.values().map(|v| v.len()).sum();
+    metrics.machines_total.set(machine_count as f64);
+
+    let wal = engine.wal();
+    // next_sequence is 1-based; subtract 1 to get actual entry count
+    let entry_count = wal.next_sequence().saturating_sub(1);
+    metrics.wal_entries.set(entry_count as f64);
+    metrics.wal_segments.set(wal.segment_ids().len() as f64);
+    metrics.wal_size_bytes.set(wal.total_size() as f64);
+
+    metrics.update_wal_stats(wal.stats());
+}
+
+/// Runs a periodic gauge refresher task. Call this from main.rs when metrics
+/// are enabled — it ensures WAL/instance/machine gauges reflect current state
+/// even on read-only replicas (which don't trigger write-path gauge updates).
+pub async fn run_gauge_refresher(
+    engine: std::sync::Arc<rstmdb_core::StateMachineEngine>,
+    metrics: std::sync::Arc<Metrics>,
+    interval: std::time::Duration,
+    mut shutdown: tokio::sync::broadcast::Receiver<()>,
+) {
+    let mut ticker = tokio::time::interval(interval);
+    loop {
+        tokio::select! {
+            _ = ticker.tick() => {
+                refresh_engine_gauges(&engine, &metrics);
+            }
+            _ = shutdown.recv() => {
+                tracing::info!("Gauge refresher shutting down");
+                return;
+            }
+        }
     }
 }
 

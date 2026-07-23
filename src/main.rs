@@ -3,8 +3,10 @@
 //! A TCP-based state machine database with WAL durability and snapshot compaction.
 
 use rstmdb_core::StateMachineEngine;
+use rstmdb_server::auth::TokenValidator;
 use rstmdb_server::{
-    run_metrics_server, tls, CompactionManager, Config, Metrics, Server, ServerConfig,
+    run_metrics_server, tls, CompactionManager, Config, Metrics, ReplicaClient, ReplicationManager,
+    ReplicationRole, Server, ServerConfig,
 };
 use rstmdb_storage::SnapshotStore;
 use rstmdb_wal::{FsyncPolicy, WalConfig};
@@ -50,6 +52,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err(e.into());
     }
 
+    // Load replication auth secrets from external file if configured
+    if let Err(e) = config.replication.load_secrets() {
+        tracing::error!("Failed to load replication auth secrets: {}", e);
+        return Err(e.into());
+    }
+
     tracing::info!("Starting rstmdb server");
     tracing::info!("  Bind address: {}", config.network.bind_addr);
     tracing::info!("  Data directory: {}", config.storage.data_dir.display());
@@ -78,6 +86,57 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Err(e) = config.tls.validate() {
         tracing::error!("TLS configuration error: {}", e);
         return Err(e.into());
+    }
+
+    // Validate and log replication config
+    if let Err(e) = config.replication.validate() {
+        tracing::error!("Replication configuration error: {}", e);
+        return Err(e.into());
+    }
+
+    // Validate cross-section constraints (e.g. FLUSH_ALL vs replication).
+    if let Err(e) = config.validate() {
+        tracing::error!("Configuration error: {}", e);
+        return Err(e.into());
+    }
+
+    // Warn if a plaintext replication token is configured
+    if config.replication.auth_token.is_some() {
+        tracing::warn!(
+            "replication.auth_token is set in plaintext — prefer replication.auth_token_hashes \
+             (generate with: rstmdb-cli hash-token <token>) or replication.auth_secrets_file"
+        );
+    }
+
+    match config.replication.role {
+        ReplicationRole::Primary => {
+            let auth_state = if config.replication.auth_required() {
+                format!(
+                    "auth: {} hash(es)",
+                    config.replication.resolved_token_hashes().len()
+                )
+            } else {
+                "auth: disabled".to_string()
+            };
+            tracing::info!(
+                "  Replication: primary ({} mode, {})",
+                if config.replication.mode == rstmdb_server::ReplicationMode::Sync {
+                    "sync"
+                } else {
+                    "async"
+                },
+                auth_state,
+            );
+        }
+        ReplicationRole::Replica => {
+            tracing::info!(
+                "  Replication: replica (upstream: {})",
+                config.replication.upstream.as_deref().unwrap_or("?")
+            );
+        }
+        ReplicationRole::Standalone => {
+            tracing::info!("  Replication: standalone (disabled)");
+        }
     }
 
     let tls_acceptor = if config.tls.enabled {
@@ -137,18 +196,47 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     server_config.auth_required = config.auth.required;
     server_config.max_machine_versions = config.storage.max_machine_versions;
     server_config.allow_flush_all = config.storage.allow_flush_all;
+    server_config.read_only = config.replication.is_replica();
     if let Some(acceptor) = tls_acceptor {
         server_config = server_config.with_tls(acceptor);
     }
     if let Some(ref m) = metrics {
         server_config = server_config.with_metrics(m.clone());
     }
-    let server = Arc::new(Server::with_snapshots_and_auth(
+    let mut server = Server::with_snapshots_and_auth(
         server_config,
         engine.clone(),
         &snapshot_dir,
         &config.auth,
-    )?);
+    )?;
+
+    // Set up replication based on role
+    let _replication_manager = if config.replication.is_primary() {
+        let repl_shutdown = server.subscribe_shutdown();
+        // Client-auth validator, used as the replication fallback so an
+        // operator who enables client auth but forgets a replication token
+        // doesn't leave replication as an unauthenticated side-door. Built even
+        // when token_hashes is empty (required but misconfigured) so it fails
+        // closed rather than open.
+        let fallback_validator = if config.auth.required {
+            Some(TokenValidator::new(config.auth.token_hashes.clone()))
+        } else {
+            None
+        };
+        let mgr = ReplicationManager::new(
+            config.replication.clone(),
+            engine.clone(),
+            repl_shutdown,
+            metrics.clone(),
+            fallback_validator,
+        );
+        server.set_replication_manager(mgr.clone());
+        Some(mgr)
+    } else {
+        None
+    };
+
+    let server = Arc::new(server);
 
     // Create and start compaction manager
     let compaction_manager = Arc::new(CompactionManager::new(
@@ -157,8 +245,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.compaction.clone(),
     ));
 
+    // Replicas should not run compaction — it's a write operation that produces
+    // snapshot files and could interact with WAL replay on restart. Compaction
+    // is the primary's responsibility; replicas can reset or be rebuilt if disk
+    // usage becomes a concern.
+    let compaction_enabled = !config.replication.is_replica();
+
     // Log compaction config
-    if config.compaction.is_disabled() {
+    if !compaction_enabled {
+        tracing::info!("  Auto-compaction: disabled (replica mode)");
+    } else if config.compaction.is_disabled() {
         tracing::info!("  Auto-compaction: disabled");
     } else {
         tracing::info!(
@@ -168,12 +264,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    // Spawn compaction manager
-    let compaction_handle = {
+    // Spawn compaction manager (primary/standalone only)
+    let compaction_handle = if compaction_enabled {
         let cm = compaction_manager.clone();
-        tokio::spawn(async move {
+        Some(tokio::spawn(async move {
             cm.run().await;
-        })
+        }))
+    } else {
+        None
+    };
+
+    // Spawn replica client if in replica mode
+    let replica_handle = if config.replication.is_replica() {
+        let upstream = config.replication.upstream.clone().unwrap();
+        let auth_token = config.replication.auth_token.clone();
+        let replica_client = Arc::new(
+            ReplicaClient::new(
+                config.replication.clone(),
+                engine.clone(),
+                upstream,
+                auth_token,
+            )
+            .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?,
+        );
+        // Give the server's handler a handle so `REPLICATION_STATUS` requests
+        // can read this replica's lag.
+        server.set_replica_client(replica_client.clone());
+        let shutdown_rx = server.subscribe_shutdown();
+        let client_for_task = replica_client.clone();
+        Some(tokio::spawn(async move {
+            client_for_task.run(shutdown_rx).await;
+        }))
+    } else {
+        None
     };
 
     // Spawn metrics server if enabled
@@ -185,6 +308,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             if let Err(e) = run_metrics_server(metrics_addr, metrics_clone, shutdown_rx).await {
                 tracing::error!("Metrics server error: {}", e);
             }
+        }))
+    } else {
+        None
+    };
+
+    // Spawn periodic gauge refresher so WAL/instance/machine gauges stay
+    // accurate on read-only replicas (which don't trigger write-path updates)
+    // and to pick up any changes the write handlers missed.
+    let gauge_refresher_handle = if let (Some(ref m), Some(ref tx)) = (&metrics, &shutdown_tx) {
+        let engine_clone = engine.clone();
+        let metrics_clone = m.clone();
+        let shutdown_rx = tx.subscribe();
+        Some(tokio::spawn(async move {
+            rstmdb_server::metrics::run_gauge_refresher(
+                engine_clone,
+                metrics_clone,
+                std::time::Duration::from_secs(5),
+                shutdown_rx,
+            )
+            .await;
         }))
     } else {
         None
@@ -207,11 +350,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Run server (blocks until shutdown)
     server.run().await?;
 
-    // Wait for compaction manager to stop
-    let _ = compaction_handle.await;
+    // Wait for compaction manager to stop (if it was spawned)
+    if let Some(handle) = compaction_handle {
+        let _ = handle.await;
+    }
 
     // Wait for metrics server to stop
     if let Some(handle) = metrics_handle {
+        let _ = handle.await;
+    }
+
+    // Wait for replica client to stop
+    if let Some(handle) = replica_handle {
+        let _ = handle.await;
+    }
+
+    // Wait for gauge refresher to stop
+    if let Some(handle) = gauge_refresher_handle {
         let _ = handle.await;
     }
 

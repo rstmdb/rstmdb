@@ -287,6 +287,10 @@ Clears all instances and machine definitions from the database. This is a destru
 This operation is **disabled by default**. Set `storage.allow_flush_all: true` in the server configuration to enable it. Recommended only for development and testing environments.
 :::
 
+:::danger Not available with replication
+`FLUSH_ALL` is **not a replicated operation** — it would clear the primary while leaving replicas holding the old data (silent divergence). The server **refuses to start** if `storage.allow_flush_all: true` is combined with any replication role (`primary` or `replica`). It is only permitted on a `standalone` node. See [FLUSH_ALL and replication](../operations/replication#flush_all-and-replication).
+:::
+
 ### Request
 
 ```json
@@ -340,6 +344,7 @@ export RSTMDB_ALLOW_FLUSH_ALL=true
 - Does not clear the WAL — historical entries remain on disk
 - After flush, machines must be re-registered before creating new instances
 - Run `COMPACT` after `FLUSH_ALL` for a complete reset including WAL cleanup
+- **Only available on `standalone` nodes** — enabling it alongside a `primary` or `replica` role prevents the server from starting (see the danger note above)
 
 ---
 

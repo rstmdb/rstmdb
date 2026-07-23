@@ -20,6 +20,11 @@ pub async fn execute(client: &Client, cmd: Commands) -> Result<String, Box<dyn s
             Ok(format_json(&info))
         }
 
+        Commands::ReplicationStatus => {
+            let status = client.replication_status().await?;
+            Ok(format_replication_status(&status))
+        }
+
         Commands::PutMachine {
             name,
             version,
@@ -313,4 +318,87 @@ fn parse_json_arg(arg: &str) -> Result<Value, Box<dyn std::error::Error>> {
 /// Formats JSON for display.
 fn format_json(value: &Value) -> String {
     serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string())
+}
+
+/// Formats the REPLICATION_STATUS response as a colored, aligned table.
+/// Shape switches on the `role` field: standalone / primary / replica.
+fn format_replication_status(status: &Value) -> String {
+    let role = status["role"].as_str().unwrap_or("unknown");
+    match role {
+        "standalone" => format!("{}", "Server is not configured for replication".yellow()),
+        "primary" => {
+            let mode = status["mode"].as_str().unwrap_or("?");
+            let primary_seq = status["primary_sequence"].as_u64().unwrap_or(0);
+            let connected = status["connected_replicas"].as_u64().unwrap_or(0);
+            let replicas = status["replicas"].as_array();
+
+            let mut out = String::new();
+            out.push_str(&format!("{}\n", "Replication status".bold()));
+            out.push_str(&format!("  Role:                {}\n", "primary".cyan()));
+            out.push_str(&format!("  Mode:                {}\n", mode));
+            out.push_str(&format!("  Primary sequence:    {}\n", primary_seq));
+            out.push_str(&format!("  Connected replicas:  {}\n", connected));
+            out.push('\n');
+
+            match replicas {
+                Some(list) if !list.is_empty() => {
+                    out.push_str(&format!(
+                        "  {:<20} {:>14} {:>14}\n",
+                        "REPLICA-ID".bold(),
+                        "LAST-ACKED".bold(),
+                        "LAG-ENTRIES".bold()
+                    ));
+                    for r in list {
+                        let id = r["replica_id"].as_str().unwrap_or("?");
+                        let acked = r["last_acked_sequence"].as_u64().unwrap_or(0);
+                        let lag = r["lag_entries"].as_u64().unwrap_or(0);
+                        let lag_str = if lag == 0 {
+                            lag.to_string().green()
+                        } else {
+                            lag.to_string().yellow()
+                        };
+                        out.push_str(&format!(
+                            "  {:<20} {:>14} {:>14}\n",
+                            id.cyan(),
+                            acked,
+                            lag_str
+                        ));
+                    }
+                }
+                _ => {
+                    out.push_str(&format!("  {}\n", "(no replicas connected)".dimmed()));
+                }
+            }
+            out
+        }
+        "replica" => {
+            let upstream = status["upstream"].as_str().unwrap_or("?");
+            let applied = status["last_applied_sequence"].as_u64().unwrap_or(0);
+            let primary_seq = status["primary_sequence"].as_u64().unwrap_or(0);
+            let lag_entries = status["lag_entries"].as_u64().unwrap_or(0);
+            let lag_seconds = status["lag_seconds"].as_f64().unwrap_or(0.0);
+
+            let lag_entries_str = if lag_entries == 0 {
+                lag_entries.to_string().green()
+            } else {
+                lag_entries.to_string().yellow()
+            };
+            let lag_seconds_str = if lag_seconds < 0.001 {
+                format!("{:.3}", lag_seconds).green()
+            } else {
+                format!("{:.3}", lag_seconds).yellow()
+            };
+
+            let mut out = String::new();
+            out.push_str(&format!("{}\n", "Replication status".bold()));
+            out.push_str(&format!("  Role:              {}\n", "replica".cyan()));
+            out.push_str(&format!("  Upstream:          {}\n", upstream));
+            out.push_str(&format!("  Primary sequence:  {}\n", primary_seq));
+            out.push_str(&format!("  Last applied:      {}\n", applied));
+            out.push_str(&format!("  Lag (entries):     {}\n", lag_entries_str));
+            out.push_str(&format!("  Lag (seconds):     {}\n", lag_seconds_str));
+            out
+        }
+        _ => format_json(status),
+    }
 }

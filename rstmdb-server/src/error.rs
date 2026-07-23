@@ -44,6 +44,15 @@ pub enum ServerError {
 
     #[error("TLS handshake failed: {0}")]
     TlsHandshake(String),
+
+    #[error("server is in read-only mode (replica)")]
+    ReadOnlyMode,
+
+    #[error("replication timeout: {0}")]
+    ReplicationTimeout(String),
+
+    #[error("replication error: {0}")]
+    ReplicationError(String),
 }
 
 impl ServerError {
@@ -73,14 +82,14 @@ impl ServerError {
             ServerError::ShuttingDown => ErrorCode::InternalError,
             ServerError::TlsConfig(_) => ErrorCode::InternalError,
             ServerError::TlsHandshake(_) => ErrorCode::InternalError,
+            ServerError::ReadOnlyMode => ErrorCode::ReadOnlyMode,
+            ServerError::ReplicationTimeout(_) => ErrorCode::ReplicationTimeout,
+            ServerError::ReplicationError(_) => ErrorCode::ReplicationError,
         }
     }
 
     /// Returns whether this error is retryable.
     pub fn is_retryable(&self) -> bool {
-        matches!(
-            self.error_code(),
-            ErrorCode::WalIoError | ErrorCode::RateLimited | ErrorCode::InternalError
-        )
+        self.error_code().is_retryable()
     }
 }

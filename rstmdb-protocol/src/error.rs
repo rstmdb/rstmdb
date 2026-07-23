@@ -70,6 +70,11 @@ pub enum ErrorCode {
     WalIoError,
     InternalError,
     RateLimited,
+
+    // Replication errors
+    ReadOnlyMode,
+    ReplicationTimeout,
+    ReplicationError,
 }
 
 impl ErrorCode {
@@ -77,7 +82,10 @@ impl ErrorCode {
     pub fn is_retryable(&self) -> bool {
         matches!(
             self,
-            ErrorCode::WalIoError | ErrorCode::RateLimited | ErrorCode::InternalError
+            ErrorCode::WalIoError
+                | ErrorCode::RateLimited
+                | ErrorCode::InternalError
+                | ErrorCode::ReplicationTimeout
         )
     }
 }
@@ -101,6 +109,9 @@ impl fmt::Display for ErrorCode {
             ErrorCode::WalIoError => write!(f, "WAL_IO_ERROR"),
             ErrorCode::InternalError => write!(f, "INTERNAL_ERROR"),
             ErrorCode::RateLimited => write!(f, "RATE_LIMITED"),
+            ErrorCode::ReadOnlyMode => write!(f, "READ_ONLY_MODE"),
+            ErrorCode::ReplicationTimeout => write!(f, "REPLICATION_TIMEOUT"),
+            ErrorCode::ReplicationError => write!(f, "REPLICATION_ERROR"),
         }
     }
 }
@@ -124,6 +135,11 @@ mod tests {
         assert!(!ErrorCode::Conflict.is_retryable());
         assert!(!ErrorCode::Unauthorized.is_retryable());
         assert!(!ErrorCode::AuthFailed.is_retryable());
+
+        // Replication errors
+        assert!(ErrorCode::ReplicationTimeout.is_retryable());
+        assert!(!ErrorCode::ReadOnlyMode.is_retryable());
+        assert!(!ErrorCode::ReplicationError.is_retryable());
     }
 
     #[test]
@@ -162,6 +178,15 @@ mod tests {
         assert_eq!(format!("{}", ErrorCode::WalIoError), "WAL_IO_ERROR");
         assert_eq!(format!("{}", ErrorCode::InternalError), "INTERNAL_ERROR");
         assert_eq!(format!("{}", ErrorCode::RateLimited), "RATE_LIMITED");
+        assert_eq!(format!("{}", ErrorCode::ReadOnlyMode), "READ_ONLY_MODE");
+        assert_eq!(
+            format!("{}", ErrorCode::ReplicationTimeout),
+            "REPLICATION_TIMEOUT"
+        );
+        assert_eq!(
+            format!("{}", ErrorCode::ReplicationError),
+            "REPLICATION_ERROR"
+        );
     }
 
     #[test]

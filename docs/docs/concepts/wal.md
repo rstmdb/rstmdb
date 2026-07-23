@@ -337,5 +337,6 @@ compaction:
 ## Limitations
 
 - **Single writer**: Only one server can write to a WAL directory
-- **No real-time replication**: WAL streaming is planned but not yet implemented
 - **Memory requirement**: All data must fit in memory; WAL is for durability only
+
+For streaming a primary's WAL to read-only replicas, see [Replication](../operations/replication).

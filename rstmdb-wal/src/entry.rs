@@ -20,8 +20,18 @@ use serde::{Deserialize, Serialize};
 /// Magic bytes for WAL records: "WLOG"
 pub const WAL_MAGIC: [u8; 4] = *b"WLOG";
 
-/// Maximum record payload size (16 MiB).
-pub const MAX_RECORD_SIZE: usize = 16 * 1024 * 1024;
+/// Maximum record payload size.
+///
+/// Held strictly below the replication wire-frame limit (`MAX_PAYLOAD_SIZE`,
+/// 16 MiB in `rstmdb-protocol`) by a generous headroom so that any entry the
+/// WAL accepts can always be wrapped in a `ReplicateEntry` JSON envelope and
+/// streamed within one frame. Without this margin an entry sized right at the
+/// frame limit would be accepted here but panic `Encoder::encode_raw` when the
+/// replication tasks tried to frame it (the envelope pushes it over the limit).
+/// The 64 KiB headroom dwarfs the real envelope (~120 bytes) with room to spare
+/// for future protocol fields. `rstmdb-server`'s `replication_frame_headroom`
+/// test asserts the invariant against the actual `MAX_PAYLOAD_SIZE`.
+pub const MAX_RECORD_SIZE: usize = 16 * 1024 * 1024 - 64 * 1024;
 
 /// Type of WAL entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

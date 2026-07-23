@@ -26,6 +26,15 @@ impl Encoder {
         let frame = Frame::from_json(value)?;
         frame.encode()
     }
+
+    /// Encodes raw bytes into an RCPX frame.
+    pub fn encode_raw(payload: &[u8]) -> BytesMut {
+        let frame = Frame::new(Bytes::copy_from_slice(payload));
+        // Frame::encode can only fail for payload > MAX_PAYLOAD_SIZE, which we trust
+        frame
+            .encode()
+            .expect("frame encoding should not fail for reasonable payloads")
+    }
 }
 
 /// Decodes frames into requests and responses.
@@ -77,6 +86,15 @@ impl Decoder {
                 let response: Response = serde_json::from_str(payload)?;
                 Ok(Some(response))
             }
+            None => Ok(None),
+        }
+    }
+
+    /// Attempts to decode the next raw payload from the buffer.
+    /// Returns the payload bytes without parsing as JSON.
+    pub fn decode_raw(&mut self) -> Result<Option<Vec<u8>>, ProtocolError> {
+        match self.decode_frame()? {
+            Some(frame) => Ok(Some(frame.payload.to_vec())),
             None => Ok(None),
         }
     }
@@ -295,5 +313,143 @@ mod tests {
         let decoder = jsonl::LineDecoder::default();
         // Just verify it creates successfully
         drop(decoder);
+    }
+
+    #[test]
+    fn test_raw_roundtrip() {
+        let payload = b"hello world";
+        let frame = Encoder::encode_raw(payload);
+
+        let mut decoder = Decoder::new();
+        decoder.extend(&frame);
+
+        let decoded = decoder.decode_raw().unwrap().unwrap();
+        assert_eq!(decoded, payload);
+    }
+
+    #[test]
+    fn test_raw_roundtrip_json() {
+        let json = br#"{"type":"replicate_auth","auth_token":"secret","last_sequence":42}"#;
+        let frame = Encoder::encode_raw(json);
+
+        let mut decoder = Decoder::new();
+        decoder.extend(&frame);
+
+        let decoded = decoder.decode_raw().unwrap().unwrap();
+        assert_eq!(decoded, json);
+
+        // Verify it's valid JSON
+        let parsed: serde_json::Value = serde_json::from_slice(&decoded).unwrap();
+        assert_eq!(parsed["last_sequence"], 42);
+    }
+
+    #[test]
+    fn test_raw_roundtrip_empty_payload() {
+        let frame = Encoder::encode_raw(b"");
+
+        let mut decoder = Decoder::new();
+        decoder.extend(&frame);
+
+        let decoded = decoder.decode_raw().unwrap().unwrap();
+        assert!(decoded.is_empty());
+    }
+
+    #[test]
+    fn test_raw_roundtrip_binary_payload() {
+        let payload: Vec<u8> = (0..=255).collect();
+        let frame = Encoder::encode_raw(&payload);
+
+        let mut decoder = Decoder::new();
+        decoder.extend(&frame);
+
+        let decoded = decoder.decode_raw().unwrap().unwrap();
+        assert_eq!(decoded, payload);
+    }
+
+    #[test]
+    fn test_raw_decode_partial() {
+        let payload = b"some data";
+        let frame = Encoder::encode_raw(payload);
+
+        let mut decoder = Decoder::new();
+
+        // Feed only half the frame
+        let mid = frame.len() / 2;
+        decoder.extend(&frame[..mid]);
+        assert!(decoder.decode_raw().unwrap().is_none());
+
+        // Feed the rest
+        decoder.extend(&frame[mid..]);
+        let decoded = decoder.decode_raw().unwrap().unwrap();
+        assert_eq!(decoded, payload);
+    }
+
+    #[test]
+    fn test_raw_decode_multiple_frames() {
+        let p1 = b"first";
+        let p2 = b"second";
+        let p3 = b"third";
+
+        let mut combined = Encoder::encode_raw(p1).to_vec();
+        combined.extend_from_slice(&Encoder::encode_raw(p2));
+        combined.extend_from_slice(&Encoder::encode_raw(p3));
+
+        let mut decoder = Decoder::new();
+        decoder.extend(&combined);
+
+        assert_eq!(decoder.decode_raw().unwrap().unwrap(), p1);
+        assert_eq!(decoder.decode_raw().unwrap().unwrap(), p2);
+        assert_eq!(decoder.decode_raw().unwrap().unwrap(), p3);
+        assert!(decoder.decode_raw().unwrap().is_none());
+    }
+
+    #[test]
+    fn test_raw_interop_with_typed_encoder() {
+        // encode_raw frame should be decodable by decode_frame / decode_raw
+        let json_payload = serde_json::to_vec(&Request::new("1", Operation::Ping)).unwrap();
+        let frame = Encoder::encode_raw(&json_payload);
+
+        let mut decoder = Decoder::new();
+        decoder.extend(&frame);
+
+        // decode_raw returns the raw bytes
+        let raw = decoder.decode_raw().unwrap().unwrap();
+        let parsed: Request = serde_json::from_slice(&raw).unwrap();
+        assert_eq!(parsed.id, "1");
+        assert_eq!(parsed.op, Operation::Ping);
+    }
+
+    #[test]
+    fn test_typed_encode_decodable_by_raw() {
+        // encode_request frame should be decodable by decode_raw
+        let request = Request::new("42", Operation::Info);
+        let frame = Encoder::encode_request(&request).unwrap();
+
+        let mut decoder = Decoder::new();
+        decoder.extend(&frame);
+
+        let raw = decoder.decode_raw().unwrap().unwrap();
+        let parsed: Request = serde_json::from_slice(&raw).unwrap();
+        assert_eq!(parsed.id, "42");
+        assert_eq!(parsed.op, Operation::Info);
+    }
+
+    #[test]
+    fn test_raw_decode_no_data() {
+        let mut decoder = Decoder::new();
+        assert!(decoder.decode_raw().unwrap().is_none());
+    }
+
+    #[test]
+    fn test_raw_large_payload() {
+        let payload = vec![0xABu8; 65536]; // 64KB
+        let frame = Encoder::encode_raw(&payload);
+
+        let mut decoder = Decoder::new();
+        decoder.extend(&frame);
+
+        let decoded = decoder.decode_raw().unwrap().unwrap();
+        assert_eq!(decoded.len(), 65536);
+        assert!(decoded.iter().all(|&b| b == 0xAB));
     }
 }

@@ -1,8 +1,8 @@
 [package]
 name = "rstmdb"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
-license = "BSL-1.1"
+license = "BUSL-1.1"
 description = "A state machine database with WAL durability"
 readme = "README.md"
 homepage = "https://github.com/rstmdb/rstmdb"
@@ -63,19 +63,19 @@ members = [
 ]
 
 [workspace.package]
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 repository = "https://github.com/rstmdb/rstmdb"
 
 [workspace.dependencies]
 # Internal crates
-rstmdb-protocol = { version = "0.2.0", path = "rstmdb-protocol" }
-rstmdb-wal = { version = "0.2.0", path = "rstmdb-wal" }
-rstmdb-core = { version = "0.2.0", path = "rstmdb-core" }
-rstmdb-storage = { version = "0.2.0", path = "rstmdb-storage" }
-rstmdb-server = { version = "0.2.0", path = "rstmdb-server" }
-rstmdb-client = { version = "0.2.0", path = "rstmdb-client" }
-rstmdb-cli = { version = "0.2.0", path = "rstmdb-cli" }
+rstmdb-protocol = { version = "0.3.0", path = "rstmdb-protocol" }
+rstmdb-wal = { version = "0.3.0", path = "rstmdb-wal" }
+rstmdb-core = { version = "0.3.0", path = "rstmdb-core" }
+rstmdb-storage = { version = "0.3.0", path = "rstmdb-storage" }
+rstmdb-server = { version = "0.3.0", path = "rstmdb-server" }
+rstmdb-client = { version = "0.3.0", path = "rstmdb-client" }
+rstmdb-cli = { version = "0.3.0", path = "rstmdb-cli" }
 
 # Async runtime
 tokio = { version = "1.36", features = ["full"] }

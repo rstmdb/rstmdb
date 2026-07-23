@@ -87,6 +87,35 @@ Features:
 
 [Full documentation →](./csharp)
 
+### Java Client
+
+**Status:** ✅ Available
+
+```kotlin
+// Gradle Kotlin DSL
+implementation("com.rstmdb:rstmdb-client:0.1.0")
+```
+
+```xml
+<!-- Maven -->
+<dependency>
+    <groupId>com.rstmdb</groupId>
+    <artifactId>rstmdb-client</artifactId>
+    <version>0.1.0</version>
+</dependency>
+```
+
+Features:
+- Java 11+ support
+- Both async (`CompletableFuture`) and sync (`*Sync`) APIs
+- Full RCP protocol with RCPX binary framing
+- TLS/mTLS support via `SSLContext`
+- Streaming subscriptions via `Iterable`
+
+[Maven Central →](https://central.sonatype.com/artifact/com.rstmdb/rstmdb-client)
+
+[Full documentation →](./java)
+
 ## Protocol Integration
 
 If an official client isn't available for your language, you can integrate directly with the RCP protocol.

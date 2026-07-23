@@ -1,0 +1,35 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
+
+  - job_name: 'rstmdb-primary'
+    static_configs:
+      - targets: ['primary:9090']
+        labels:
+          role: primary
+          instance_name: primary
+    metrics_path: /metrics
+    scrape_interval: 5s
+
+  - job_name: 'rstmdb-replica1'
+    static_configs:
+      - targets: ['replica1:9090']
+        labels:
+          role: replica
+          instance_name: replica1
+    metrics_path: /metrics
+    scrape_interval: 5s
+
+  - job_name: 'rstmdb-replica2'
+    static_configs:
+      - targets: ['replica2:9090']
+        labels:
+          role: replica
+          instance_name: replica2
+    metrics_path: /metrics
+    scrape_interval: 5s

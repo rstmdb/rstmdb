@@ -417,7 +417,7 @@ impl Storage {
         let mut snapshots_created = 0;
 
         // Create snapshots for all instances
-        for (instance_id, _) in self.instances.read().iter() {
+        for instance_id in self.instances.read().keys() {
             let snapshot_id = format!("periodic-{}-{}", instance_id, uuid::Uuid::new_v4());
             if self.create_snapshot(instance_id, &snapshot_id).is_ok() {
                 snapshots_created += 1;

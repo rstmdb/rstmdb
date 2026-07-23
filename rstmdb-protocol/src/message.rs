@@ -18,6 +18,7 @@ pub enum Operation {
 
     // Server info
     Info,
+    ReplicationStatus,
 
     // Machine definition management
     PutMachine,
@@ -47,6 +48,10 @@ pub enum Operation {
 
     // Administrative
     FlushAll,
+
+    // Replication (internal use)
+    Replicate,
+    ReplicateAck,
 }
 
 /// Request message envelope.

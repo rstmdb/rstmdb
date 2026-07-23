@@ -105,6 +105,15 @@ impl Client {
         self.request(Operation::Info, json!({})).await
     }
 
+    /// Queries replication status. Shape of the returned value depends on the
+    /// server's role:
+    /// - standalone: `{"role": "standalone"}`
+    /// - primary: `{"role", "mode", "primary_sequence", "connected_replicas", "replicas": [...]}`
+    /// - replica: `{"role", "upstream", "last_applied_sequence", "primary_sequence", "lag_entries", "lag_seconds"}`
+    pub async fn replication_status(&self) -> Result<Value, ClientError> {
+        self.request(Operation::ReplicationStatus, json!({})).await
+    }
+
     // =========================================================================
     // Machine operations
     // =========================================================================

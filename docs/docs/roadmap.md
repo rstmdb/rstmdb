@@ -6,7 +6,7 @@ sidebar_position: 11
 
 Planned features and development phases for rstmdb.
 
-## Current Version: 0.1.x
+## Current Version: 0.2.x
 
 ### Core Features (Complete)
 
@@ -43,30 +43,49 @@ Expand language support with official client libraries.
 - [x] Streaming support
 - [x] npm package
 
-### Go Client
+### Go Client ✅
 
-- [ ] Idiomatic Go API
-- [ ] Context support
-- [ ] Connection pooling
+- [x] Idiomatic Go API
+- [x] Context support
+- [x] Connection pooling
+
+### C# / .NET Client ✅
+
+- [x] Async API (Task-based)
+- [x] Full type definitions
+- [x] Streaming support
+- [x] NuGet package
+
+### Java Client ✅
+
+- [x] CompletableFuture async API
+- [x] Synchronous wrappers
+- [x] Streaming support (Flow.Publisher)
+- [x] Maven Central package
 
 ## Phase 2: High Availability
 
-**Status:** Planning
+**Status:** In progress — core WAL streaming replication is shipped; failover tooling is next.
 
 Enable read replicas for horizontal read scaling and improved availability.
 
 ### WAL Streaming Replication
 
-- [ ] WAL segment streaming to replicas
-- [ ] Configurable replication lag limits
-- [ ] Read-only replica mode
-- [ ] Automatic replica catch-up
+- [x] WAL entry streaming to replicas
+- [x] Configurable replication lag thresholds
+- [x] Read-only replica mode
+- [x] Automatic replica catch-up (offset-based)
+- [x] Async and sync replication modes
+- [x] Backpressure handling (slow-replica disconnect)
+- [x] TLS for replication connections
+- [x] Hashed auth tokens with rotation
 
 ### Health & Monitoring
 
-- [ ] Replica lag monitoring
+- [x] Replica lag monitoring (entries and seconds)
+- [x] Per-replica primary-side metrics
+- [x] Replication metrics (Prometheus) + Grafana dashboard
 - [ ] Health check endpoints
-- [ ] Replication metrics
 
 ### Failover Support
 
@@ -154,20 +173,20 @@ Horizontal scaling and performance optimizations.
 
 Features requested by the community:
 
-| Feature | Votes | Status |
-|---------|-------|--------|
-| HTTP/REST API | ⭐⭐⭐ | Planned |
-| gRPC interface | ⭐⭐ | Planned |
-| Webhooks on transitions | ⭐⭐ | Considering |
-| GraphQL API | ⭐ | Considering |
-| Instance TTL/expiration | ⭐ | Considering |
-| State machine versioning migration | ⭐ | Research |
+| Feature                            | Votes  | Status      |
+| ---------------------------------- | ------ | ----------- |
+| HTTP/REST API                      | ⭐⭐⭐ | Planned     |
+| gRPC interface                     | ⭐⭐   | Planned     |
+| Webhooks on transitions            | ⭐⭐   | Considering |
+| GraphQL API                        | ⭐     | Considering |
+| Instance TTL/expiration            | ⭐     | Considering |
+| State machine versioning migration | ⭐     | Research    |
 
 ## Contributing
 
 We welcome contributions! Areas where help is especially appreciated:
 
-1. **Client libraries** - Python, Go, Java, .NET
+1. **Client libraries** - additional languages and improvements
 2. **Documentation** - Tutorials, examples, translations
 3. **Testing** - Integration tests, chaos testing
 4. **Benchmarks** - Performance comparisons, optimization
@@ -176,15 +195,14 @@ See [CONTRIBUTING.md](https://github.com/rstmdb/rstmdb/blob/main/CONTRIBUTING.md
 
 ## Release Schedule
 
-| Version | Target | Focus |
-|---------|--------|-------|
-| 0.1.x | Current | Stability, bug fixes |
-| 0.2.0 | Q1 2026 | Python & TypeScript clients |
-| 0.3.0 | Q2 2026 | WAL streaming replication |
-| 0.4.0 | Q3 2026 | Raft consensus |
-| 1.0.0 | Q4 2026 | Production ready |
+| Version | Target   | Focus                                             |
+| ------- | -------- | ------------------------------------------------- |
+| 0.2.0   | Released | Client libraries, FLUSH_ALL, instance re-creation |
+| 0.3.0   | Released | WAL streaming replication                         |
+| 0.4.0   | Q3 2026  | Failover tooling, Raft consensus                  |
+| 1.0.0   | Q4 2026  | Production ready                                  |
 
-*Dates are estimates and subject to change based on community feedback and contributions.*
+_Dates are estimates and subject to change based on community feedback and contributions._
 
 ## Feedback
 

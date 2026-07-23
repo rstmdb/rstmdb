@@ -1,0 +1,45 @@
+# rstmdb Primary Server Configuration
+#
+# Start with: RSTMDB_CONFIG=config.primary.yaml cargo run
+
+network:
+  bind_addr: "127.0.0.1:7401"
+  idle_timeout_secs: 300
+  max_connections: 1000
+
+auth:
+  required: false
+
+storage:
+  data_dir: "./data/primary"
+  wal_segment_size_mb: 64
+  fsync_policy: every_write
+  max_machine_versions: 0
+  allow_instance_recreate: true
+  # Must be false when replication is enabled — FLUSH_ALL does not replicate and
+  # would diverge the cluster, so the server refuses to start with both set.
+  allow_flush_all: false
+
+compaction:
+  enabled: true
+  events_threshold: 10000
+  size_threshold_mb: 100
+  min_interval_secs: 60
+
+tls:
+  enabled: false
+
+replication:
+  role: primary
+  mode: async
+  # Preferred: list SHA-256 hashes of accepted replica tokens.
+  # Below is the hash of "repl-dev-token" (generate with: rstmdb-cli hash-token <token>)
+  auth_token_hashes:
+    - "ec46c1b607eb52e1db74a115a1ec14a872b19f47909a5ce1d57a651d7d7b116c"
+  poll_interval_ms: 10
+  heartbeat_interval_secs: 5
+  lag_check_interval_secs: 10
+
+metrics:
+  enabled: true
+  bind_addr: "0.0.0.0:9090"

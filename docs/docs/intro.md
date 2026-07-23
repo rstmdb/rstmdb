@@ -13,6 +13,7 @@ rstmdb provides:
 
 - **State Machine Engine** - Define state machines with states, transitions, and guard conditions
 - **Durable Storage** - WAL-based persistence with crash recovery and snapshot compaction
+- **Primary → Replica Replication** - Stream the primary's WAL to read-only replicas for read scale-out and improved durability
 - **Real-time Subscriptions** - Watch individual instances or subscribe to filtered event streams
 - **Simple Protocol** - JSON-based RCP protocol over TCP with optional TLS
 

@@ -1,0 +1,42 @@
+# rstmdb Replica 1 Configuration
+#
+# Start with: RSTMDB_CONFIG=config.replica1.yaml cargo run
+
+network:
+  bind_addr: "127.0.0.1:7402"
+  idle_timeout_secs: 300
+  max_connections: 1000
+
+auth:
+  required: false
+
+storage:
+  data_dir: "./data/replica1"
+  wal_segment_size_mb: 64
+  fsync_policy: every_write
+  max_machine_versions: 0
+  allow_instance_recreate: true
+  allow_flush_all: false
+
+compaction:
+  enabled: true
+  events_threshold: 10000
+  size_threshold_mb: 100
+  min_interval_secs: 60
+
+tls:
+  enabled: false
+
+replication:
+  role: replica
+  upstream: "127.0.0.1:7401"
+  auth_token: "repl-dev-token"
+  max_lag_entries: 10000
+  max_lag_seconds: 30
+  reconnect_delay_secs: 1
+  reconnect_max_delay_secs: 60
+  lag_check_interval_secs: 10
+
+metrics:
+  enabled: true
+  bind_addr: "0.0.0.0:9091"

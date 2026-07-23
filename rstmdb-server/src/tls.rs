@@ -1,15 +1,15 @@
 //! TLS configuration and acceptor.
 
-use crate::config::TlsConfig;
+use crate::config::{ReplicationConfig, TlsConfig};
 use crate::error::ServerError;
-use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 use rustls::server::WebPkiClientVerifier;
 use rustls::RootCertStore;
 use std::fs::File;
 use std::io::BufReader;
 use std::path::Path;
 use std::sync::Arc;
-use tokio_rustls::TlsAcceptor;
+use tokio_rustls::{TlsAcceptor, TlsConnector};
 
 /// Loads TLS certificates and creates a TLS acceptor.
 pub fn create_tls_acceptor(config: &TlsConfig) -> Result<TlsAcceptor, ServerError> {
@@ -99,6 +99,106 @@ fn load_private_key(path: &Path) -> Result<PrivateKeyDer<'static>, ServerError> 
             _ => continue, // Skip other PEM items (certs, etc.)
         }
     }
+}
+
+/// Creates a TLS connector for a replica to connect to its primary.
+/// Returns `(connector, server_name)` where `server_name` is used for SNI.
+pub fn create_replication_tls_connector(
+    config: &ReplicationConfig,
+    server_host: &str,
+) -> Result<(TlsConnector, ServerName<'static>), ServerError> {
+    let client_config = if config.tls_insecure {
+        build_insecure_client_config()
+    } else {
+        build_verifying_client_config(config.tls_ca_path.as_deref())?
+    };
+
+    let connector = TlsConnector::from(Arc::new(client_config));
+    let server_name = ServerName::try_from(server_host.to_string())
+        .map_err(|_| ServerError::TlsConfig(format!("invalid server name: {}", server_host)))?;
+
+    Ok((connector, server_name))
+}
+
+fn build_verifying_client_config(
+    ca_path: Option<&Path>,
+) -> Result<rustls::ClientConfig, ServerError> {
+    let root_store = if let Some(path) = ca_path {
+        let certs = load_certs(path)?;
+        let mut store = RootCertStore::empty();
+        for cert in certs {
+            store
+                .add(cert)
+                .map_err(|e| ServerError::TlsConfig(format!("invalid CA cert: {}", e)))?;
+        }
+        store
+    } else {
+        // Use system roots via webpki-roots
+        let mut store = RootCertStore::empty();
+        store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        store
+    };
+
+    Ok(rustls::ClientConfig::builder()
+        .with_root_certificates(root_store)
+        .with_no_client_auth())
+}
+
+fn build_insecure_client_config() -> rustls::ClientConfig {
+    use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+    use rustls::pki_types::UnixTime;
+    use rustls::DigitallySignedStruct;
+
+    #[derive(Debug)]
+    struct InsecureVerifier;
+
+    impl ServerCertVerifier for InsecureVerifier {
+        fn verify_server_cert(
+            &self,
+            _: &CertificateDer<'_>,
+            _: &[CertificateDer<'_>],
+            _: &ServerName<'_>,
+            _: &[u8],
+            _: UnixTime,
+        ) -> Result<ServerCertVerified, rustls::Error> {
+            Ok(ServerCertVerified::assertion())
+        }
+        fn verify_tls12_signature(
+            &self,
+            _: &[u8],
+            _: &CertificateDer<'_>,
+            _: &DigitallySignedStruct,
+        ) -> Result<HandshakeSignatureValid, rustls::Error> {
+            Ok(HandshakeSignatureValid::assertion())
+        }
+        fn verify_tls13_signature(
+            &self,
+            _: &[u8],
+            _: &CertificateDer<'_>,
+            _: &DigitallySignedStruct,
+        ) -> Result<HandshakeSignatureValid, rustls::Error> {
+            Ok(HandshakeSignatureValid::assertion())
+        }
+        fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+            vec![
+                rustls::SignatureScheme::RSA_PKCS1_SHA256,
+                rustls::SignatureScheme::RSA_PKCS1_SHA384,
+                rustls::SignatureScheme::RSA_PKCS1_SHA512,
+                rustls::SignatureScheme::ECDSA_NISTP256_SHA256,
+                rustls::SignatureScheme::ECDSA_NISTP384_SHA384,
+                rustls::SignatureScheme::ECDSA_NISTP521_SHA512,
+                rustls::SignatureScheme::RSA_PSS_SHA256,
+                rustls::SignatureScheme::RSA_PSS_SHA384,
+                rustls::SignatureScheme::RSA_PSS_SHA512,
+                rustls::SignatureScheme::ED25519,
+            ]
+        }
+    }
+
+    rustls::ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(InsecureVerifier))
+        .with_no_client_auth()
 }
 
 #[cfg(test)]

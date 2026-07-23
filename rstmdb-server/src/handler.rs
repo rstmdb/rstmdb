@@ -5,6 +5,7 @@ use crate::broadcast::{EventBroadcaster, EventFilter, InstanceEvent};
 use crate::config::AuthConfig;
 use crate::error::ServerError;
 use crate::metrics::Metrics;
+use crate::replication::{ReplicaClient, ReplicationManager};
 use crate::session::{Session, SessionState, WireMode};
 use rstmdb_core::instance::InstanceSnapshot;
 use rstmdb_core::StateMachineEngine;
@@ -15,7 +16,7 @@ use rstmdb_storage::SnapshotStore;
 use serde_json::{json, Value};
 use std::collections::HashSet;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use tokio::sync::broadcast;
 
 /// Server capabilities and limits.
@@ -89,6 +90,14 @@ pub struct CommandHandler {
     metrics: Option<Arc<Metrics>>,
     /// Whether the FLUSH_ALL operation is allowed.
     allow_flush_all: bool,
+    /// Whether this handler is in read-only mode (replica).
+    read_only: bool,
+    /// Replication manager (primary mode). Set after construction via
+    /// `set_replication_manager`; read-only thereafter.
+    replication_manager: OnceLock<Arc<ReplicationManager>>,
+    /// Replica client (replica mode). Set after construction via
+    /// `set_replica_client`; read-only thereafter.
+    replica_client: OnceLock<Arc<ReplicaClient>>,
 }
 
 impl CommandHandler {
@@ -104,6 +113,9 @@ impl CommandHandler {
             broadcaster: None,
             metrics: None,
             allow_flush_all: false,
+            read_only: false,
+            replication_manager: OnceLock::new(),
+            replica_client: OnceLock::new(),
         }
     }
 
@@ -125,6 +137,9 @@ impl CommandHandler {
             broadcaster: None,
             metrics: None,
             allow_flush_all: false,
+            read_only: false,
+            replication_manager: OnceLock::new(),
+            replica_client: OnceLock::new(),
         }
     }
 
@@ -144,6 +159,9 @@ impl CommandHandler {
             broadcaster: None,
             metrics: None,
             allow_flush_all: false,
+            read_only: false,
+            replication_manager: OnceLock::new(),
+            replica_client: OnceLock::new(),
         })
     }
 
@@ -170,6 +188,9 @@ impl CommandHandler {
             broadcaster: None,
             metrics: None,
             allow_flush_all: false,
+            read_only: false,
+            replication_manager: OnceLock::new(),
+            replica_client: OnceLock::new(),
         })
     }
 
@@ -185,6 +206,9 @@ impl CommandHandler {
             broadcaster: None,
             metrics: None,
             allow_flush_all: false,
+            read_only: false,
+            replication_manager: OnceLock::new(),
+            replica_client: OnceLock::new(),
         }
     }
 
@@ -212,6 +236,25 @@ impl CommandHandler {
         self
     }
 
+    /// Sets the handler to read-only mode (for replicas).
+    pub fn with_read_only(mut self, read_only: bool) -> Self {
+        self.read_only = read_only;
+        self
+    }
+
+    /// Sets the replication manager (for primaries). Can only be set once.
+    /// Subsequent calls are silently ignored.
+    pub fn set_replication_manager(&self, manager: Arc<ReplicationManager>) {
+        let _ = self.replication_manager.set(manager);
+    }
+
+    /// Sets the replica client (for replicas). Used by
+    /// `handle_replication_status` to report this replica's lag and primary
+    /// connection state. Can only be set once.
+    pub fn set_replica_client(&self, client: Arc<ReplicaClient>) {
+        let _ = self.replica_client.set(client);
+    }
+
     /// Returns a reference to the broadcaster, if set.
     pub fn broadcaster(&self) -> Option<&Arc<EventBroadcaster>> {
         self.broadcaster.as_ref()
@@ -225,27 +268,22 @@ impl CommandHandler {
     /// Updates gauge metrics from current engine state.
     pub fn update_gauge_metrics(&self) {
         if let Some(ref metrics) = self.metrics {
-            // Update instances count
-            let instances = self.engine.get_all_instances();
-            metrics.instances_total.set(instances.len() as f64);
-
-            // Update machines count
-            let machines = self.engine.list_machines();
-            let machine_count: usize = machines.values().map(|versions| versions.len()).sum();
-            metrics.machines_total.set(machine_count as f64);
-
-            // Update WAL metrics
-            let wal = self.engine.wal();
-            // next_sequence is 1-based, so subtract 1 to get actual entry count
-            let entry_count = wal.next_sequence().saturating_sub(1);
-            metrics.wal_entries.set(entry_count as f64);
-            metrics.wal_segments.set(wal.segment_ids().len() as f64);
-            metrics.wal_size_bytes.set(wal.total_size() as f64);
-
-            // Update WAL I/O counters
-            let wal_stats = wal.stats();
-            metrics.update_wal_stats(wal_stats);
+            crate::metrics::refresh_engine_gauges(&self.engine, metrics);
         }
+    }
+
+    /// Returns whether an operation is a write (mutating) operation.
+    pub fn is_write_operation(op: &Operation) -> bool {
+        matches!(
+            op,
+            Operation::PutMachine
+                | Operation::CreateInstance
+                | Operation::ApplyEvent
+                | Operation::DeleteInstance
+                | Operation::Batch
+                | Operation::FlushAll
+                | Operation::Compact
+        )
     }
 
     /// Returns whether authentication is required for an operation.
@@ -296,12 +334,32 @@ impl CommandHandler {
             );
         }
 
+        // READ-ONLY ENFORCEMENT: Reject write operations on replicas
+        if self.read_only && Self::is_write_operation(&request.op) {
+            if let Some(ref metrics) = self.metrics {
+                metrics.requests_total.with_label_values(&[op_name]).inc();
+                metrics
+                    .errors_total
+                    .with_label_values(&["READ_ONLY_MODE"])
+                    .inc();
+            }
+            drop(timer);
+            return Response::error(
+                &request.id,
+                ResponseError::new(
+                    ErrorCode::ReadOnlyMode,
+                    "server is in read-only mode (replica)".to_string(),
+                ),
+            );
+        }
+
         let result = match request.op {
             Operation::Hello => self.handle_hello(session, &request.params),
             Operation::Auth => self.handle_auth(session, &request.params),
             Operation::Ping => self.handle_ping(),
             Operation::Bye => self.handle_bye(session),
             Operation::Info => self.handle_info(),
+            Operation::ReplicationStatus => self.handle_replication_status(),
             Operation::PutMachine => self.handle_put_machine(&request.params),
             Operation::GetMachine => self.handle_get_machine(&request.params),
             Operation::ListMachines => self.handle_list_machines(&request.params),
@@ -319,6 +377,9 @@ impl CommandHandler {
             Operation::WatchAll => self.handle_watch_all_cmd(session, &request.params),
             Operation::Unwatch => self.handle_unwatch(session, &request.params),
             Operation::FlushAll => self.handle_flush_all(),
+            Operation::Replicate | Operation::ReplicateAck => Err(ServerError::InvalidRequest(
+                "replication operations are handled internally".to_string(),
+            )),
         };
 
         // Record metrics
@@ -348,6 +409,7 @@ impl CommandHandler {
             Operation::Ping => "PING",
             Operation::Bye => "BYE",
             Operation::Info => "INFO",
+            Operation::ReplicationStatus => "REPLICATION_STATUS",
             Operation::PutMachine => "PUT_MACHINE",
             Operation::GetMachine => "GET_MACHINE",
             Operation::ListMachines => "LIST_MACHINES",
@@ -365,6 +427,8 @@ impl CommandHandler {
             Operation::WatchAll => "WATCH_ALL",
             Operation::Unwatch => "UNWATCH",
             Operation::FlushAll => "FLUSH_ALL",
+            Operation::Replicate => "REPLICATE",
+            Operation::ReplicateAck => "REPLICATE_ACK",
         }
     }
 
@@ -387,6 +451,9 @@ impl CommandHandler {
             ErrorCode::WalIoError => "WAL_IO_ERROR",
             ErrorCode::InternalError => "INTERNAL_ERROR",
             ErrorCode::RateLimited => "RATE_LIMITED",
+            ErrorCode::ReadOnlyMode => "READ_ONLY_MODE",
+            ErrorCode::ReplicationTimeout => "REPLICATION_TIMEOUT",
+            ErrorCode::ReplicationError => "REPLICATION_ERROR",
         }
     }
 
@@ -493,6 +560,43 @@ impl CommandHandler {
             "max_frame_bytes": self.info.max_frame_bytes,
             "max_batch_ops": self.info.max_batch_ops,
         }))
+    }
+
+    fn handle_replication_status(&self) -> Result<Value, ServerError> {
+        if let Some(mgr) = self.replication_manager.get() {
+            let primary_seq = self.engine.wal().next_sequence().saturating_sub(1);
+            let replicas: Vec<Value> = mgr
+                .replica_stats()
+                .into_iter()
+                .map(|(id, acked, lag)| {
+                    json!({
+                        "replica_id": id,
+                        "last_acked_sequence": acked,
+                        "lag_entries": lag,
+                    })
+                })
+                .collect();
+            return Ok(json!({
+                "role": "primary",
+                "mode": if mgr.is_sync() { "sync" } else { "async" },
+                "primary_sequence": primary_seq,
+                "connected_replicas": mgr.connected_replica_count(),
+                "replicas": replicas,
+            }));
+        }
+
+        if let Some(client) = self.replica_client.get() {
+            return Ok(json!({
+                "role": "replica",
+                "upstream": client.primary_addr(),
+                "last_applied_sequence": client.last_applied_sequence(),
+                "primary_sequence": client.primary_sequence(),
+                "lag_entries": client.lag_entries(),
+                "lag_seconds": client.lag_seconds(),
+            }));
+        }
+
+        Ok(json!({ "role": "standalone" }))
     }
 
     fn handle_put_machine(&self, params: &Value) -> Result<Value, ServerError> {
@@ -2244,5 +2348,329 @@ mod tests {
         let response = handler.handle(&mut session, &apply_request);
         assert!(response.is_ok());
         assert_eq!(response.result.unwrap()["to_state"], "paid");
+    }
+
+    fn test_handler_read_only() -> (TempDir, CommandHandler, Session) {
+        let dir = TempDir::new().unwrap();
+        let config = WalConfig::new(dir.path())
+            .with_segment_size(4096)
+            .with_fsync_policy(FsyncPolicy::EveryWrite);
+        let engine = Arc::new(StateMachineEngine::new(config).unwrap());
+        let handler = CommandHandler::new(engine)
+            .with_read_only(true)
+            .with_allow_flush_all(true);
+        let session = Session::new(
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 12345),
+            false,
+        );
+        (dir, handler, session)
+    }
+
+    #[test]
+    fn test_read_only_rejects_put_machine() {
+        let (_dir, handler, mut session) = test_handler_read_only();
+
+        let request = Request::new("1", Operation::PutMachine).with_params(json!({
+            "machine": "order",
+            "version": 1,
+            "definition": {
+                "states": ["created"],
+                "initial": "created",
+                "transitions": []
+            }
+        }));
+        let response = handler.handle(&mut session, &request);
+        assert!(response.is_error());
+        assert_eq!(response.error.unwrap().code, ErrorCode::ReadOnlyMode);
+    }
+
+    #[test]
+    fn test_read_only_rejects_create_instance() {
+        let (_dir, handler, mut session) = test_handler_read_only();
+
+        let request = Request::new("1", Operation::CreateInstance).with_params(json!({
+            "instance_id": "i-1",
+            "machine": "order",
+            "version": 1
+        }));
+        let response = handler.handle(&mut session, &request);
+        assert!(response.is_error());
+        assert_eq!(response.error.unwrap().code, ErrorCode::ReadOnlyMode);
+    }
+
+    #[test]
+    fn test_read_only_rejects_apply_event() {
+        let (_dir, handler, mut session) = test_handler_read_only();
+
+        let request = Request::new("1", Operation::ApplyEvent).with_params(json!({
+            "instance_id": "i-1",
+            "event": "PAY"
+        }));
+        let response = handler.handle(&mut session, &request);
+        assert!(response.is_error());
+        assert_eq!(response.error.unwrap().code, ErrorCode::ReadOnlyMode);
+    }
+
+    #[test]
+    fn test_read_only_rejects_delete_instance() {
+        let (_dir, handler, mut session) = test_handler_read_only();
+
+        let request = Request::new("1", Operation::DeleteInstance).with_params(json!({
+            "instance_id": "i-1"
+        }));
+        let response = handler.handle(&mut session, &request);
+        assert!(response.is_error());
+        assert_eq!(response.error.unwrap().code, ErrorCode::ReadOnlyMode);
+    }
+
+    #[test]
+    fn test_read_only_rejects_batch() {
+        let (_dir, handler, mut session) = test_handler_read_only();
+
+        let request = Request::new("1", Operation::Batch).with_params(json!({
+            "ops": [{"op": "PING", "params": {}}]
+        }));
+        let response = handler.handle(&mut session, &request);
+        assert!(response.is_error());
+        assert_eq!(response.error.unwrap().code, ErrorCode::ReadOnlyMode);
+    }
+
+    #[test]
+    fn test_read_only_rejects_flush_all() {
+        let (_dir, handler, mut session) = test_handler_read_only();
+
+        let request = Request::new("1", Operation::FlushAll);
+        let response = handler.handle(&mut session, &request);
+        assert!(response.is_error());
+        assert_eq!(response.error.unwrap().code, ErrorCode::ReadOnlyMode);
+    }
+
+    #[test]
+    fn test_read_only_rejects_compact() {
+        let (_dir, handler, mut session) = test_handler_read_only();
+
+        let request = Request::new("1", Operation::Compact).with_params(json!({}));
+        let response = handler.handle(&mut session, &request);
+        assert!(response.is_error());
+        assert_eq!(response.error.unwrap().code, ErrorCode::ReadOnlyMode);
+    }
+
+    #[test]
+    fn test_read_only_allows_reads() {
+        let (_dir, handler, mut session) = test_handler_read_only();
+
+        // These should all succeed (not ReadOnlyMode)
+        let ops = [
+            Operation::Ping,
+            Operation::Info,
+            Operation::ListMachines,
+            Operation::WalStats,
+        ];
+
+        for op in ops {
+            let request = Request::new("1", op);
+            let response = handler.handle(&mut session, &request);
+            assert!(
+                response.is_ok(),
+                "{:?} should be allowed in read-only mode",
+                op
+            );
+        }
+    }
+
+    #[test]
+    fn test_read_only_allows_hello_and_bye() {
+        let (_dir, handler, mut session) = test_handler_read_only();
+
+        let hello = Request::new("1", Operation::Hello).with_params(json!({
+            "protocol_version": 1,
+            "client_name": "test",
+            "wire_modes": ["binary_json"],
+            "features": []
+        }));
+        let response = handler.handle(&mut session, &hello);
+        assert!(response.is_ok());
+
+        let bye = Request::new("2", Operation::Bye);
+        let response = handler.handle(&mut session, &bye);
+        assert!(response.is_ok());
+    }
+
+    #[test]
+    fn test_read_only_allows_get_instance() {
+        let (_dir, handler, mut session) = test_handler_read_only();
+
+        // GetInstance should be allowed — it returns NotFound, not ReadOnlyMode
+        let request = Request::new("1", Operation::GetInstance).with_params(json!({
+            "instance_id": "nonexistent"
+        }));
+        let response = handler.handle(&mut session, &request);
+        assert!(response.is_error());
+        // Error should be NotFound, NOT ReadOnlyMode
+        assert_eq!(response.error.unwrap().code, ErrorCode::InstanceNotFound);
+    }
+
+    #[test]
+    fn test_read_only_allows_get_machine() {
+        let (_dir, handler, mut session) = test_handler_read_only();
+
+        let request = Request::new("1", Operation::GetMachine).with_params(json!({
+            "machine": "nonexistent",
+            "version": 1
+        }));
+        let response = handler.handle(&mut session, &request);
+        assert!(response.is_error());
+        assert_eq!(response.error.unwrap().code, ErrorCode::MachineNotFound);
+    }
+
+    #[test]
+    fn test_is_write_operation_write_ops() {
+        let write_ops = [
+            Operation::PutMachine,
+            Operation::CreateInstance,
+            Operation::ApplyEvent,
+            Operation::DeleteInstance,
+            Operation::Batch,
+            Operation::FlushAll,
+            Operation::Compact,
+        ];
+        for op in write_ops {
+            assert!(
+                CommandHandler::is_write_operation(&op),
+                "{:?} should be classified as a write operation",
+                op
+            );
+        }
+    }
+
+    #[test]
+    fn test_is_write_operation_read_ops() {
+        let read_ops = [
+            Operation::Hello,
+            Operation::Auth,
+            Operation::Ping,
+            Operation::Bye,
+            Operation::Info,
+            Operation::GetMachine,
+            Operation::ListMachines,
+            Operation::GetInstance,
+            Operation::ListInstances,
+            Operation::SnapshotInstance,
+            Operation::WalRead,
+            Operation::WalStats,
+            Operation::WatchInstance,
+            Operation::WatchAll,
+            Operation::Unwatch,
+            Operation::Replicate,
+            Operation::ReplicateAck,
+        ];
+        for op in read_ops {
+            assert!(
+                !CommandHandler::is_write_operation(&op),
+                "{:?} should NOT be classified as a write operation",
+                op
+            );
+        }
+    }
+
+    #[test]
+    fn test_non_read_only_allows_writes() {
+        // Verify that with read_only=false, writes succeed normally
+        let (_dir, handler, mut session) = test_handler();
+
+        let request = Request::new("1", Operation::PutMachine).with_params(json!({
+            "machine": "order",
+            "version": 1,
+            "definition": {
+                "states": ["created"],
+                "initial": "created",
+                "transitions": []
+            }
+        }));
+        let response = handler.handle(&mut session, &request);
+        assert!(response.is_ok());
+    }
+
+    // =========================================================================
+    // REPLICATION_STATUS
+    // =========================================================================
+
+    #[test]
+    fn test_replication_status_standalone() {
+        let (_dir, handler, mut session) = test_handler();
+        let req = Request::new("1", Operation::ReplicationStatus);
+        let resp = handler.handle(&mut session, &req);
+        assert!(resp.is_ok(), "standalone status should succeed");
+        let result = resp.result.unwrap();
+        assert_eq!(result["role"], "standalone");
+    }
+
+    #[test]
+    fn test_replication_status_primary_no_replicas() {
+        use crate::config::{ReplicationConfig, ReplicationRole};
+        use crate::replication::ReplicationManager;
+
+        // ReplicationManager::new spawns a tailer task so we need a runtime.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let (_dir, handler, mut session) = test_handler();
+
+        rt.block_on(async {
+            let config = ReplicationConfig {
+                role: ReplicationRole::Primary,
+                ..Default::default()
+            };
+            let (_tx, rx) = tokio::sync::broadcast::channel(1);
+            let mgr = ReplicationManager::new(config, handler.engine.clone(), rx, None, None);
+            handler.set_replication_manager(mgr);
+
+            let req = Request::new("1", Operation::ReplicationStatus);
+            let resp = handler.handle(&mut session, &req);
+            assert!(resp.is_ok());
+            let result = resp.result.unwrap();
+            assert_eq!(result["role"], "primary");
+            assert_eq!(result["mode"], "async");
+            assert_eq!(result["connected_replicas"], 0);
+            assert_eq!(
+                result["replicas"].as_array().unwrap().len(),
+                0,
+                "no replicas expected"
+            );
+        });
+    }
+
+    #[test]
+    fn test_replication_status_replica_shape() {
+        use crate::config::{ReplicationConfig, ReplicationRole};
+        use crate::replication::ReplicaClient;
+
+        let (_dir, handler, mut session) = test_handler();
+
+        // Build a ReplicaClient pointing at a bogus upstream (it never needs
+        // to connect for the status path — we only read in-memory state).
+        let config = ReplicationConfig {
+            role: ReplicationRole::Replica,
+            upstream: Some("127.0.0.1:1".to_string()),
+            ..Default::default()
+        };
+        let client = ReplicaClient::new(
+            config,
+            handler.engine.clone(),
+            "127.0.0.1:1".to_string(),
+            None,
+        )
+        .unwrap();
+        handler.set_replica_client(Arc::new(client));
+
+        let req = Request::new("1", Operation::ReplicationStatus);
+        let resp = handler.handle(&mut session, &req);
+        assert!(resp.is_ok());
+        let result = resp.result.unwrap();
+        assert_eq!(result["role"], "replica");
+        assert_eq!(result["upstream"], "127.0.0.1:1");
+        // Fresh replica: no entries applied, no heartbeats — all zero.
+        assert_eq!(result["last_applied_sequence"], 0);
+        assert_eq!(result["primary_sequence"], 0);
+        assert_eq!(result["lag_entries"], 0);
+        assert_eq!(result["lag_seconds"].as_f64().unwrap(), 0.0);
     }
 }
