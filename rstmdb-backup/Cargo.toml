@@ -1,0 +1,27 @@
+[package]
+name = "rstmdb-backup"
+description = "Physical backup/restore archive format (.rstmbak) for rstmdb"
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+license-file = "../LICENSE"
+readme = "README.md"
+keywords = ["rstmdb", "backup", "restore", "archive"]
+categories = ["database"]
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+sha2.workspace = true
+hex.workspace = true
+chrono.workspace = true
+tar.workspace = true
+flate2.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+# Used by the end-to-end round-trip test (engine → backup → restore → engine).
+rstmdb-core.workspace = true
+rstmdb-wal.workspace = true
+serde_json.workspace = true

@@ -21,6 +21,7 @@ COPY rstmdb-core/Cargo.toml rstmdb-core/
 COPY rstmdb-storage/Cargo.toml rstmdb-storage/
 COPY rstmdb-server/Cargo.toml rstmdb-server/
 COPY rstmdb-client/Cargo.toml rstmdb-client/
+COPY rstmdb-backup/Cargo.toml rstmdb-backup/
 COPY rstmdb-cli/Cargo.toml rstmdb-cli/
 
 # Remove bench from workspace members
@@ -28,7 +29,7 @@ RUN sed -i 's/"rstmdb-bench",\?//g' Cargo.toml
 
 # Create dummy source files for dependency resolution
 RUN mkdir -p src && echo "fn main() {}" > src/main.rs && \
-    for crate in rstmdb-protocol rstmdb-wal rstmdb-core rstmdb-storage rstmdb-server rstmdb-client rstmdb-cli; do \
+    for crate in rstmdb-protocol rstmdb-wal rstmdb-core rstmdb-storage rstmdb-server rstmdb-client rstmdb-cli rstmdb-backup; do \
     mkdir -p $crate/src && echo "" > $crate/src/lib.rs; \
     done && \
     echo "fn main() {}" > rstmdb-cli/src/main.rs
@@ -60,6 +61,7 @@ COPY rstmdb-core/ rstmdb-core/
 COPY rstmdb-storage/ rstmdb-storage/
 COPY rstmdb-server/ rstmdb-server/
 COPY rstmdb-client/ rstmdb-client/
+COPY rstmdb-backup/ rstmdb-backup/
 COPY rstmdb-cli/ rstmdb-cli/
 
 # Build the server and CLI
