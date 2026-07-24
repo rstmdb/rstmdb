@@ -2,6 +2,7 @@
 //!
 //! A TCP-based state machine database with WAL durability and snapshot compaction.
 
+use clap::{Args, Parser, Subcommand};
 use rstmdb_core::StateMachineEngine;
 use rstmdb_server::auth::TokenValidator;
 use rstmdb_server::{
@@ -9,10 +10,68 @@ use rstmdb_server::{
     ReplicationRole, Server, ServerConfig,
 };
 use rstmdb_storage::SnapshotStore;
-use rstmdb_wal::{FsyncPolicy, WalConfig};
+use rstmdb_wal::{FsyncPolicy, Wal, WalConfig};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::broadcast;
 use tracing_subscriber::EnvFilter;
+
+/// rstmdb — state machine database with WAL durability.
+#[derive(Parser)]
+#[command(name = "rstmdb", version, about)]
+struct Cli {
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Run the database server (this is also the default with no subcommand).
+    Serve,
+    /// Create a physical backup of a data directory into a `.rstmbak` archive.
+    ///
+    /// The server should be stopped (or point at a replica's data dir) for a
+    /// fully consistent snapshot.
+    Backup(BackupArgs),
+    /// Restore a `.rstmbak` archive into a data directory. The server must be
+    /// stopped; it replays the restored WAL on next start.
+    Restore(RestoreArgs),
+    /// Verify a `.rstmbak` archive's manifest and per-file checksums.
+    Verify(VerifyArgs),
+}
+
+#[derive(Args)]
+struct BackupArgs {
+    /// Data directory to back up. Required — pass explicitly, or set
+    /// RSTMDB_CONFIG to reuse the server's configured storage.data_dir.
+    #[arg(long)]
+    data_dir: Option<PathBuf>,
+    /// Output archive path, or "-" for stdout.
+    #[arg(short, long, default_value = "-")]
+    output: String,
+    /// Compression: gzip | none.
+    #[arg(long, default_value = "gzip")]
+    compression: String,
+}
+
+#[derive(Args)]
+struct RestoreArgs {
+    /// Archive to restore (path, or "-" for stdin).
+    archive: String,
+    /// Data directory to restore into. Required — pass explicitly, or set
+    /// RSTMDB_CONFIG to reuse the server's configured storage.data_dir.
+    #[arg(long)]
+    data_dir: Option<PathBuf>,
+    /// Overwrite a non-empty data directory.
+    #[arg(long)]
+    force: bool,
+}
+
+#[derive(Args)]
+struct VerifyArgs {
+    /// Archive to verify (path, or "-" for stdin).
+    archive: String,
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -23,6 +82,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .init();
 
+    match Cli::parse().command {
+        None | Some(Command::Serve) => serve().await,
+        Some(Command::Backup(args)) => run_backup(args),
+        Some(Command::Restore(args)) => run_restore(args),
+        Some(Command::Verify(args)) => run_verify(args),
+    }
+}
+
+/// Runs the database server (the default when no subcommand is given).
+async fn serve() -> Result<(), Box<dyn std::error::Error>> {
     // Load configuration (from file if RSTMDB_CONFIG is set, then env overrides)
     let mut config = match Config::load() {
         Ok(c) => {
@@ -376,5 +445,138 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     tracing::info!("Server stopped");
+    Ok(())
+}
+
+// ===========================================================================
+// Backup / restore / verify subcommands (offline; server should be stopped)
+// ===========================================================================
+
+/// Resolves the data dir from an explicit `--data-dir` or `RSTMDB_CONFIG`.
+///
+/// There is deliberately **no default** — backing up/restoring the wrong
+/// directory silently is worse than failing, so the caller must name the data
+/// dir explicitly (directly or via the same config the server uses). Reports the
+/// resolved path (and its source) to stderr.
+fn resolve_data_dir(explicit: Option<PathBuf>) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    if let Some(d) = explicit {
+        eprintln!("data_dir: {} (from --data-dir)", d.display());
+        return Ok(d);
+    }
+    if let Ok(cfg_path) = std::env::var("RSTMDB_CONFIG") {
+        let c = Config::load()?;
+        eprintln!(
+            "data_dir: {} (from RSTMDB_CONFIG={})",
+            c.storage.data_dir.display(),
+            cfg_path
+        );
+        return Ok(c.storage.data_dir);
+    }
+    Err("no data directory specified — pass --data-dir <path>, or set \
+         RSTMDB_CONFIG=<file> to use the same data_dir as the server. \
+         (A server running in a container keeps its data in a volume; run the \
+         backup inside the container or against that volume's path.)"
+        .into())
+}
+
+/// Reads the WAL head `(offset, sequence)` for the backup manifest, without side
+/// effects on a populated data dir. Returns `(0, 0)` if the WAL isn't openable.
+fn wal_head(data_dir: &Path) -> (u64, u64) {
+    let wal_dir = data_dir.join("wal");
+    // Only open if segments already exist — avoids creating an empty WAL here.
+    let has_segments = std::fs::read_dir(&wal_dir)
+        .map(|it| {
+            it.filter_map(|e| e.ok())
+                .any(|e| e.path().extension().map(|x| x == "wal").unwrap_or(false))
+        })
+        .unwrap_or(false);
+    if !has_segments {
+        return (0, 0);
+    }
+    match Wal::open(WalConfig::new(&wal_dir).with_fsync_policy(FsyncPolicy::Never)) {
+        Ok(wal) => {
+            let seq = wal.next_sequence().saturating_sub(1);
+            let off = wal.latest_offset().map(|o| o.as_u64()).unwrap_or(0);
+            (off, seq)
+        }
+        Err(_) => (0, 0),
+    }
+}
+
+fn run_backup(args: BackupArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let data_dir = resolve_data_dir(args.data_dir)?;
+    let compression = match args.compression.as_str() {
+        "gzip" => rstmdb_backup::Compression::Gzip,
+        "none" => rstmdb_backup::Compression::None,
+        other => return Err(format!("unknown compression '{other}' (use gzip|none)").into()),
+    };
+
+    let (wal_head_offset, wal_head_sequence) = wal_head(&data_dir);
+    let meta = rstmdb_backup::ManifestMeta {
+        rstmdb_version: env!("CARGO_PKG_VERSION").to_string(),
+        wal_head_offset,
+        wal_head_sequence,
+        machine_count: None,
+        instance_count: None,
+        source: Some(serde_json::json!({
+            "tool": "rstmdb backup",
+            "data_dir": data_dir.display().to_string(),
+        })),
+    };
+
+    let manifest = if args.output == "-" {
+        let stdout = std::io::stdout();
+        let w = std::io::BufWriter::new(stdout.lock());
+        rstmdb_backup::write_backup(&data_dir, meta, compression, w)?
+    } else {
+        let f = std::fs::File::create(&args.output)?;
+        rstmdb_backup::write_backup(&data_dir, meta, compression, std::io::BufWriter::new(f))?
+    };
+
+    eprintln!(
+        "backup ok: {} segments, {} snapshots, wal head seq={} offset={} -> {}",
+        manifest.segment_count,
+        manifest.snapshot_count,
+        manifest.wal_head_sequence,
+        manifest.wal_head_offset,
+        if args.output == "-" { "stdout" } else { &args.output }
+    );
+    Ok(())
+}
+
+fn run_restore(args: RestoreArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let data_dir = resolve_data_dir(args.data_dir)?;
+    std::fs::create_dir_all(&data_dir)?;
+
+    let manifest = if args.archive == "-" {
+        let stdin = std::io::stdin();
+        rstmdb_backup::read_backup(std::io::BufReader::new(stdin.lock()), &data_dir, args.force)?
+    } else {
+        let f = std::fs::File::open(&args.archive)?;
+        rstmdb_backup::read_backup(std::io::BufReader::new(f), &data_dir, args.force)?
+    };
+
+    eprintln!(
+        "restore ok: {} files ({} segments, {} snapshots, created {}) into {}",
+        manifest.files.len(),
+        manifest.segment_count,
+        manifest.snapshot_count,
+        manifest.created_at,
+        data_dir.display(),
+    );
+    eprintln!("start the server on this data dir to replay and serve the restored state.");
+    Ok(())
+}
+
+fn run_verify(args: VerifyArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let manifest = if args.archive == "-" {
+        let stdin = std::io::stdin();
+        rstmdb_backup::verify_backup(std::io::BufReader::new(stdin.lock()))?
+    } else {
+        let f = std::fs::File::open(&args.archive)?;
+        rstmdb_backup::verify_backup(std::io::BufReader::new(f))?
+    };
+    println!("{}", serde_json::to_string_pretty(&manifest)?);
+    eprintln!("verify ok: checksums match ({} files)", manifest.files.len());
     Ok(())
 }
