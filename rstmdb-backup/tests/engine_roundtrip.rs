@@ -66,7 +66,11 @@ fn backup_restore_roundtrip_via_engine() {
     let e2 = open_engine(dst.path());
     assert!(e2.get_machine("order", 1).is_ok(), "machine restored");
     assert_eq!(e2.get_all_instances().len(), 30, "all instances restored");
-    assert_eq!(e2.get_instance("o-0").unwrap().state, "paid", "applied event restored");
+    assert_eq!(
+        e2.get_instance("o-0").unwrap().state,
+        "paid",
+        "applied event restored"
+    );
     let mid = e2.get_instance("o-15").unwrap();
     assert_eq!(mid.state, "created");
     assert_eq!(mid.ctx["n"], 15, "context restored");

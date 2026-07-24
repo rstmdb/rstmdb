@@ -169,7 +169,14 @@ fn collect_files(data_dir: &Path) -> Result<Vec<(PathBuf, FileEntry)>, BackupErr
             let abs = dir.join(&name);
             let (size, sha256) = sha256_file(&abs)?;
             let rel = format!("{}/{}", sub, name);
-            out.push((abs, FileEntry { path: rel, size, sha256 }));
+            out.push((
+                abs,
+                FileEntry {
+                    path: rel,
+                    size,
+                    sha256,
+                },
+            ));
         }
     }
     Ok(out)
@@ -189,7 +196,10 @@ pub fn write_backup<W: Write>(
 ) -> Result<Manifest, BackupError> {
     let files = collect_files(data_dir)?;
 
-    let segment_count = files.iter().filter(|(_, f)| f.path.starts_with("wal/")).count();
+    let segment_count = files
+        .iter()
+        .filter(|(_, f)| f.path.starts_with("wal/"))
+        .count();
     let snapshot_count = files
         .iter()
         .filter(|(_, f)| f.path.starts_with("snapshots/"))
@@ -265,7 +275,10 @@ fn build_tar<W: Write>(
 fn safe_relpath(raw: &str) -> Result<PathBuf, BackupError> {
     let p = Path::new(raw);
     let is_bad = p.components().any(|c| {
-        matches!(c, Component::ParentDir | Component::RootDir | Component::Prefix(_))
+        matches!(
+            c,
+            Component::ParentDir | Component::RootDir | Component::Prefix(_)
+        )
     });
     if is_bad || !(raw.starts_with("wal/") || raw.starts_with("snapshots/")) {
         return Err(BackupError::UnsafePath(raw.to_string()));
@@ -305,7 +318,8 @@ where
     let mut archive = tar::Archive::new(reader);
 
     let mut manifest: Option<Manifest> = None;
-    let mut expected: std::collections::HashMap<String, FileEntry> = std::collections::HashMap::new();
+    let mut expected: std::collections::HashMap<String, FileEntry> =
+        std::collections::HashMap::new();
 
     for entry in archive.entries()? {
         let mut entry = entry?;
@@ -401,7 +415,11 @@ mod tests {
         let td = tempfile::TempDir::new().unwrap();
         fs::create_dir_all(td.path().join("wal")).unwrap();
         fs::create_dir_all(td.path().join("snapshots")).unwrap();
-        fs::write(td.path().join("wal/0000000000000001.wal"), b"wal-segment-bytes").unwrap();
+        fs::write(
+            td.path().join("wal/0000000000000001.wal"),
+            b"wal-segment-bytes",
+        )
+        .unwrap();
         fs::write(td.path().join("snapshots/i-1.snap"), b"snapshot-1").unwrap();
         fs::write(td.path().join("snapshots/i-2.snap"), b"snapshot-2").unwrap();
         td
@@ -434,7 +452,10 @@ mod tests {
             fs::read(dst.path().join("wal/0000000000000001.wal")).unwrap(),
             b"wal-segment-bytes"
         );
-        assert_eq!(fs::read(dst.path().join("snapshots/i-1.snap")).unwrap(), b"snapshot-1");
+        assert_eq!(
+            fs::read(dst.path().join("snapshots/i-1.snap")).unwrap(),
+            b"snapshot-1"
+        );
     }
 
     #[test]
@@ -451,7 +472,13 @@ mod tests {
     fn restore_into_nonempty_requires_force() {
         let src = make_data_dir();
         let mut buf = Vec::new();
-        write_backup(src.path(), ManifestMeta::default(), Compression::Gzip, &mut buf).unwrap();
+        write_backup(
+            src.path(),
+            ManifestMeta::default(),
+            Compression::Gzip,
+            &mut buf,
+        )
+        .unwrap();
 
         let dst = make_data_dir(); // already populated
         let err = read_backup(std::io::Cursor::new(buf.clone()), dst.path(), false);
@@ -465,7 +492,13 @@ mod tests {
     fn detects_corruption() {
         let src = make_data_dir();
         let mut buf = Vec::new();
-        write_backup(src.path(), ManifestMeta::default(), Compression::None, &mut buf).unwrap();
+        write_backup(
+            src.path(),
+            ManifestMeta::default(),
+            Compression::None,
+            &mut buf,
+        )
+        .unwrap();
         // Corrupt a byte inside a file's content (uncompressed, so the content
         // bytes appear verbatim in the archive). This must trip the per-file
         // checksum on read.

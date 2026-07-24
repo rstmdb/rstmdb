@@ -472,11 +472,13 @@ fn resolve_data_dir(explicit: Option<PathBuf>) -> Result<PathBuf, Box<dyn std::e
         );
         return Ok(c.storage.data_dir);
     }
-    Err("no data directory specified — pass --data-dir <path>, or set \
+    Err(
+        "no data directory specified — pass --data-dir <path>, or set \
          RSTMDB_CONFIG=<file> to use the same data_dir as the server. \
          (A server running in a container keeps its data in a volume; run the \
          backup inside the container or against that volume's path.)"
-        .into())
+            .into(),
+    )
 }
 
 /// Reads the WAL head `(offset, sequence)` for the backup manifest, without side
@@ -539,7 +541,11 @@ fn run_backup(args: BackupArgs) -> Result<(), Box<dyn std::error::Error>> {
         manifest.snapshot_count,
         manifest.wal_head_sequence,
         manifest.wal_head_offset,
-        if args.output == "-" { "stdout" } else { &args.output }
+        if args.output == "-" {
+            "stdout"
+        } else {
+            &args.output
+        }
     );
     Ok(())
 }
@@ -577,6 +583,9 @@ fn run_verify(args: VerifyArgs) -> Result<(), Box<dyn std::error::Error>> {
         rstmdb_backup::verify_backup(std::io::BufReader::new(f))?
     };
     println!("{}", serde_json::to_string_pretty(&manifest)?);
-    eprintln!("verify ok: checksums match ({} files)", manifest.files.len());
+    eprintln!(
+        "verify ok: checksums match ({} files)",
+        manifest.files.len()
+    );
     Ok(())
 }
