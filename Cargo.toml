@@ -45,9 +45,12 @@ rstmdb-core.workspace = true
 rstmdb-server.workspace = true
 rstmdb-storage.workspace = true
 rstmdb-wal.workspace = true
+rstmdb-backup.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+clap.workspace = true
+serde_json.workspace = true
 
 [workspace]
 resolver = "2"
@@ -56,6 +59,7 @@ members = [
     "rstmdb-wal",
     "rstmdb-core",
     "rstmdb-storage",
+    "rstmdb-backup",
     "rstmdb-server",
     "rstmdb-client",
     "rstmdb-cli",
@@ -73,6 +77,7 @@ rstmdb-protocol = { version = "0.3.0", path = "rstmdb-protocol" }
 rstmdb-wal = { version = "0.3.0", path = "rstmdb-wal" }
 rstmdb-core = { version = "0.3.0", path = "rstmdb-core" }
 rstmdb-storage = { version = "0.3.0", path = "rstmdb-storage" }
+rstmdb-backup = { version = "0.3.0", path = "rstmdb-backup" }
 rstmdb-server = { version = "0.3.0", path = "rstmdb-server" }
 rstmdb-client = { version = "0.3.0", path = "rstmdb-client" }
 rstmdb-cli = { version = "0.3.0", path = "rstmdb-cli" }
@@ -94,6 +99,10 @@ crc32c = "0.6"
 # Cryptography
 sha2 = "0.10"
 hex = "0.4"
+
+# Backup / archiving
+tar = "0.4"
+flate2 = "1.0"
 
 # TLS
 rustls = "0.23"
