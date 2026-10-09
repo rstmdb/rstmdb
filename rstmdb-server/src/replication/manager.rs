@@ -151,6 +151,12 @@ impl ReplicationManager {
     /// Background task that polls the WAL for new entries and sends them to all replicas.
     async fn wal_tailer_task(&self, mut shutdown: tokio::sync::broadcast::Receiver<()>) {
         let mut interval = tokio::time::interval(self.config.poll_interval());
+        // Each tick re-reads the whole current segment synchronously, which can
+        // take longer than the poll interval once the segment grows. The default
+        // `Burst` would then fire every missed tick back-to-back, monopolizing
+        // the runtime thread in a self-reinforcing spiral (starving replica
+        // writers/readers). `Delay` spaces ticks out from when we actually finish.
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
         loop {
             tokio::select! {
