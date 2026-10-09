@@ -1,12 +1,15 @@
 //! Command handlers.
 
 use crate::auth::TokenValidator;
+use crate::backup::{BackupOpError, BackupRegistry, CHUNK_SIZE};
 use crate::broadcast::{EventBroadcaster, EventFilter, InstanceEvent};
 use crate::config::AuthConfig;
 use crate::error::ServerError;
 use crate::metrics::Metrics;
 use crate::replication::{ReplicaClient, ReplicationManager};
 use crate::session::{Session, SessionState, WireMode};
+use base64::Engine as _;
+use parking_lot::Mutex as PlMutex;
 use rstmdb_core::instance::InstanceSnapshot;
 use rstmdb_core::StateMachineEngine;
 use rstmdb_protocol::message::*;
@@ -98,6 +101,11 @@ pub struct CommandHandler {
     /// Replica client (replica mode). Set after construction via
     /// `set_replica_client`; read-only thereafter.
     replica_client: OnceLock<Arc<ReplicaClient>>,
+    /// In-progress hot backups (BackupBegin/Chunk/End).
+    backup_registry: Arc<BackupRegistry>,
+    /// Shared gate: held during backup staging so auto-compaction cannot delete
+    /// a WAL segment mid-copy. Set by the server binary; unset in tests.
+    compaction_gate: OnceLock<Arc<PlMutex<()>>>,
 }
 
 impl CommandHandler {
@@ -116,6 +124,8 @@ impl CommandHandler {
             read_only: false,
             replication_manager: OnceLock::new(),
             replica_client: OnceLock::new(),
+            backup_registry: Arc::new(BackupRegistry::new()),
+            compaction_gate: OnceLock::new(),
         }
     }
 
@@ -140,6 +150,8 @@ impl CommandHandler {
             read_only: false,
             replication_manager: OnceLock::new(),
             replica_client: OnceLock::new(),
+            backup_registry: Arc::new(BackupRegistry::new()),
+            compaction_gate: OnceLock::new(),
         }
     }
 
@@ -162,6 +174,8 @@ impl CommandHandler {
             read_only: false,
             replication_manager: OnceLock::new(),
             replica_client: OnceLock::new(),
+            backup_registry: Arc::new(BackupRegistry::new()),
+            compaction_gate: OnceLock::new(),
         })
     }
 
@@ -191,6 +205,8 @@ impl CommandHandler {
             read_only: false,
             replication_manager: OnceLock::new(),
             replica_client: OnceLock::new(),
+            backup_registry: Arc::new(BackupRegistry::new()),
+            compaction_gate: OnceLock::new(),
         })
     }
 
@@ -209,6 +225,8 @@ impl CommandHandler {
             read_only: false,
             replication_manager: OnceLock::new(),
             replica_client: OnceLock::new(),
+            backup_registry: Arc::new(BackupRegistry::new()),
+            compaction_gate: OnceLock::new(),
         }
     }
 
@@ -253,6 +271,48 @@ impl CommandHandler {
     /// connection state. Can only be set once.
     pub fn set_replica_client(&self, client: Arc<ReplicaClient>) {
         let _ = self.replica_client.set(client);
+    }
+
+    /// Shares the compaction gate so staging and auto-compaction are mutually
+    /// exclusive. Idempotent; a second call is ignored.
+    pub fn set_compaction_gate(&self, gate: Arc<PlMutex<()>>) {
+        let _ = self.compaction_gate.set(gate);
+    }
+
+    /// The backup registry (used by the server's TTL sweep task).
+    pub fn backup_registry(&self) -> &Arc<BackupRegistry> {
+        &self.backup_registry
+    }
+
+    /// Releases all backups owned by a session (call on session close).
+    pub fn release_session_backups(&self, session_id: &str) {
+        self.backup_registry.release_session(session_id);
+    }
+
+    /// Data directory = the WAL directory's parent.
+    fn data_dir(&self) -> std::path::PathBuf {
+        self.engine
+            .wal()
+            .dir()
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| self.engine.wal().dir().to_path_buf())
+    }
+
+    fn backup_err_to_server(e: BackupOpError) -> ServerError {
+        match e {
+            BackupOpError::NotFound => ServerError::NotFound("no such backup id".into()),
+            BackupOpError::NotOwner => {
+                ServerError::InvalidRequest("backup id belongs to another session".into())
+            }
+            BackupOpError::AlreadyActive => {
+                ServerError::InvalidRequest("session already has an active backup".into())
+            }
+            BackupOpError::BadRange => {
+                ServerError::InvalidRequest("chunk range out of bounds".into())
+            }
+            other => ServerError::Internal(other.to_string()),
+        }
     }
 
     /// Returns a reference to the broadcaster, if set.
@@ -376,6 +436,9 @@ impl CommandHandler {
             Operation::WatchInstance => self.handle_watch_instance_cmd(session, &request.params),
             Operation::WatchAll => self.handle_watch_all_cmd(session, &request.params),
             Operation::Unwatch => self.handle_unwatch(session, &request.params),
+            Operation::BackupBegin => self.handle_backup_begin(session, &request.params),
+            Operation::BackupChunk => self.handle_backup_chunk(session, &request.params),
+            Operation::BackupEnd => self.handle_backup_end(session, &request.params),
             Operation::FlushAll => self.handle_flush_all(),
             Operation::Replicate | Operation::ReplicateAck => Err(ServerError::InvalidRequest(
                 "replication operations are handled internally".to_string(),
@@ -426,6 +489,9 @@ impl CommandHandler {
             Operation::WatchInstance => "WATCH_INSTANCE",
             Operation::WatchAll => "WATCH_ALL",
             Operation::Unwatch => "UNWATCH",
+            Operation::BackupBegin => "BACKUP_BEGIN",
+            Operation::BackupChunk => "BACKUP_CHUNK",
+            Operation::BackupEnd => "BACKUP_END",
             Operation::FlushAll => "FLUSH_ALL",
             Operation::Replicate => "REPLICATE",
             Operation::ReplicateAck => "REPLICATE_ACK",
@@ -952,6 +1018,75 @@ impl CommandHandler {
         }))
     }
 
+    fn handle_backup_begin(&self, session: &Session, params: &Value) -> Result<Value, ServerError> {
+        let compression = match params["compression"].as_str().unwrap_or("gzip") {
+            "none" => rstmdb_backup::Compression::None,
+            "gzip" | "" => rstmdb_backup::Compression::Gzip,
+            other => {
+                return Err(ServerError::InvalidRequest(format!(
+                    "unknown compression '{other}' (want gzip|none)"
+                )))
+            }
+        };
+        let data_dir = self.data_dir();
+        let (head_offset, head_seq) = crate::backup_head(&data_dir);
+        let role = if self.read_only { "replica" } else { "primary" };
+        let meta = rstmdb_backup::ManifestMeta {
+            rstmdb_version: env!("CARGO_PKG_VERSION").to_string(),
+            wal_head_offset: head_offset,
+            wal_head_sequence: head_seq,
+            machine_count: None,
+            instance_count: Some(self.engine.get_all_instances().len() as u64),
+            source: Some(serde_json::json!({ "role": role, "mode": "hot" })),
+        };
+
+        let outcome = self
+            .backup_registry
+            .begin(
+                session.id.as_str(),
+                &data_dir,
+                meta,
+                compression,
+                self.compaction_gate.get(),
+            )
+            .map_err(Self::backup_err_to_server)?;
+
+        Ok(serde_json::json!({
+            "backup_id": outcome.backup_id,
+            "manifest": outcome.manifest,
+            "total_bytes": outcome.total_bytes,
+            "chunk_size": outcome.chunk_size,
+        }))
+    }
+
+    fn handle_backup_chunk(&self, session: &Session, params: &Value) -> Result<Value, ServerError> {
+        let backup_id = params["backup_id"]
+            .as_str()
+            .ok_or_else(|| ServerError::InvalidRequest("missing backup_id".into()))?;
+        let offset = params["offset"].as_u64().unwrap_or(0);
+        let len = params["len"].as_u64().unwrap_or(CHUNK_SIZE);
+
+        let (bytes, eof) = self
+            .backup_registry
+            .read_chunk(backup_id, session.id.as_str(), offset, len)
+            .map_err(Self::backup_err_to_server)?;
+
+        Ok(serde_json::json!({
+            "bytes": base64::engine::general_purpose::STANDARD.encode(&bytes),
+            "eof": eof,
+        }))
+    }
+
+    fn handle_backup_end(&self, session: &Session, params: &Value) -> Result<Value, ServerError> {
+        let backup_id = params["backup_id"]
+            .as_str()
+            .ok_or_else(|| ServerError::InvalidRequest("missing backup_id".into()))?;
+        self.backup_registry
+            .end(backup_id, session.id.as_str())
+            .map_err(Self::backup_err_to_server)?;
+        Ok(serde_json::json!({ "ok": true }))
+    }
+
     fn handle_compact(&self, params: &Value) -> Result<Value, ServerError> {
         let force_snapshot = params["force_snapshot"].as_bool().unwrap_or(false);
 
@@ -960,6 +1095,11 @@ impl CommandHandler {
         })?;
 
         let mut snapshots_created = 0;
+
+        // Hold the shared gate (if any) for the duration of the snapshot +
+        // compact pass so hot-backup staging can't observe a WAL/snapshot
+        // mid-mutate. Mirrors CompactionManager::run_compaction.
+        let _held = self.compaction_gate.get().map(|g| g.lock());
 
         // Snapshot instances that have changed since last snapshot
         for instance in self.engine.get_all_instances() {
@@ -994,6 +1134,7 @@ impl CommandHandler {
             } else {
                 (0, 0)
             };
+        drop(_held);
 
         // Report current state
         let total_snapshots = snapshot_store.snapshot_count();
@@ -1290,6 +1431,13 @@ mod tests {
             false,
         );
         (dir, handler, session)
+    }
+
+    fn test_session() -> Session {
+        Session::new(
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 12345),
+            false,
+        )
     }
 
     fn test_handler_with_broadcaster() -> (TempDir, CommandHandler, Session) {
@@ -2672,5 +2820,78 @@ mod tests {
         assert_eq!(result["primary_sequence"], 0);
         assert_eq!(result["lag_entries"], 0);
         assert_eq!(result["lag_seconds"].as_f64().unwrap(), 0.0);
+    }
+
+    #[test]
+    fn backup_begin_chunk_end_via_handler() {
+        use rstmdb_protocol::{Operation, Request};
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let engine = std::sync::Arc::new(
+            rstmdb_core::StateMachineEngine::new(
+                rstmdb_wal::WalConfig::new(tmp.path().join("wal"))
+                    .with_fsync_policy(rstmdb_wal::FsyncPolicy::EveryWrite),
+            )
+            .unwrap(),
+        );
+        engine
+            .put_machine(
+                "order",
+                1,
+                &serde_json::json!({
+                    "states": ["created"],
+                    "initial": "created",
+                    "transitions": []
+                }),
+            )
+            .unwrap();
+        engine.wal().sync().unwrap();
+
+        let handler = CommandHandler::new(engine);
+        let mut session = test_session();
+
+        // BEGIN
+        let begin = handler.handle(
+            &mut session,
+            &Request::new("1", Operation::BackupBegin)
+                .with_params(serde_json::json!({"compression": "none"})),
+        );
+        assert!(begin.is_ok(), "begin failed: {:?}", begin.error);
+        let r = begin.result.unwrap();
+        let backup_id = r["backup_id"].as_str().unwrap().to_string();
+        let total: u64 = r["total_bytes"].as_u64().unwrap();
+        assert!(total > 0);
+
+        // CHUNK loop
+        let mut assembled = Vec::new();
+        let mut offset = 0u64;
+        loop {
+            let resp = handler.handle(
+                &mut session,
+                &Request::new("2", Operation::BackupChunk).with_params(serde_json::json!({
+                    "backup_id": backup_id, "offset": offset, "len": CHUNK_SIZE
+                })),
+            );
+            assert!(resp.is_ok());
+            let body = resp.result.unwrap();
+            let b64 = body["bytes"].as_str().unwrap();
+            let bytes =
+                base64::Engine::decode(&base64::engine::general_purpose::STANDARD, b64).unwrap();
+            offset += bytes.len() as u64;
+            assembled.extend_from_slice(&bytes);
+            if body["eof"].as_bool().unwrap() {
+                break;
+            }
+        }
+        assert_eq!(offset, total);
+        rstmdb_backup::verify_backup(std::io::Cursor::new(assembled)).unwrap();
+
+        // END
+        let end = handler.handle(
+            &mut session,
+            &Request::new("3", Operation::BackupEnd)
+                .with_params(serde_json::json!({"backup_id": backup_id})),
+        );
+        assert!(end.is_ok());
     }
 }

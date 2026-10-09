@@ -55,7 +55,17 @@ echo "Backup created: $BACKUP_DIR.tar.gz"
 
 ### Hot Backup
 
-Backup without stopping the server (recommended):
+Backup without stopping the server:
+
+> **Prefer the protocol-based hot backup** described below (`rstmdb-cli
+> backup`, see ["Hot backup (running server)"](#hot-backup-running-server))
+> when it's available to you. This section copies the `wal/` and
+> `snapshots/` directories directly from the filesystem while the server
+> keeps running; if compaction removes a WAL segment mid-copy, the copy can
+> end up torn/inconsistent. Either stop the server first (see "Cold
+> Backup" above), copy a replica's data directory instead, or use the
+> protocol-based hot backup, which coordinates a consistent, checksummed
+> snapshot server-side.
 
 ```bash
 #!/bin/bash
@@ -97,6 +107,42 @@ rm -rf "$BACKUP_DIR"
 
 echo "Backup created: $BACKUP_DIR.tar.gz"
 ```
+
+### Hot backup (running server)
+
+`rstmdb-cli backup` streams a consistent backup archive from a **running**
+server over the wire protocol — no filesystem or volume access to the data
+directory is needed. Internally it drives `BACKUP_BEGIN` / `BACKUP_CHUNK` /
+`BACKUP_END`: the server stages a point-in-time snapshot of `wal/` and
+`snapshots/`, streams it to the client in chunks, and the client verifies the
+downloaded bytes (manifest + per-file checksums) before writing them out.
+
+```bash
+# Back up a running server over the protocol:
+rstmdb-cli -s host:7401 backup -o db.rstmbak
+
+# Stream to stdout and pipe straight to object storage (no local copy):
+rstmdb-cli -s host:7401 backup -o - | aws s3 cp - s3://bucket/rstmdb/2026-07-24.rstmbak
+
+# Prefer a replica as the source to offload the primary:
+rstmdb-cli -s replica:7401 backup -o db.rstmbak
+```
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `-o, --output <path>` | `-` (stdout) | Destination file, or `-` to stream the archive to stdout |
+| `--compression <gzip\|none>` | `gzip` | Compression applied to the archive |
+
+The resulting `.rstmbak` archive is byte-for-byte the same format produced by
+the offline `rstmdb backup` command, and is restored the same way with the
+offline `rstmdb restore` command — hot and cold backups are interchangeable.
+
+Backup ops are read-only, so they work against a replica exactly as well as
+against the primary; running the backup there keeps the extra I/O off the
+primary's write path. If the server has `auth.required: true`, pass a token
+with `-t <token>` (or `RSTMDB_TOKEN`) as you would for any other `rstmdb-cli`
+command — the backup operations are subject to the same authentication as
+everything else.
 
 ### Filesystem Snapshots
 

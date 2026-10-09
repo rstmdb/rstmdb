@@ -26,3 +26,5 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 sha2.workspace = true
 hex.workspace = true
+base64.workspace = true
+rstmdb-backup.workspace = true

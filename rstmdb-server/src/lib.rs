@@ -12,6 +12,7 @@
 //! - Optional TLS support
 
 pub mod auth;
+mod backup;
 pub mod broadcast;
 pub mod compaction;
 pub mod config;
@@ -25,6 +26,7 @@ pub mod stream;
 pub mod tls;
 
 pub use auth::TokenValidator;
+pub use backup::{backup_head, BackupOpError, BackupRegistry, BeginOutcome, CHUNK_SIZE};
 pub use broadcast::{EventBroadcaster, EventFilter, InstanceEvent, Subscription, SubscriptionType};
 pub use compaction::CompactionManager;
 pub use config::{

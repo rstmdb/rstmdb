@@ -384,6 +384,11 @@ impl Wal {
         }
     }
 
+    /// Returns the directory this WAL is stored in (`<data_dir>/wal`).
+    pub fn dir(&self) -> &std::path::Path {
+        &self.config.dir
+    }
+
     /// Returns the next sequence number that will be assigned.
     pub fn next_sequence(&self) -> u64 {
         self.next_sequence.load(Ordering::SeqCst)
@@ -731,5 +736,12 @@ mod tests {
         // Compacting with offset 0 should not delete the only segment
         let deleted = wal.compact_before(WalOffset::new(0, 0)).unwrap();
         assert_eq!(deleted, 0);
+    }
+
+    #[test]
+    fn dir_returns_configured_directory() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let wal = Wal::open(test_config(tmp.path())).unwrap();
+        assert_eq!(wal.dir(), tmp.path());
     }
 }

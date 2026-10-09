@@ -168,6 +168,17 @@ enum Commands {
     /// Clear all instances and machine definitions from the database
     FlushAll,
 
+    /// Hot backup a running server to a .rstmbak archive (or stdout with -o -)
+    Backup {
+        /// Output path, or "-" for stdout
+        #[arg(short, long, default_value = "-")]
+        output: String,
+
+        /// Compression: gzip | none
+        #[arg(long, default_value = "gzip")]
+        compression: String,
+    },
+
     /// Generate SHA-256 hash of a token for config files
     HashToken {
         /// The token to hash
@@ -436,6 +447,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     eprintln!("{}: {}", "Error".red(), e);
                     std::process::exit(1);
                 }
+            }
+
+            client.close().await?;
+        }
+        Some(Commands::Backup {
+            output,
+            compression,
+        }) => {
+            // Backup is handled inline (not via commands::execute) because
+            // writing to stdout must stay binary-clean: execute()'s caller
+            // does `println!(output)`, which would append a trailing
+            // newline and corrupt the archive when `-o -` is used.
+            client.connect().await.map_err(|e| {
+                eprintln!("{}: {}", "Connection failed".red(), e);
+                e
+            })?;
+
+            // Spawn read loop in background
+            let conn = client.connection();
+            tokio::spawn(async move {
+                let _ = conn.read_loop().await;
+            });
+
+            // Give read_loop a chance to start
+            tokio::task::yield_now().await;
+
+            if let Err(e) = commands::run_backup(&client, &output, &compression).await {
+                eprintln!("{}: {}", "Error".red(), e);
+                std::process::exit(1);
             }
 
             client.close().await?;

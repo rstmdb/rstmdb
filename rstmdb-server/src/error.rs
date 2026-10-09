@@ -53,6 +53,12 @@ pub enum ServerError {
 
     #[error("replication error: {0}")]
     ReplicationError(String),
+
+    #[error("internal error: {0}")]
+    Internal(String),
+
+    #[error("not found: {0}")]
+    NotFound(String),
 }
 
 impl ServerError {
@@ -85,6 +91,8 @@ impl ServerError {
             ServerError::ReadOnlyMode => ErrorCode::ReadOnlyMode,
             ServerError::ReplicationTimeout(_) => ErrorCode::ReplicationTimeout,
             ServerError::ReplicationError(_) => ErrorCode::ReplicationError,
+            ServerError::Internal(_) => ErrorCode::InternalError,
+            ServerError::NotFound(_) => ErrorCode::NotFound,
         }
     }
 
