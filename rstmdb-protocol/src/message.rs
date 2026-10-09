@@ -46,6 +46,11 @@ pub enum Operation {
     WatchAll,
     Unwatch,
 
+    // Hot backup (client-pull pagination)
+    BackupBegin,
+    BackupChunk,
+    BackupEnd,
+
     // Administrative
     FlushAll,
 

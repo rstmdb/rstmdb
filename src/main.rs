@@ -314,6 +314,27 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
         config.compaction.clone(),
     ));
 
+    // Shared gate so hot-backup staging and auto-compaction never overlap:
+    // staging holds it while copying WAL segments/snapshots, compaction holds
+    // it while mutating them.
+    let compaction_gate = std::sync::Arc::new(parking_lot::Mutex::new(()));
+    compaction_manager.set_compaction_gate(compaction_gate.clone());
+
+    // Clear any staging dir orphaned by a previous crash.
+    rstmdb_server::BackupRegistry::clean_staging_dir(&config.storage.data_dir);
+
+    server.set_compaction_gate(compaction_gate.clone());
+
+    // Reap abandoned hot-backup cursors every minute (10-min TTL).
+    let backup_registry = server.backup_registry();
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
+        loop {
+            tick.tick().await;
+            backup_registry.sweep_expired(std::time::Duration::from_secs(600));
+        }
+    });
+
     // Replicas should not run compaction — it's a write operation that produces
     // snapshot files and could interact with WAL replay on restart. Compaction
     // is the primary's responsibility; replicas can reset or be rebuilt if disk

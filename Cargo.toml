@@ -51,6 +51,7 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 clap.workspace = true
 serde_json.workspace = true
+parking_lot.workspace = true
 
 [workspace]
 resolver = "2"
@@ -99,6 +100,9 @@ crc32c = "0.6"
 # Cryptography
 sha2 = "0.10"
 hex = "0.4"
+
+# Encoding
+base64 = "0.22"
 
 # Backup / archiving
 tar = "0.4"

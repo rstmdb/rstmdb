@@ -14,6 +14,7 @@ rstmdb-protocol.workspace = true
 rstmdb-wal.workspace = true
 rstmdb-core.workspace = true
 rstmdb-storage.workspace = true
+rstmdb-backup.workspace = true
 tokio.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -27,6 +28,7 @@ uuid.workspace = true
 bytes.workspace = true
 sha2.workspace = true
 hex.workspace = true
+base64.workspace = true
 rustls.workspace = true
 tokio-rustls.workspace = true
 rustls-pemfile.workspace = true
@@ -38,6 +40,7 @@ hyper-util = { version = "0.1", features = ["tokio"] }
 http-body-util = "0.1"
 
 [dev-dependencies]
+rstmdb-client.workspace = true
 tempfile.workspace = true
 tokio-test.workspace = true
 # Enable WAL test hooks for deterministic interleaving tests (e.g. the H2 sync

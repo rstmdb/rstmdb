@@ -396,6 +396,27 @@ This is a destructive operation that removes all in-memory state. It does not cl
 `FLUSH_ALL` does not replicate and would diverge a cluster, so `storage.allow_flush_all: true` cannot be combined with a `primary` or `replica` role — the server refuses to start. It works only on `standalone` nodes. See [FLUSH_ALL and replication](./operations/replication#flush_all-and-replication).
 :::
 
+#### backup
+
+Hot back up a running server to a `.rstmbak` archive over the wire protocol — no filesystem access to the data directory required. Drives `BACKUP_BEGIN`/`BACKUP_CHUNK`/`BACKUP_END` under the hood and verifies the downloaded archive (manifest + checksums) before writing it out.
+
+```bash
+rstmdb-cli backup [-o <path>] [--compression <gzip|none>]
+```
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `-o, --output <path>` | `-` (stdout) | Destination file, or `-` to stream the archive to stdout |
+| `--compression <gzip\|none>` | `gzip` | Compression applied to the archive |
+
+**Example:**
+```bash
+rstmdb-cli -s host:7401 backup -o db.rstmbak
+rstmdb-cli -s host:7401 backup -o - | aws s3 cp - s3://bucket/rstmdb/backup.rstmbak
+```
+
+See [Backup and Recovery: Hot backup](./operations/backup-recovery#hot-backup-running-server) for restore instructions and running the backup from a replica.
+
 ---
 
 ## Environment Variables

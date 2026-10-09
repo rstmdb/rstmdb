@@ -18,6 +18,7 @@ pub struct CompactionManager {
     last_compact: parking_lot::Mutex<Instant>,
     shutdown: AtomicBool,
     notify: Notify,
+    compaction_gate: std::sync::OnceLock<Arc<parking_lot::Mutex<()>>>,
 }
 
 impl CompactionManager {
@@ -35,7 +36,15 @@ impl CompactionManager {
             last_compact: parking_lot::Mutex::new(Instant::now()),
             shutdown: AtomicBool::new(false),
             notify: Notify::new(),
+            compaction_gate: std::sync::OnceLock::new(),
         }
+    }
+
+    /// Shares a mutex with hot-backup staging so the two never overlap:
+    /// staging holds the gate while copying WAL segments/snapshots, and
+    /// compaction holds it while mutating them.
+    pub fn set_compaction_gate(&self, gate: Arc<parking_lot::Mutex<()>>) {
+        let _ = self.compaction_gate.set(gate);
     }
 
     /// Records that an event occurred (for event-based compaction).
@@ -85,6 +94,10 @@ impl CompactionManager {
 
     /// Runs compaction.
     fn run_compaction(&self) -> CompactionResult {
+        // Hold the shared gate (if any) for the duration of the compaction
+        // pass so hot-backup staging can't observe a WAL/snapshot mid-mutate.
+        let _held = self.compaction_gate.get().map(|g| g.lock());
+
         let mut result = CompactionResult::default();
 
         // Snapshot instances that have changed
@@ -161,6 +174,12 @@ impl CompactionManager {
         tracing::info!("Compaction manager stopped");
     }
 
+    /// Test-only wrapper around the private sync compaction pass.
+    #[cfg(test)]
+    pub fn run_once_for_test(&self) {
+        self.run_compaction();
+    }
+
     /// Signals the compaction manager to shut down.
     pub fn shutdown(&self) {
         self.shutdown.store(true, Ordering::Relaxed);
@@ -188,4 +207,67 @@ pub struct CompactionResult {
 pub struct CompactionStats {
     pub events_since_compact: u64,
     pub last_compact: Duration,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rstmdb_storage::SnapshotStore;
+    use rstmdb_wal::{FsyncPolicy, WalConfig};
+
+    fn build_manager(tmp: &std::path::Path) -> CompactionManager {
+        let engine = Arc::new(
+            StateMachineEngine::new(
+                WalConfig::new(tmp.join("wal")).with_fsync_policy(FsyncPolicy::EveryWrite),
+            )
+            .unwrap(),
+        );
+        let snapshot_store = Arc::new(SnapshotStore::open(tmp.join("snapshots")).unwrap());
+        CompactionManager::new(engine, snapshot_store, CompactionConfig::default())
+    }
+
+    #[test]
+    fn compaction_respects_gate() {
+        use std::sync::atomic::AtomicBool;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mgr = build_manager(tmp.path());
+
+        let gate = Arc::new(parking_lot::Mutex::new(()));
+        mgr.set_compaction_gate(gate.clone());
+
+        // Hold the gate before spawning the compaction thread.
+        let held = gate.lock();
+
+        let started = Arc::new(AtomicBool::new(false));
+        let done = Arc::new(AtomicBool::new(false));
+        let started2 = started.clone();
+        let done2 = done.clone();
+
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                started2.store(true, Ordering::SeqCst);
+                mgr.run_once_for_test();
+                done2.store(true, Ordering::SeqCst);
+            });
+
+            // Give the spawned thread time to start and block on the gate.
+            std::thread::sleep(Duration::from_millis(50));
+            assert!(
+                started.load(Ordering::SeqCst),
+                "compaction thread never started"
+            );
+            assert!(
+                !done.load(Ordering::SeqCst),
+                "compaction ran to completion while the gate was held"
+            );
+
+            drop(held);
+        });
+
+        assert!(
+            done.load(Ordering::SeqCst),
+            "compaction did not complete after the gate was released"
+        );
+    }
 }

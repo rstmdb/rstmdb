@@ -263,6 +263,17 @@ impl Server {
         self.handler.set_replica_client(client);
     }
 
+    /// Shares the compaction gate with the command handler so hot-backup staging
+    /// and auto-compaction are mutually exclusive.
+    pub fn set_compaction_gate(&self, gate: Arc<parking_lot::Mutex<()>>) {
+        self.handler.set_compaction_gate(gate);
+    }
+
+    /// The hot-backup registry (for the TTL sweep task).
+    pub fn backup_registry(&self) -> Arc<crate::BackupRegistry> {
+        self.handler.backup_registry().clone()
+    }
+
     /// Returns a subscribe receiver for shutdown signals.
     pub fn subscribe_shutdown(&self) -> broadcast::Receiver<()> {
         self.shutdown.subscribe()
@@ -645,6 +656,7 @@ impl Server {
                 if session.state() == SessionState::Closing {
                     tracing::debug!("[{}] Session closing", addr);
                     Self::cleanup_subscriptions(&session, &broadcaster);
+                    handler.release_session_backups(&session.id);
                     Self::abort_subscription_tasks(&mut subscription_tasks);
                     return Ok(());
                 }
@@ -699,6 +711,7 @@ impl Server {
                         Ok(0) => {
                             tracing::debug!("[{}] Connection closed by client", addr);
                             Self::cleanup_subscriptions(&session, &broadcaster);
+                            handler.release_session_backups(&session.id);
                             Self::abort_subscription_tasks(&mut subscription_tasks);
                             return Ok(());
                         }
@@ -709,6 +722,7 @@ impl Server {
                         Err(e) => {
                             tracing::debug!("[{}] Read error: {}", addr, e);
                             Self::cleanup_subscriptions(&session, &broadcaster);
+                            handler.release_session_backups(&session.id);
                             Self::abort_subscription_tasks(&mut subscription_tasks);
                             return Err(ServerError::Io(e));
                         }
@@ -720,6 +734,7 @@ impl Server {
                     if session.idle_duration() > config.idle_timeout {
                         tracing::debug!("[{}] Idle timeout", addr);
                         Self::cleanup_subscriptions(&session, &broadcaster);
+                        handler.release_session_backups(&session.id);
                         Self::abort_subscription_tasks(&mut subscription_tasks);
                         return Ok(());
                     }
@@ -729,6 +744,7 @@ impl Server {
                 _ = shutdown.recv() => {
                     tracing::debug!("[{}] Shutdown signal received", addr);
                     Self::cleanup_subscriptions(&session, &broadcaster);
+                    handler.release_session_backups(&session.id);
                     Self::abort_subscription_tasks(&mut subscription_tasks);
                     return Err(ServerError::ShuttingDown);
                 }

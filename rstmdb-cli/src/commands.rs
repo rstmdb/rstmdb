@@ -1,9 +1,12 @@
 //! Command execution.
 
 use crate::Commands;
+use base64::Engine as _;
 use colored::Colorize;
 use rstmdb_client::Client;
-use serde_json::Value;
+use rstmdb_protocol::Operation;
+use serde_json::{json, Value};
+use std::io::Write;
 
 /// Executes a command and returns the formatted output.
 pub async fn execute(client: &Client, cmd: Commands) -> Result<String, Box<dyn std::error::Error>> {
@@ -261,6 +264,10 @@ pub async fn execute(client: &Client, cmd: Commands) -> Result<String, Box<dyn s
         Commands::WatchInstance { .. } => unreachable!(),
         Commands::WatchAll { .. } => unreachable!(),
 
+        // Backup is handled inline in main.rs (must not go through the
+        // println!(output) path so `-o -` stdout output stays binary-clean)
+        Commands::Backup { .. } => unreachable!(),
+
         Commands::FlushAll => {
             let result = client.flush_all().await?;
             let instances = result["instances_removed"].as_u64().unwrap_or(0);
@@ -290,6 +297,125 @@ pub async fn execute(client: &Client, cmd: Commands) -> Result<String, Box<dyn s
             }
         }
     }
+}
+
+/// Hot-backs-up a running server via BackupBegin/Chunk/End, verifying the
+/// assembled archive client-side before writing it out.
+///
+/// Writes ONLY the raw archive bytes to stdout when `output == "-"` — no
+/// other output may go to stdout in that path, or it would corrupt the
+/// archive. Status/summary output goes to stderr.
+pub async fn run_backup(
+    client: &Client,
+    output: &str,
+    compression: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let conn = client.connection();
+
+    // BEGIN
+    let begin = conn
+        .request(
+            Operation::BackupBegin,
+            json!({ "compression": compression }),
+        )
+        .await?;
+    if !begin.is_ok() {
+        return Err(format!(
+            "backup begin failed: {}",
+            begin.error.map(|e| e.message).unwrap_or_default()
+        )
+        .into());
+    }
+    let r = begin.result.unwrap_or_default();
+    let backup_id = r["backup_id"]
+        .as_str()
+        .ok_or("no backup_id in response")?
+        .to_string();
+    let total_bytes = r["total_bytes"].as_u64().unwrap_or(0);
+    let chunk_size = r["chunk_size"].as_u64().unwrap_or(4 * 1024 * 1024);
+
+    // Sink: file or stdout. Buffer in memory so we can verify before finalizing.
+    let mut assembled: Vec<u8> = Vec::with_capacity(total_bytes as usize);
+    let mut offset = 0u64;
+    loop {
+        let resp = conn
+            .request(
+                Operation::BackupChunk,
+                json!({ "backup_id": backup_id, "offset": offset, "len": chunk_size }),
+            )
+            .await?;
+        if !resp.is_ok() {
+            // Best-effort release before erroring out.
+            let _ = conn
+                .request(Operation::BackupEnd, json!({ "backup_id": backup_id }))
+                .await;
+            return Err(format!(
+                "backup chunk failed at offset {offset}: {}",
+                resp.error.map(|e| e.message).unwrap_or_default()
+            )
+            .into());
+        }
+        let body = resp.result.unwrap_or_default();
+        let b64 = match body["bytes"].as_str() {
+            Some(b64) => b64,
+            None => {
+                // Best-effort release before erroring out.
+                let _ = conn
+                    .request(Operation::BackupEnd, json!({ "backup_id": backup_id }))
+                    .await;
+                return Err("malformed BackupChunk response: missing 'bytes'".into());
+            }
+        };
+        let bytes = base64::engine::general_purpose::STANDARD.decode(b64)?;
+        let eof = body["eof"].as_bool().unwrap_or(false);
+        if bytes.is_empty() && !eof {
+            // Best-effort release before erroring out.
+            let _ = conn
+                .request(Operation::BackupEnd, json!({ "backup_id": backup_id }))
+                .await;
+            return Err(format!(
+                "backup stalled: server returned an empty non-final chunk at offset {offset}"
+            )
+            .into());
+        }
+        offset += bytes.len() as u64;
+        assembled.extend_from_slice(&bytes);
+        if eof {
+            break;
+        }
+    }
+
+    // END (release the server temp file). Best-effort: the download already
+    // succeeded, so a failure to release shouldn't fail the whole command.
+    let _ = conn
+        .request(Operation::BackupEnd, json!({ "backup_id": backup_id }))
+        .await;
+
+    // Verify the assembled archive client-side before writing it out.
+    let manifest = rstmdb_backup::verify_backup(std::io::Cursor::new(assembled.clone()))
+        .map_err(|e| format!("downloaded archive failed verification: {e}"))?;
+
+    // Write to sink.
+    if output == "-" {
+        std::io::stdout().write_all(&assembled)?;
+        std::io::stdout().flush()?;
+    } else {
+        std::fs::write(output, &assembled)?;
+    }
+
+    eprintln!(
+        "backup ok: {} segments, {} snapshots, head seq={} ({} bytes){}",
+        manifest.segment_count,
+        manifest.snapshot_count,
+        manifest.wal_head_sequence,
+        total_bytes,
+        if output == "-" {
+            String::new()
+        } else {
+            format!(" -> {output}")
+        }
+    );
+    Ok(())
 }
 
 /// Formats bytes as human-readable string.

@@ -117,6 +117,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "base64"
+version = "0.22.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
+
+[[package]]
 name = "bit-set"
 version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1301,6 +1307,7 @@ name = "rstmdb"
 version = "0.3.0"
 dependencies = [
  "clap",
+ "parking_lot",
  "rstmdb-backup",
  "rstmdb-core",
  "rstmdb-server",
@@ -1353,9 +1360,11 @@ dependencies = [
 name = "rstmdb-cli"
 version = "0.3.0"
 dependencies = [
+ "base64",
  "clap",
  "colored",
  "hex",
+ "rstmdb-backup",
  "rstmdb-client",
  "rstmdb-protocol",
  "rustyline",
@@ -1421,6 +1430,7 @@ dependencies = [
 name = "rstmdb-server"
 version = "0.3.0"
 dependencies = [
+ "base64",
  "bytes",
  "dashmap",
  "hex",
@@ -1430,6 +1440,8 @@ dependencies = [
  "parking_lot",
  "pin-project-lite",
  "prometheus",
+ "rstmdb-backup",
+ "rstmdb-client",
  "rstmdb-core",
  "rstmdb-protocol",
  "rstmdb-storage",
