@@ -411,7 +411,12 @@ impl Wal {
             }
 
             let mut seg = segment.lock();
-            let records = seg.read_all()?;
+            // Only the first segment can contain records before `from`.
+            let records = if seg_id == from.segment_id() {
+                seg.read_from(from.offset())?
+            } else {
+                seg.read_all()?
+            };
 
             for (offset, record) in records {
                 let wal_offset = WalOffset::new(seg_id, offset);
