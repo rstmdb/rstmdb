@@ -5,7 +5,7 @@
 //! - Cleanup: Old segments can be deleted after snapshotting
 //! - Recovery: Segments can be read independently
 
-use crate::entry::WalRecord;
+use crate::entry::{WalRecord, WAL_MAGIC};
 use crate::error::WalError;
 use crate::RECORD_HEADER_SIZE;
 use bytes::BytesMut;
@@ -137,18 +137,71 @@ impl Segment {
 
     /// Reads all records from the segment.
     pub fn read_all(&mut self) -> Result<Vec<(u64, WalRecord)>, WalError> {
-        self.read_from(0)
+        self.read_from(0, None)
     }
 
-    /// Reads all records whose offset is `>= start`. `start` need not be a
-    /// record boundary: scanning resumes from the nearest known boundary at or
-    /// before it, and records before `start` are skipped.
-    pub fn read_from(&mut self, start: u64) -> Result<Vec<(u64, WalRecord)>, WalError> {
-        let mut records = Vec::new();
-        let mut offset = match self.index.partition_point(|&c| c <= start) {
-            0 => 0,
+    /// Reads records whose offset is `>= start`, at most `limit` of them.
+    /// `start` need not be a record boundary: scanning resumes from the nearest
+    /// known boundary at or before it, and records before `start` are skipped.
+    ///
+    /// Records before that boundary are not decoded, so corruption there does
+    /// not surface here; `read_all` (and recovery) still scan from offset 0.
+    pub fn read_from(
+        &mut self,
+        start: u64,
+        limit: Option<usize>,
+    ) -> Result<Vec<(u64, WalRecord)>, WalError> {
+        let limit = limit.unwrap_or(usize::MAX);
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        let checkpoint = self.checkpoint_for(start)?;
+        match self.scan(checkpoint, start, limit) {
+            // The file changed behind the index's back in a way the magic check
+            // couldn't catch. Forget everything learned and rescan from 0.
+            Err(_) if checkpoint > 0 => {
+                self.index.clear();
+                self.scan(0, start, limit)
+            }
+            result => result,
+        }
+    }
+
+    /// Returns the nearest indexed record boundary at or before `start`,
+    /// verifying it still lies within the file and begins with `WAL_MAGIC`.
+    /// The index assumes the file only changes through this `Segment`; if it
+    /// was rewritten or truncated out of band, the index is dropped and the
+    /// scan restarts from 0.
+    fn checkpoint_for(&mut self, start: u64) -> Result<u64, WalError> {
+        let checkpoint = match self.index.partition_point(|&c| c <= start) {
+            0 => return Ok(0),
             i => self.index[i - 1],
         };
+
+        let mut magic = [0u8; 4];
+        let valid = checkpoint + RECORD_HEADER_SIZE as u64 <= self.file.metadata()?.len() && {
+            self.file.seek(SeekFrom::Start(checkpoint))?;
+            self.file.read_exact(&mut magic)?;
+            magic == WAL_MAGIC
+        };
+        if valid {
+            Ok(checkpoint)
+        } else {
+            self.index.clear();
+            Ok(0)
+        }
+    }
+
+    /// Decodes records from `offset` (a record boundary) to EOF, returning up
+    /// to `limit` of those at or after `start`.
+    fn scan(
+        &mut self,
+        mut offset: u64,
+        start: u64,
+        limit: usize,
+    ) -> Result<Vec<(u64, WalRecord)>, WalError> {
+        let mut records = Vec::new();
 
         self.file.seek(SeekFrom::Start(offset))?;
         let mut reader = BufReader::new(&self.file);
@@ -172,6 +225,9 @@ impl Segment {
                         note_boundary(&mut self.index, record_offset);
                         if record_offset >= start {
                             records.push((record_offset, record));
+                            if records.len() == limit {
+                                return Ok(records);
+                            }
                         }
                         offset += record_size as u64;
                     }
@@ -339,7 +395,7 @@ mod tests {
         for start in probes {
             let expected: Vec<u64> = offsets.iter().copied().filter(|&o| o >= start).collect();
             let got: Vec<u64> = segment
-                .read_from(start)
+                .read_from(start, None)
                 .unwrap()
                 .into_iter()
                 .map(|(o, _)| o)
@@ -370,7 +426,7 @@ mod tests {
         // correct (before and after the first full scan builds the index).
         let mut segment = Segment::open(dir.path(), 1, DEFAULT_SEGMENT_SIZE).unwrap();
         let last = *offsets.last().unwrap();
-        assert_eq!(segment.read_from(last).unwrap().len(), 1);
+        assert_eq!(segment.read_from(last, None).unwrap().len(), 1);
         assert_read_from_matches(&mut segment, &offsets);
 
         // Appends after reopen keep the index consistent.
@@ -396,5 +452,53 @@ mod tests {
             all.push(segment.append(&record).unwrap());
         }
         assert_read_from_matches(&mut segment, &all);
+    }
+
+    #[test]
+    fn test_segment_read_from_survives_out_of_band_rewrite() {
+        let dir = TempDir::new().unwrap();
+        let mut segment = Segment::create(dir.path(), 1, DEFAULT_SEGMENT_SIZE).unwrap();
+        let old = fill_segment(&mut segment, 300);
+        segment.read_all().unwrap(); // warm the index
+
+        // Rewrite the file in place behind this handle's back (manual repair,
+        // copy over a live file) with differently sized records, so learned
+        // checkpoints land mid-record or past the new EOF.
+        let other = TempDir::new().unwrap();
+        let mut replacement = Segment::create(other.path(), 1, DEFAULT_SEGMENT_SIZE).unwrap();
+        let mut new = Vec::new();
+        for i in 0..150u64 {
+            let payload = format!(r#"{{"r":{},"pad":"{}"}}"#, i, "z".repeat(777));
+            let record = WalRecord::new(WalEntryType::ApplyEvent, i, Bytes::from(payload));
+            new.push(replacement.append(&record).unwrap());
+        }
+        replacement.sync().unwrap();
+        std::fs::copy(replacement.path(), segment.path()).unwrap();
+        assert!(old.last() > new.last());
+
+        assert_read_from_matches(&mut segment, &new);
+    }
+
+    #[test]
+    fn test_segment_read_from_limit() {
+        let dir = TempDir::new().unwrap();
+        let mut segment = Segment::create(dir.path(), 1, DEFAULT_SEGMENT_SIZE).unwrap();
+        let offsets = fill_segment(&mut segment, 300);
+
+        for (start, limit) in [(0, 0), (0, 5), (offsets[100] + 1, 7), (offsets[290], 50)] {
+            let expected: Vec<u64> = offsets
+                .iter()
+                .copied()
+                .filter(|&o| o >= start)
+                .take(limit)
+                .collect();
+            let got: Vec<u64> = segment
+                .read_from(start, Some(limit))
+                .unwrap()
+                .into_iter()
+                .map(|(o, _)| o)
+                .collect();
+            assert_eq!(got, expected, "read_from({}, Some({}))", start, limit);
+        }
     }
 }
