@@ -158,10 +158,12 @@ impl Segment {
 
         let checkpoint = self.checkpoint_for(start)?;
         match self.scan(checkpoint, start, limit) {
-            // The file changed behind the index's back in a way the magic check
-            // couldn't catch. Forget everything learned and rescan from 0.
+            // Either the file changed behind the index's back in a way the
+            // magic check couldn't catch, or there is genuine corruption past
+            // the checkpoint. Drop the checkpoints from here on (earlier ones
+            // are still trusted) and rescan from 0, which is authoritative.
             Err(_) if checkpoint > 0 => {
-                self.index.clear();
+                self.index.retain(|&c| c < checkpoint);
                 self.scan(0, start, limit)
             }
             result => result,
@@ -173,6 +175,9 @@ impl Segment {
     /// The index assumes the file only changes through this `Segment`; if it
     /// was rewritten or truncated out of band, the index is dropped and the
     /// scan restarts from 0.
+    ///
+    /// Only reads tolerate out-of-band changes: `append` still trusts the
+    /// cached `size`, so offsets it returns after such a change are wrong.
     fn checkpoint_for(&mut self, start: u64) -> Result<u64, WalError> {
         let checkpoint = match self.index.partition_point(|&c| c <= start) {
             0 => return Ok(0),
@@ -201,6 +206,7 @@ impl Segment {
         start: u64,
         limit: usize,
     ) -> Result<Vec<(u64, WalRecord)>, WalError> {
+        let from_checkpoint = offset > 0;
         let mut records = Vec::new();
 
         self.file.seek(SeekFrom::Start(offset))?;
@@ -234,6 +240,18 @@ impl Segment {
                     None => break, // Need more data
                 }
             }
+        }
+
+        // Undecodable bytes at EOF. From offset 0 that's a torn tail (an append
+        // in flight or a crash mid-write) and the records so far are the answer.
+        // From a checkpoint it may instead be a stale checkpoint landing on
+        // bytes that merely look like a header, so report it and let
+        // `read_from` rescan from 0 rather than return a short result.
+        if from_checkpoint && !buf.is_empty() {
+            return Err(WalError::InvalidHeader {
+                offset,
+                reason: "undecodable bytes at end of segment".to_string(),
+            });
         }
 
         Ok(records)
@@ -500,5 +518,126 @@ mod tests {
                 .collect();
             assert_eq!(got, expected, "read_from({}, Some({}))", start, limit);
         }
+    }
+
+    /// Overwrites `segment`'s file out of band with a record whose payload
+    /// carries `planted` (a fake record header) exactly at a checkpoint the
+    /// segment learned earlier, followed by a few ordinary records. Returns the
+    /// planted checkpoint and the new file's record offsets.
+    fn rewrite_with_planted_header(
+        segment: &mut Segment,
+        planted: [u8; RECORD_HEADER_SIZE],
+    ) -> (u64, Vec<u64>) {
+        let checkpoint = segment.index[2];
+        let other = TempDir::new().unwrap();
+        let mut replacement = Segment::create(other.path(), 1, DEFAULT_SEGMENT_SIZE).unwrap();
+
+        let mut payload = vec![b'a'; checkpoint as usize - RECORD_HEADER_SIZE];
+        payload.extend_from_slice(&planted);
+        payload.extend_from_slice(&[b'b'; 100]);
+        let mut offsets = vec![replacement
+            .append(&WalRecord::new(
+                WalEntryType::ApplyEvent,
+                0,
+                Bytes::from(payload),
+            ))
+            .unwrap()];
+        for i in 1..6u64 {
+            let record = WalRecord::new(WalEntryType::ApplyEvent, i, Bytes::from("{}"));
+            offsets.push(replacement.append(&record).unwrap());
+        }
+        replacement.sync().unwrap();
+        std::fs::copy(replacement.path(), segment.path()).unwrap();
+        (checkpoint, offsets)
+    }
+
+    fn fake_header(entry_type: u8, payload_len: u32) -> [u8; RECORD_HEADER_SIZE] {
+        let mut h = [0u8; RECORD_HEADER_SIZE];
+        h[0..4].copy_from_slice(&WAL_MAGIC);
+        h[4] = entry_type;
+        h[8..12].copy_from_slice(&payload_len.to_be_bytes());
+        h
+    }
+
+    fn read_offsets(segment: &mut Segment, start: u64) -> Vec<u64> {
+        segment
+            .read_from(start, None)
+            .unwrap()
+            .into_iter()
+            .map(|(o, _)| o)
+            .collect()
+    }
+
+    #[test]
+    fn test_segment_stale_checkpoint_with_magic_but_invalid_header() {
+        let dir = TempDir::new().unwrap();
+        let mut segment = Segment::create(dir.path(), 1, DEFAULT_SEGMENT_SIZE).unwrap();
+        fill_segment(&mut segment, 300);
+        segment.read_all().unwrap();
+
+        // Passes the magic check, then fails to decode (unknown entry type):
+        // the scan must fall back to offset 0 instead of erroring.
+        let (checkpoint, offsets) =
+            rewrite_with_planted_header(&mut segment, fake_header(0x7f, 10));
+        let expected: Vec<u64> = offsets
+            .iter()
+            .copied()
+            .filter(|&o| o >= checkpoint)
+            .collect();
+        assert_eq!(read_offsets(&mut segment, checkpoint), expected);
+        assert_read_from_matches(&mut segment, &offsets);
+    }
+
+    #[test]
+    fn test_segment_stale_checkpoint_with_magic_and_overlong_length() {
+        let dir = TempDir::new().unwrap();
+        let mut segment = Segment::create(dir.path(), 1, DEFAULT_SEGMENT_SIZE).unwrap();
+        fill_segment(&mut segment, 300);
+        segment.read_all().unwrap();
+
+        // Valid-looking header whose length runs past EOF: decoding just waits
+        // for more data until EOF. From a checkpoint that must not silently
+        // return a short result.
+        let header = fake_header(WalEntryType::ApplyEvent as u8, 1_000_000);
+        let (checkpoint, offsets) = rewrite_with_planted_header(&mut segment, header);
+        let expected: Vec<u64> = offsets
+            .iter()
+            .copied()
+            .filter(|&o| o >= checkpoint)
+            .collect();
+        assert_eq!(read_offsets(&mut segment, checkpoint), expected);
+        assert_read_from_matches(&mut segment, &offsets);
+    }
+
+    #[test]
+    fn test_segment_corruption_past_checkpoint_is_reported() {
+        let dir = TempDir::new().unwrap();
+        let mut segment = Segment::create(dir.path(), 1, DEFAULT_SEGMENT_SIZE).unwrap();
+        let offsets = fill_segment(&mut segment, 300);
+        segment.read_all().unwrap();
+        // Genuine corruption: flip a payload byte of the last record (CRC
+        // mismatch), which lies past the last learned checkpoint.
+        let bad = *offsets.last().unwrap();
+        let checkpoint = *segment.index.iter().rev().find(|&&c| c <= bad).unwrap();
+        let earlier: Vec<u64> = segment
+            .index
+            .iter()
+            .copied()
+            .filter(|&c| c < checkpoint)
+            .collect();
+        assert!(!earlier.is_empty());
+        {
+            let mut f = OpenOptions::new().write(true).open(segment.path()).unwrap();
+            f.seek(SeekFrom::Start(bad + RECORD_HEADER_SIZE as u64 + 1))
+                .unwrap();
+            f.write_all(b"#").unwrap();
+        }
+
+        assert!(segment.read_from(bad, None).is_err());
+        assert!(
+            earlier.iter().all(|c| segment.index.contains(c)),
+            "checkpoints before the corruption should survive: {:?}",
+            segment.index
+        );
     }
 }
