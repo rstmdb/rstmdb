@@ -411,7 +411,12 @@ impl Wal {
             }
 
             let mut seg = segment.lock();
-            let records = seg.read_all()?;
+            // Only the first segment can contain records before `from`.
+            let records = if seg_id == from.segment_id() {
+                seg.read_from(from.offset(), limit.map(|_| remaining))?
+            } else {
+                seg.read_from(0, limit.map(|_| remaining))?
+            };
 
             for (offset, record) in records {
                 let wal_offset = WalOffset::new(seg_id, offset);
@@ -640,6 +645,62 @@ mod tests {
 
             let entries = wal.read_from(WalOffset::new(1, 0), None).unwrap();
             assert_eq!(entries.len(), 10);
+        }
+    }
+
+    #[test]
+    fn test_wal_read_from_matches_full_scan_across_segments() {
+        let dir = TempDir::new().unwrap();
+        let wal = Wal::open(test_config(dir.path())).unwrap();
+        for i in 0..60 {
+            let entry = WalEntry::ApplyEvent {
+                instance_id: "i-1".to_string(),
+                event: format!("E{}", i),
+                from_state: "s1".to_string(),
+                to_state: "s2".to_string(),
+                payload: serde_json::json!({"pad": "p".repeat(100)}),
+                ctx: serde_json::json!({}),
+                event_id: None,
+                idempotency_key: None,
+            };
+            wal.append(&entry).unwrap();
+        }
+
+        let all: Vec<WalOffset> = wal
+            .read_from(WalOffset::new(0, 0), None)
+            .unwrap()
+            .into_iter()
+            .map(|(_, o, _)| o)
+            .collect();
+        let first_seg = all[0].segment_id();
+        let seg1: Vec<WalOffset> = all
+            .iter()
+            .copied()
+            .filter(|o| o.segment_id() == first_seg)
+            .collect();
+        assert!(seg1.len() < all.len(), "test needs multiple segments");
+        let last1 = *seg1.last().unwrap();
+
+        let cases = [
+            (WalOffset::new(first_seg, seg1[3].offset() + 1), None), // mid-record
+            (seg1[3], None),                                         // exact boundary
+            (WalOffset::new(first_seg, last1.offset() + 1), None),   // end of segment 1
+            (seg1[seg1.len() - 2], Some(5)),                         // limit spans segments
+        ];
+        for (from, limit) in cases {
+            let expected: Vec<WalOffset> = all
+                .iter()
+                .copied()
+                .filter(|&o| o >= from)
+                .take(limit.unwrap_or(usize::MAX))
+                .collect();
+            let got: Vec<WalOffset> = wal
+                .read_from(from, limit)
+                .unwrap()
+                .into_iter()
+                .map(|(_, o, _)| o)
+                .collect();
+            assert_eq!(got, expected, "read_from({:?}, {:?})", from, limit);
         }
     }
 
