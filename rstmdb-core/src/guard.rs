@@ -300,13 +300,13 @@ impl<'a> Parser<'a> {
         // Parse field name (including nested dots)
         while let Some(c) = self.peek_char() {
             if c.is_alphanumeric() || c == '_' || c == '.' {
-                self.pos += 1;
+                self.pos += c.len_utf8();
             } else {
                 break;
             }
         }
 
-        let field = &self.input[start + 4..self.pos];
+        let field = self.input.get(start + 4..self.pos).unwrap_or("");
         if field.is_empty() {
             return Err(CoreError::InvalidGuard {
                 reason: "empty field name".to_string(),
@@ -320,7 +320,7 @@ impl<'a> Parser<'a> {
         self.skip_whitespace();
 
         // Try to parse as JSON value
-        let rest = &self.input[self.pos..];
+        let rest = self.input.get(self.pos..).unwrap_or("");
 
         // Boolean
         if rest.starts_with("true") {
@@ -357,14 +357,19 @@ impl<'a> Parser<'a> {
         let start = self.pos;
         while let Some(c) = self.peek_char() {
             if c == '"' {
-                let s = &self.input[start..self.pos];
+                let s = self.input.get(start..self.pos).unwrap_or("");
                 self.pos += 1;
                 return Ok(Value::String(s.to_string()));
             }
             if c == '\\' {
-                self.pos += 2; // Skip escape sequence
-            } else {
+                // skip the backslash, then the escaped char by its width, so a
+                // multi-byte escaped char can't leave `pos` mid-character.
                 self.pos += 1;
+                if let Some(esc) = self.peek_char() {
+                    self.pos += esc.len_utf8();
+                }
+            } else {
+                self.pos += c.len_utf8();
             }
         }
 
@@ -403,7 +408,7 @@ impl<'a> Parser<'a> {
             }
         }
 
-        let num_str = &self.input[start..self.pos];
+        let num_str = self.input.get(start..self.pos).unwrap_or("");
         num_str.parse::<f64>().map_err(|_| CoreError::InvalidGuard {
             reason: format!("invalid number: '{}'", num_str),
         })
@@ -412,7 +417,7 @@ impl<'a> Parser<'a> {
     fn skip_whitespace(&mut self) {
         while let Some(c) = self.peek_char() {
             if c.is_whitespace() {
-                self.pos += 1;
+                self.pos += c.len_utf8();
             } else {
                 break;
             }
@@ -420,11 +425,15 @@ impl<'a> Parser<'a> {
     }
 
     fn peek_char(&self) -> Option<char> {
-        self.input[self.pos..].chars().next()
+        // char-boundary-safe: `.get` yields None (not a panic) if `pos` ever lands
+        // mid-char; the advance methods keep `pos` on a boundary.
+        self.input.get(self.pos..).and_then(|s| s.chars().next())
     }
 
     fn peek_str(&self, s: &str) -> bool {
-        self.input[self.pos..].starts_with(s)
+        self.input
+            .get(self.pos..)
+            .is_some_and(|rest| rest.starts_with(s))
     }
 }
 
@@ -462,6 +471,24 @@ mod tests {
         let guard = GuardExpr::parse("ctx.status == \"active\"").unwrap();
         assert!(guard.evaluate(&json!({"status": "active"})));
         assert!(!guard.evaluate(&json!({"status": "inactive"})));
+    }
+
+    #[test]
+    fn test_multibyte_input_does_not_panic() {
+        // Regression: the hand-rolled parser advanced `pos` by 1 byte per
+        // char, so a multi-byte char (via is_alphanumeric / is_whitespace / a string
+        // literal) left `pos` mid-character and the next str-slice panicked. The parser
+        // now advances by `char::len_utf8`, so untrusted guard strings with multi-byte
+        // content parse (or error) without panicking.
+        // Multi-byte string literal:
+        let guard = GuardExpr::parse("ctx.status == \"café\"").unwrap();
+        assert!(guard.evaluate(&json!({"status": "café"})));
+        assert!(!guard.evaluate(&json!({"status": "cafe"})));
+        // Multi-byte field name (is_alphanumeric is true for 'é'):
+        let guard = GuardExpr::parse("ctx.café == 1").unwrap();
+        assert!(guard.evaluate(&json!({"café": 1})));
+        // Multi-byte whitespace (U+00A0) must not panic; it parses or errors:
+        let _ = GuardExpr::parse("ctx.a\u{00A0}==\u{00A0}1");
     }
 
     #[test]
