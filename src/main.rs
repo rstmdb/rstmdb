@@ -260,6 +260,22 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
             .with_allow_instance_recreate(config.storage.allow_instance_recreate),
     );
 
+    // A FLUSH_ALL marker newer than the snapshot store (crash before the
+    // store was cleared): recovery already ignored the stale files, now
+    // delete them so compaction never sees them.
+    if !config.replication.is_replica() {
+        if let Some(flush_offset) = engine.last_flush_offset() {
+            let discarded = snapshot_store.discard_before(flush_offset)?;
+            if discarded > 0 {
+                tracing::info!(
+                    "Discarded {} snapshots older than FLUSH_ALL at offset {}",
+                    discarded,
+                    flush_offset
+                );
+            }
+        }
+    }
+
     // Create metrics if enabled
     let (metrics, shutdown_tx) = if config.metrics.enabled {
         let metrics = Arc::new(Metrics::new()?);

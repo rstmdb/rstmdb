@@ -48,6 +48,17 @@ pub struct Segment {
     index: Vec<u64>,
 }
 
+#[cfg(unix)]
+fn sync_dir(dir: &Path) -> Result<(), WalError> {
+    File::open(dir)?.sync_all()?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn sync_dir(_dir: &Path) -> Result<(), WalError> {
+    Ok(())
+}
+
 impl Segment {
     /// Creates a new segment file.
     pub fn create(dir: &Path, id: SegmentId, max_size: u64) -> Result<Self, WalError> {
@@ -57,6 +68,9 @@ impl Segment {
             .read(true)
             .write(true)
             .open(&path)?;
+        // Persist the new directory entry: without it a record fsynced into
+        // this segment can vanish with the file after a power loss.
+        sync_dir(dir)?;
 
         Ok(Self {
             id,

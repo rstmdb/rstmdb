@@ -834,8 +834,8 @@ fn test_delete_and_recreate_replicates() {
 
 #[test]
 fn test_flush_all_on_primary_does_not_affect_replica() {
-    // flush_all clears in-memory state but doesn't write a WAL entry,
-    // so the replica retains its replicated state
+    // The replica only sees what is streamed to it; flushing the primary after
+    // the last replicated entry leaves the replica's copy intact.
     let primary_dir = TempDir::new().unwrap();
     let replica_dir = TempDir::new().unwrap();
 
@@ -859,10 +859,10 @@ fn test_flush_all_on_primary_does_not_affect_replica() {
     }
 
     // Now flush primary
-    primary.flush_all();
+    primary.flush_all().unwrap();
     assert!(primary.get_instance("flush-test").is_err());
 
-    // Replica still has it (flush_all doesn't produce a WAL entry)
+    // Replica still has it (the FlushAll marker was never streamed to it)
     assert!(replica.get_instance("flush-test").is_ok());
 }
 

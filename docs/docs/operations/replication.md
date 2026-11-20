@@ -320,9 +320,9 @@ Pair this with the bundled Grafana dashboard (`grafana/dashboards/rstmdb.json`) 
 
 ## FLUSH_ALL and replication
 
-`FLUSH_ALL` clears all instances and machine definitions, but it is **not a replicated operation**. In a replicated cluster it is unsafe:
+`FLUSH_ALL` clears all instances and machine definitions and records the flush in the WAL, but it is **not supported in a replicated cluster**:
 
-- On a **primary**, the flush clears the primary's in-memory state while replicas keep the old data — the cluster silently diverges (replicas hold instances the primary no longer has).
+- On a **primary**, replica recovery and snapshot cleanup do not account for the flush, so the cluster can diverge.
 - On a **replica**, it is a local-only mutation that breaks WAL parity with the primary.
 
 Because of this, the server **refuses to start** when `storage.allow_flush_all: true` is combined with any replication role (`primary` or `replica`) — even if you set the flag explicitly:

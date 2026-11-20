@@ -49,6 +49,8 @@ pub enum WalEntryType {
     Snapshot = 5,
     /// Checkpoint marker (for recovery).
     Checkpoint = 6,
+    /// All state cleared (FLUSH_ALL). Recovery ignores everything before it.
+    FlushAll = 7,
     /// No-op (for padding/alignment).
     Noop = 255,
 }
@@ -64,6 +66,7 @@ impl TryFrom<u8> for WalEntryType {
             4 => Ok(WalEntryType::DeleteInstance),
             5 => Ok(WalEntryType::Snapshot),
             6 => Ok(WalEntryType::Checkpoint),
+            7 => Ok(WalEntryType::FlushAll),
             255 => Ok(WalEntryType::Noop),
             _ => Err(WalError::InvalidHeader {
                 offset: 0,
@@ -273,6 +276,11 @@ pub enum WalEntry {
     Checkpoint {
         timestamp: i64,
     },
+    /// FLUSH_ALL marker: every machine, instance and idempotency record
+    /// written before it is gone.
+    FlushAll {
+        timestamp: i64,
+    },
 }
 
 impl WalEntry {
@@ -285,6 +293,7 @@ impl WalEntry {
             WalEntry::DeleteInstance { .. } => WalEntryType::DeleteInstance,
             WalEntry::Snapshot { .. } => WalEntryType::Snapshot,
             WalEntry::Checkpoint { .. } => WalEntryType::Checkpoint,
+            WalEntry::FlushAll { .. } => WalEntryType::FlushAll,
         }
     }
 
@@ -366,6 +375,21 @@ mod tests {
 
         assert_eq!(parsed.entry_type(), WalEntryType::ApplyEvent);
         assert_eq!(parsed.instance_id(), Some("i-1"));
+    }
+
+    #[test]
+    fn test_flush_all_entry() {
+        let entry = WalEntry::FlushAll { timestamp: 42 };
+        assert_eq!(entry.entry_type(), WalEntryType::FlushAll);
+        assert_eq!(entry.entry_type() as u8, 7);
+        assert_eq!(entry.instance_id(), None);
+
+        let json = serde_json::to_string(&entry).unwrap();
+        assert_eq!(json, r#"{"type":"flush_all","timestamp":42}"#);
+        let parsed: WalEntry = serde_json::from_str(&json).unwrap();
+        assert!(matches!(parsed, WalEntry::FlushAll { timestamp: 42 }));
+
+        assert_eq!(WalEntryType::try_from(7u8).unwrap(), WalEntryType::FlushAll);
     }
 
     #[test]
