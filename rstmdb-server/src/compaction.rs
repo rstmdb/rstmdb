@@ -60,7 +60,7 @@ fn snapshot_and_compact_with(
     // even if every snapshot taken below lands in a later segment.
     let head = engine.wal().latest_offset().map(|o| o.as_u64());
 
-    store.save_machines(&engine.machine_records()?)?;
+    store.save_machines(&engine.machine_records()?, head.unwrap_or(0))?;
     after_machines();
 
     for (instance, idempotency) in engine.instances_for_snapshot() {
@@ -400,6 +400,84 @@ mod tests {
         assert!(engine
             .create_instance("keep", "m", 1, json!({"x": 1}), Some("create-keep"))
             .is_ok());
+    }
+
+    /// FLUSH_ALL, new data, compaction, restart: only the new data exists.
+    #[test]
+    fn flush_then_compaction_then_restart_keeps_new_data() {
+        use serde_json::json;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let def = json!({"states": ["a"], "initial": "a", "transitions": []});
+        {
+            let engine = StateMachineEngine::new(small_wal(tmp.path())).unwrap();
+            let store = SnapshotStore::open(tmp.path().join("snapshots")).unwrap();
+            engine.put_machine("old", 1, &def).unwrap();
+            engine
+                .create_instance("gone", "old", 1, json!({}), None)
+                .unwrap();
+            snapshot_and_compact(&engine, &store, SnapshotMode::Changed).unwrap();
+
+            engine.flush_all().unwrap();
+            store.clear().unwrap();
+
+            engine.put_machine("new", 1, &def).unwrap();
+            engine
+                .create_instance("x", "new", 1, json!({"v": 1}), None)
+                .unwrap();
+            snapshot_and_compact(&engine, &store, SnapshotMode::Changed).unwrap();
+        }
+
+        let store = SnapshotStore::open(tmp.path().join("snapshots")).unwrap();
+        let engine = StateMachineEngine::new_with_recovery(
+            small_wal(tmp.path()),
+            store.load_recovery_state().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(engine.list_instance_ids(), vec!["x".to_string()]);
+        assert!(engine.get_machine("new", 1).is_ok());
+        assert!(engine.get_machine("old", 1).is_err());
+    }
+
+    /// Crash after the FlushAll marker but before the store was cleared:
+    /// recovery ignores the stale store, discard_before removes it, and a
+    /// second restart gives the same result.
+    #[test]
+    fn crash_before_store_clear_recovers_flushed_state_twice() {
+        use serde_json::json;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let def = json!({"states": ["a"], "initial": "a", "transitions": []});
+        {
+            let engine = StateMachineEngine::new(small_wal(tmp.path())).unwrap();
+            let store = SnapshotStore::open(tmp.path().join("snapshots")).unwrap();
+            engine.put_machine("old", 1, &def).unwrap();
+            engine
+                .create_instance("gone", "old", 1, json!({}), None)
+                .unwrap();
+            snapshot_and_compact(&engine, &store, SnapshotMode::Changed).unwrap();
+            engine.flush_all().unwrap();
+            // "Crash": store.clear() never runs.
+        }
+
+        for restart in 0..2 {
+            let store = SnapshotStore::open(tmp.path().join("snapshots")).unwrap();
+            let engine = StateMachineEngine::new_with_recovery(
+                small_wal(tmp.path()),
+                store.load_recovery_state().unwrap(),
+            )
+            .unwrap();
+            assert_eq!(engine.instance_count(), 0, "restart {restart}");
+            assert!(engine.get_machine("old", 1).is_err(), "restart {restart}");
+
+            let f = engine.last_flush_offset().expect("marker must be found");
+            store.discard_before(f).unwrap();
+            assert_eq!(store.snapshot_count(), 0, "restart {restart}");
+            assert!(
+                store.load_machines().unwrap().is_empty(),
+                "restart {restart}"
+            );
+        }
     }
 
     /// Regression: WAL entries written while a pass runs are in neither

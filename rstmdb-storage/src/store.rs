@@ -211,7 +211,7 @@ impl Storage {
                     instance.soft_delete(0);
                 }
             }
-            WalEntry::Snapshot { .. } | WalEntry::Checkpoint { .. } => {
+            WalEntry::Snapshot { .. } | WalEntry::Checkpoint { .. } | WalEntry::FlushAll { .. } => {
                 // Handled separately
             }
         }

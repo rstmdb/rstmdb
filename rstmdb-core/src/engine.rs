@@ -41,6 +41,18 @@ pub struct MachineRecord {
 pub struct RecoveryState {
     pub machines: Vec<MachineRecord>,
     pub snapshots: Vec<InstanceSnapshot>,
+    /// WAL head when `machines` was written (0 for legacy files). Machines
+    /// written before the last FLUSH_ALL marker are stale and ignored.
+    pub machines_wal_offset: u64,
+}
+
+/// Outcome of [`StateMachineEngine::flush_all`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FlushAllResult {
+    pub instances_removed: usize,
+    pub machines_removed: usize,
+    /// Offset of the FlushAll marker in the WAL.
+    pub wal_offset: u64,
 }
 
 /// The state machine engine.
@@ -60,8 +72,15 @@ pub struct StateMachineEngine {
     /// Write-ahead log.
     wal: Arc<Wal>,
 
+    /// Mutations hold it shared from WAL append to memory update; FLUSH_ALL
+    /// holds it exclusively, so no write straddles the FlushAll marker.
+    write_gate: RwLock<()>,
+
     /// Whether to allow re-creating deleted instances with the same ID.
     allow_instance_recreate: bool,
+
+    /// Offset of the last FlushAll marker found in the WAL at recovery.
+    last_flush_offset: Option<u64>,
 }
 
 impl StateMachineEngine {
@@ -95,15 +114,17 @@ impl StateMachineEngine {
 
     /// Creates an engine over an existing WAL and recovers state.
     pub fn recover(wal: Arc<Wal>, recovery: RecoveryState) -> Result<Self, CoreError> {
-        let engine = Self {
+        let mut engine = Self {
             definitions: DashMap::new(),
             instances: DashMap::new(),
             idempotency_cache: DashMap::new(),
             wal,
+            write_gate: RwLock::new(()),
             allow_instance_recreate: true,
+            last_flush_offset: None,
         };
 
-        engine.restore(recovery)?;
+        engine.last_flush_offset = engine.restore(recovery)?;
 
         Ok(engine)
     }
@@ -121,11 +142,30 @@ impl StateMachineEngine {
     }
 
     /// Restores persisted machines and snapshots, then replays the WAL.
-    fn restore(&self, recovery: RecoveryState) -> Result<(), CoreError> {
+    ///
+    /// Everything before the last FlushAll marker (F) is gone: machines and
+    /// snapshots persisted at or before F are ignored and only entries after
+    /// F are replayed. Returns F.
+    fn restore(&self, recovery: RecoveryState) -> Result<Option<u64>, CoreError> {
         use rstmdb_wal::WalOffset;
 
-        let machine_count = recovery.machines.len();
-        for record in recovery.machines {
+        let entries = self.wal.read_from(WalOffset::from_u64(0), None)?;
+        let flush_offset = entries
+            .iter()
+            .rev()
+            .find(|(_, _, e)| matches!(e, WalEntry::FlushAll { .. }))
+            .map(|(_, offset, _)| offset.as_u64());
+        // WAL head positions are end offsets, so a head captured just before
+        // the flush equals F: anything at or before F predates the flush.
+        let before_flush = |offset: u64| flush_offset.is_some_and(|f| offset <= f);
+
+        let machines = if before_flush(recovery.machines_wal_offset) {
+            Vec::new()
+        } else {
+            recovery.machines
+        };
+        let machine_count = machines.len();
+        for record in machines {
             let key = (record.machine.clone(), record.version);
             if !self.definitions.contains_key(&key) {
                 let def = MachineDefinition::from_json(
@@ -137,10 +177,22 @@ impl StateMachineEngine {
             }
         }
 
+        let (snapshots, stale): (Vec<_>, Vec<_>) = recovery
+            .snapshots
+            .into_iter()
+            .partition(|s| !before_flush(s.wal_offset));
+        if !stale.is_empty() {
+            tracing::info!(
+                "Ignoring {} snapshots older than FLUSH_ALL at offset {}",
+                stale.len(),
+                flush_offset.unwrap_or(0)
+            );
+        }
+
         // Instance id -> WAL offset already reflected by its snapshot.
         let mut covered: HashMap<String, u64> = HashMap::new();
-        let snapshot_count = recovery.snapshots.len();
-        for snapshot in recovery.snapshots {
+        let snapshot_count = snapshots.len();
+        for snapshot in snapshots {
             covered.insert(snapshot.instance_id.clone(), snapshot.wal_offset);
             if !snapshot.idempotency.is_empty() {
                 let cache = snapshot
@@ -169,12 +221,14 @@ impl StateMachineEngine {
                 .insert(snapshot.instance_id.clone(), RwLock::new(instance));
         }
 
-        let entries = self.wal.read_from(WalOffset::from_u64(0), None)?;
         let entry_count = entries.len();
         let mut skipped = 0usize;
 
         for (seq, offset, entry) in entries {
             let offset = offset.as_u64();
+            if flush_offset.is_some_and(|f| offset <= f) {
+                continue;
+            }
             if let Some(id) = entry_instance_id(&entry) {
                 if covered
                     .get(id)
@@ -199,7 +253,7 @@ impl StateMachineEngine {
             );
         }
 
-        Ok(())
+        Ok(flush_offset)
     }
 
     /// Replays a single WAL entry to restore in-memory state.
@@ -323,6 +377,8 @@ impl StateMachineEngine {
                 }
             }
 
+            WalEntry::FlushAll { .. } => self.clear_state(),
+
             WalEntry::Snapshot { .. } | WalEntry::Checkpoint { .. } => {
                 // These don't affect in-memory state
             }
@@ -346,6 +402,7 @@ impl StateMachineEngine {
         primary_offset: u64,
         entry: WalEntry,
     ) -> Result<(u64, u64), CoreError> {
+        let _write = self.write_gate.read();
         let (sequence, local_offset) = self.wal.append(&entry)?;
         // Use the primary's offset in memory so clients see consistent offsets
         // when reading from any node that's fully caught up.
@@ -388,6 +445,7 @@ impl StateMachineEngine {
         version: u32,
         definition_json: &Value,
     ) -> Result<(String, bool), CoreError> {
+        let _write = self.write_gate.read();
         let key = (name.to_string(), version);
 
         // Check if already exists
@@ -507,6 +565,7 @@ impl StateMachineEngine {
         initial_ctx: Value,
         idempotency_key: Option<&str>,
     ) -> Result<(Instance, u64), CoreError> {
+        let _write = self.write_gate.read();
         // The context is always a JSON object; an omitted/null initial_ctx
         // means `{}` (anything else would make later payload merges no-ops).
         let initial_ctx = normalize_ctx(initial_ctx).ok_or_else(|| CoreError::InvalidContext {
@@ -635,6 +694,7 @@ impl StateMachineEngine {
         event_id: Option<&str>,
         idempotency_key: Option<&str>,
     ) -> Result<ApplyResult, CoreError> {
+        let _write = self.write_gate.read();
         // Get instance (with write lock for the duration)
         let instance_lock =
             self.instances
@@ -783,6 +843,7 @@ impl StateMachineEngine {
         instance_id: &str,
         idempotency_key: Option<&str>,
     ) -> Result<u64, CoreError> {
+        let _write = self.write_gate.read();
         let instance_lock =
             self.instances
                 .get(instance_id)
@@ -814,8 +875,19 @@ impl StateMachineEngine {
     // Administrative
     // =========================================================================
 
-    /// Clears all instances, machine definitions, and idempotency cache.
-    /// Returns `(instances_removed, machines_removed)`.
+    /// Drops every machine, instance and idempotency record from memory.
+    fn clear_state(&self) {
+        self.instances.clear();
+        self.definitions.clear();
+        self.idempotency_cache.clear();
+    }
+
+    /// Clears all instances, machine definitions, and idempotency records.
+    ///
+    /// Durable: a FlushAll marker is appended and fsynced (regardless of the
+    /// fsync policy), so recovery never brings the flushed data back. If the
+    /// append fails nothing is cleared; once it succeeds memory is cleared
+    /// even if the fsync then fails (the error is still returned).
     ///
     /// # Examples
     ///
@@ -831,20 +903,31 @@ impl StateMachineEngine {
     /// #     "states": ["created"], "initial": "created", "transitions": []
     /// # })).unwrap();
     /// # engine.create_instance("i1", "order", 1, json!({}), None).unwrap();
-    /// let (instances, machines) = engine.flush_all();
-    /// assert_eq!(instances, 1);
-    /// assert_eq!(machines, 1);
+    /// let flushed = engine.flush_all().unwrap();
+    /// assert_eq!(flushed.instances_removed, 1);
+    /// assert_eq!(flushed.machines_removed, 1);
     /// assert_eq!(engine.instance_count(), 0);
     /// ```
-    pub fn flush_all(&self) -> (usize, usize) {
-        let instance_count = self.instances.len();
-        let machine_count = self.definitions.len();
+    pub fn flush_all(&self) -> Result<FlushAllResult, CoreError> {
+        let _write = self.write_gate.write();
 
-        self.instances.clear();
-        self.definitions.clear();
-        self.idempotency_cache.clear();
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        let (_, offset) = self.wal.append(&WalEntry::FlushAll { timestamp })?;
 
-        (instance_count, machine_count)
+        // The marker is in the WAL now and recovery will honour it, so memory
+        // follows it even if the fsync below fails.
+        let result = FlushAllResult {
+            instances_removed: self.instances.len(),
+            machines_removed: self.definitions.len(),
+            wal_offset: offset.as_u64(),
+        };
+        self.clear_state();
+
+        self.wal.sync()?;
+        Ok(result)
     }
 
     // =========================================================================
@@ -925,6 +1008,12 @@ impl StateMachineEngine {
     // WAL Access
     // =========================================================================
 
+    /// Offset of the last FLUSH_ALL marker seen during recovery. Snapshot
+    /// store state older than it is stale and should be discarded.
+    pub fn last_flush_offset(&self) -> Option<u64> {
+        self.last_flush_offset
+    }
+
     /// Returns a reference to the WAL.
     pub fn wal(&self) -> &Arc<Wal> {
         &self.wal
@@ -987,6 +1076,13 @@ mod tests {
             .with_fsync_policy(FsyncPolicy::EveryWrite);
         let engine = StateMachineEngine::new(config).unwrap();
         (dir, engine)
+    }
+
+    fn reopen_with(dir: &TempDir, recovery: RecoveryState) -> StateMachineEngine {
+        let config = WalConfig::new(dir.path())
+            .with_segment_size(4096)
+            .with_fsync_policy(FsyncPolicy::EveryWrite);
+        StateMachineEngine::new_with_recovery(config, recovery).unwrap()
     }
 
     fn sample_definition() -> Value {
@@ -1455,6 +1551,7 @@ mod tests {
             RecoveryState {
                 machines,
                 snapshots: vec![snapshot],
+                machines_wal_offset: 0,
             },
         )
         .unwrap();
@@ -1651,9 +1748,9 @@ mod tests {
             .create_instance("i2", "order", 1, json!({}), None)
             .unwrap();
 
-        let (instances, machines) = engine.flush_all();
-        assert_eq!(instances, 2);
-        assert_eq!(machines, 2);
+        let flushed = engine.flush_all().unwrap();
+        assert_eq!(flushed.instances_removed, 2);
+        assert_eq!(flushed.machines_removed, 2);
 
         // Everything should be gone
         assert!(engine.get_instance("i1").is_err());
@@ -1672,7 +1769,7 @@ mod tests {
             .create_instance("i1", "order", 1, json!({}), None)
             .unwrap();
 
-        engine.flush_all();
+        engine.flush_all().unwrap();
 
         // Can re-register machine and create instances after flush
         engine
@@ -1688,9 +1785,248 @@ mod tests {
     #[test]
     fn test_flush_all_empty_database() {
         let (_dir, engine) = test_engine();
-        let (instances, machines) = engine.flush_all();
-        assert_eq!(instances, 0);
-        assert_eq!(machines, 0);
+        let flushed = engine.flush_all().unwrap();
+        assert_eq!(flushed.instances_removed, 0);
+        assert_eq!(flushed.machines_removed, 0);
+    }
+
+    #[test]
+    fn test_flush_all_survives_restart() {
+        let (dir, engine) = test_engine();
+        engine
+            .put_machine("order", 1, &sample_definition())
+            .unwrap();
+        engine
+            .create_instance("i-1", "order", 1, json!({}), None)
+            .unwrap();
+
+        let flushed = engine.flush_all().unwrap();
+        assert_eq!(flushed.instances_removed, 1);
+        assert_eq!(flushed.machines_removed, 1);
+        drop(engine);
+
+        let engine = reopen_with(&dir, RecoveryState::default());
+        assert_eq!(engine.instance_count(), 0);
+        assert!(engine.get_machine("order", 1).is_err());
+    }
+
+    #[test]
+    fn test_flush_all_empty_database_writes_marker() {
+        let (dir, engine) = test_engine();
+        let flushed = engine.flush_all().unwrap();
+        assert_eq!(flushed.instances_removed, 0);
+        assert_eq!(flushed.machines_removed, 0);
+        let entries = engine
+            .wal()
+            .read_from(rstmdb_wal::WalOffset::from_u64(0), None)
+            .unwrap();
+        assert!(matches!(
+            entries.last(),
+            Some((_, _, WalEntry::FlushAll { .. }))
+        ));
+        drop(engine);
+        assert_eq!(
+            reopen_with(&dir, RecoveryState::default()).instance_count(),
+            0
+        );
+    }
+
+    /// Writers racing FLUSH_ALL must never leave memory disagreeing with what
+    /// the WAL replays to.
+    #[test]
+    fn test_flush_all_concurrent_writes_match_wal() {
+        for round in 0..20 {
+            let (dir, engine) = test_engine();
+            let engine = Arc::new(engine);
+            engine
+                .put_machine("order", 1, &sample_definition())
+                .unwrap();
+
+            let writers: Vec<_> = (0..4)
+                .map(|t| {
+                    let engine = engine.clone();
+                    std::thread::spawn(move || {
+                        for n in 0..25 {
+                            // Fails with MachineNotFound after the flush; fine.
+                            let _ = engine.create_instance(
+                                &format!("r{round}-t{t}-n{n}"),
+                                "order",
+                                1,
+                                json!({}),
+                                None,
+                            );
+                        }
+                    })
+                })
+                .collect();
+            engine.flush_all().unwrap();
+            for w in writers {
+                w.join().unwrap();
+            }
+
+            let mut live = engine.list_instance_ids();
+            live.sort();
+            drop(engine);
+            let mut replayed = reopen_with(&dir, RecoveryState::default()).list_instance_ids();
+            replayed.sort();
+            assert_eq!(live, replayed, "round {round}");
+        }
+    }
+
+    fn snapshot_of(engine: &StateMachineEngine, id: &str) -> InstanceSnapshot {
+        let (instance, records) = engine
+            .instances_for_snapshot()
+            .into_iter()
+            .find(|(i, _)| i.id == id)
+            .unwrap();
+        InstanceSnapshot::from_instance(&instance, format!("s-{id}")).with_idempotency(records)
+    }
+
+    /// Regression: a snapshot taken after FLUSH_ALL must survive recovery
+    /// while the marker is still in the WAL.
+    #[test]
+    fn test_recovery_keeps_snapshot_taken_after_flush() {
+        let (dir, engine) = test_engine();
+        engine
+            .put_machine("order", 1, &sample_definition())
+            .unwrap();
+        engine.flush_all().unwrap();
+        engine
+            .put_machine("order", 1, &sample_definition())
+            .unwrap();
+        engine
+            .create_instance("x", "order", 1, json!({"v": 1}), None)
+            .unwrap();
+        let recovery = RecoveryState {
+            machines: engine.machine_records().unwrap(),
+            snapshots: vec![snapshot_of(&engine, "x")],
+            machines_wal_offset: engine.wal().latest_offset().unwrap().as_u64(),
+        };
+        drop(engine);
+
+        let engine = reopen_with(&dir, recovery);
+        assert_eq!(engine.get_instance("x").unwrap().ctx, json!({"v": 1}));
+        assert!(engine.get_machine("order", 1).is_ok());
+    }
+
+    /// Crash between the marker and clearing the store: the stale snapshot
+    /// and machines.json must be ignored.
+    #[test]
+    fn test_recovery_ignores_state_older_than_flush() {
+        let (dir, engine) = test_engine();
+        engine
+            .put_machine("order", 1, &sample_definition())
+            .unwrap();
+        engine
+            .create_instance("old", "order", 1, json!({}), None)
+            .unwrap();
+        let stale = RecoveryState {
+            machines: engine.machine_records().unwrap(),
+            snapshots: vec![snapshot_of(&engine, "old")],
+            machines_wal_offset: engine.wal().latest_offset().unwrap().as_u64(),
+        };
+        let flushed = engine.flush_all().unwrap();
+        drop(engine);
+
+        let engine = reopen_with(&dir, stale);
+        assert!(engine.get_instance("old").is_err());
+        assert!(engine.get_machine("order", 1).is_err());
+        assert_eq!(engine.last_flush_offset(), Some(flushed.wal_offset));
+    }
+
+    #[test]
+    fn test_recovery_after_two_flushes_keeps_only_latest_data() {
+        let (dir, engine) = test_engine();
+        for round in 0..2 {
+            engine
+                .put_machine("order", 1, &sample_definition())
+                .unwrap();
+            engine
+                .create_instance(&format!("r{round}"), "order", 1, json!({}), None)
+                .unwrap();
+            engine.flush_all().unwrap();
+        }
+        engine
+            .put_machine("order", 1, &sample_definition())
+            .unwrap();
+        engine
+            .create_instance("final", "order", 1, json!({}), None)
+            .unwrap();
+        drop(engine);
+
+        let engine = reopen_with(&dir, RecoveryState::default());
+        assert_eq!(engine.list_instance_ids(), vec!["final".to_string()]);
+    }
+
+    #[test]
+    fn test_recreated_ids_after_flush_restore_new_state() {
+        let (dir, engine) = test_engine();
+        engine
+            .put_machine("order", 1, &sample_definition())
+            .unwrap();
+        engine
+            .create_instance("i-1", "order", 1, json!({"gen": 1}), Some("c"))
+            .unwrap();
+        engine
+            .apply_event("i-1", "PAY", json!({}), None, None, None, Some("pay"))
+            .unwrap();
+        engine.flush_all().unwrap();
+        engine
+            .put_machine("order", 1, &sample_definition())
+            .unwrap();
+        engine
+            .create_instance("i-1", "order", 1, json!({"gen": 2}), None)
+            .unwrap();
+        drop(engine);
+
+        let engine = reopen_with(&dir, RecoveryState::default());
+        let i = engine.get_instance("i-1").unwrap();
+        assert_eq!(i.state, "created");
+        assert_eq!(i.ctx, json!({"gen": 2}));
+        // The pre-flush idempotency key is forgotten.
+        let r = engine
+            .apply_event("i-1", "PAY", json!({}), None, None, None, Some("pay"))
+            .unwrap();
+        assert!(r.applied);
+    }
+
+    #[test]
+    fn test_recovery_without_flush_uses_legacy_machines() {
+        let (dir, engine) = test_engine();
+        engine
+            .put_machine("order", 1, &sample_definition())
+            .unwrap();
+        let machines = engine.machine_records().unwrap();
+        drop(engine);
+
+        let engine = reopen_with(
+            &dir,
+            RecoveryState {
+                machines,
+                snapshots: vec![],
+                machines_wal_offset: 0,
+            },
+        );
+        assert!(engine.get_machine("order", 1).is_ok());
+        assert_eq!(engine.last_flush_offset(), None);
+    }
+
+    #[test]
+    fn test_replayed_flush_all_clears_state() {
+        let (_dir, engine) = test_engine();
+        engine
+            .put_machine("order", 1, &sample_definition())
+            .unwrap();
+        engine
+            .create_instance("i-1", "order", 1, json!({}), None)
+            .unwrap();
+
+        engine
+            .apply_replicated_entry(0, WalEntry::FlushAll { timestamp: 0 })
+            .unwrap();
+
+        assert_eq!(engine.instance_count(), 0);
+        assert!(engine.get_machine("order", 1).is_err());
     }
 
     #[test]

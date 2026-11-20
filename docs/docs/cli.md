@@ -389,7 +389,9 @@ Database flushed
 ```
 
 :::caution
-This is a destructive operation that removes all in-memory state. It does not clear the WAL — use `compact` after `flush-all` for a full reset. This command is disabled by default and must be explicitly enabled in the server configuration.
+This is a destructive operation: it removes all machines, instances and idempotency records. The flush is durable — a `FlushAll` marker is written to the WAL and fsynced, and snapshots are cleared, so the data does not come back after a restart. Old WAL segments are reclaimed by normal compaction. This command is disabled by default and must be explicitly enabled in the server configuration.
+
+A data directory whose WAL contains a `FlushAll` marker cannot be opened by rstmdb versions older than the one that introduced it.
 :::
 
 :::danger Not available with replication

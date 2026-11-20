@@ -50,6 +50,30 @@ pub struct SnapshotStore {
 const INDEX_FILE: &str = "index.json";
 const MACHINES_FILE: &str = "machines.json";
 
+/// On-disk `machines.json`: definitions plus the WAL head they reflect.
+#[derive(Debug, Serialize, Deserialize)]
+struct MachinesFile {
+    wal_offset: u64,
+    machines: Vec<MachineRecord>,
+}
+
+/// Accepts the current format and the older bare array.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum MachinesOnDisk {
+    Current(MachinesFile),
+    Legacy(Vec<MachineRecord>),
+}
+
+/// Removes `path`; a missing file is not an error.
+fn remove_if_exists(path: &Path) -> Result<(), StorageError> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e.into()),
+    }
+}
+
 /// Writes `data` to `path` atomically: temp file, fsync, rename, fsync dir.
 /// A crash leaves either the old or the new file, never a torn one.
 fn atomic_write(path: &Path, data: &[u8]) -> Result<(), StorageError> {
@@ -272,6 +296,60 @@ impl SnapshotStore {
         Ok(())
     }
 
+    /// Removes every snapshot and machines.json (FLUSH_ALL).
+    ///
+    /// The empty index is written first, so once this returns Ok — or crashes
+    /// after that point — no snapshot is reachable; a leftover `.snap` file is
+    /// only garbage.
+    pub fn clear(&self) -> Result<(), StorageError> {
+        let _guard = self.write_lock.lock();
+        let removed = std::mem::take(&mut *self.index.write());
+        if let Err(e) = self.save_index() {
+            *self.index.write() = removed;
+            return Err(e);
+        }
+        remove_if_exists(&self.dir.join(MACHINES_FILE))?;
+        for meta in removed.values() {
+            remove_if_exists(&self.snapshot_path(&meta.snapshot_id))?;
+        }
+        sync_dir(&self.dir);
+        Ok(())
+    }
+
+    /// Drops state older than a FLUSH_ALL marker at `wal_offset`: snapshots
+    /// and a machines.json whose offset is at or before it (a WAL head taken
+    /// right before the flush equals the marker offset). Returns the number of
+    /// snapshots discarded. Idempotent.
+    pub fn discard_before(&self, wal_offset: u64) -> Result<usize, StorageError> {
+        let _guard = self.write_lock.lock();
+        let stale: Vec<SnapshotMeta> = self
+            .index
+            .read()
+            .values()
+            .filter(|meta| meta.wal_offset <= wal_offset)
+            .cloned()
+            .collect();
+        if !stale.is_empty() {
+            {
+                let mut index = self.index.write();
+                for meta in &stale {
+                    index.remove(&meta.instance_id);
+                }
+            }
+            self.save_index()?;
+            for meta in &stale {
+                remove_if_exists(&self.snapshot_path(&meta.snapshot_id))?;
+            }
+        }
+        if let Some(file) = self.read_machines_file()? {
+            if file.wal_offset <= wal_offset {
+                remove_if_exists(&self.dir.join(MACHINES_FILE))?;
+            }
+        }
+        sync_dir(&self.dir);
+        Ok(stale.len())
+    }
+
     /// Returns the minimum WAL offset across all snapshots.
     ///
     /// This is the oldest point in the WAL that is still needed for recovery.
@@ -300,22 +378,46 @@ impl SnapshotStore {
 
     /// Persists all machine definitions (atomically replaces machines.json).
     ///
+    /// `wal_offset` is the WAL head the definitions reflect; recovery ignores
+    /// the file if a FLUSH_ALL marker was written after it.
+    ///
     /// Must be called before WAL compaction so definitions whose PUT_MACHINE
     /// entries are compacted away can still be recovered.
-    pub fn save_machines(&self, machines: &[MachineRecord]) -> Result<(), StorageError> {
+    pub fn save_machines(
+        &self,
+        machines: &[MachineRecord],
+        wal_offset: u64,
+    ) -> Result<(), StorageError> {
         let _guard = self.write_lock.lock();
-        let data = serde_json::to_vec_pretty(machines)?;
+        let file = MachinesFile {
+            wal_offset,
+            machines: machines.to_vec(),
+        };
+        let data = serde_json::to_vec_pretty(&file)?;
         atomic_write(&self.dir.join(MACHINES_FILE), &data)
     }
 
     /// Loads persisted machine definitions (empty if none were saved).
     pub fn load_machines(&self) -> Result<Vec<MachineRecord>, StorageError> {
+        Ok(self
+            .read_machines_file()?
+            .map(|f| f.machines)
+            .unwrap_or_default())
+    }
+
+    fn read_machines_file(&self) -> Result<Option<MachinesFile>, StorageError> {
         let path = self.dir.join(MACHINES_FILE);
         if !path.exists() {
-            return Ok(Vec::new());
+            return Ok(None);
         }
         let file = File::open(&path)?;
-        Ok(serde_json::from_reader(BufReader::new(file))?)
+        Ok(Some(match serde_json::from_reader(BufReader::new(file))? {
+            MachinesOnDisk::Current(f) => f,
+            MachinesOnDisk::Legacy(machines) => MachinesFile {
+                wal_offset: 0,
+                machines,
+            },
+        }))
     }
 
     /// Loads everything needed to recover the engine: persisted machines and
@@ -324,7 +426,10 @@ impl SnapshotStore {
     /// Fails on any missing or corrupt snapshot rather than starting with
     /// silently missing instances.
     pub fn load_recovery_state(&self) -> Result<RecoveryState, StorageError> {
-        let machines = self.load_machines()?;
+        let (machines, machines_wal_offset) = self
+            .read_machines_file()?
+            .map(|f| (f.machines, f.wal_offset))
+            .unwrap_or_default();
         let metas: Vec<SnapshotMeta> = self.index.read().values().cloned().collect();
         let mut snapshots = Vec::with_capacity(metas.len());
         for meta in metas {
@@ -340,6 +445,7 @@ impl SnapshotStore {
         Ok(RecoveryState {
             machines,
             snapshots,
+            machines_wal_offset,
         })
     }
 
@@ -419,11 +525,14 @@ mod tests {
         {
             let store = SnapshotStore::open(dir.path()).unwrap();
             store
-                .save_machines(&[MachineRecord {
-                    machine: "order".into(),
-                    version: 1,
-                    definition: json!({"states": ["a"], "initial": "a", "transitions": []}),
-                }])
+                .save_machines(
+                    &[MachineRecord {
+                        machine: "order".into(),
+                        version: 1,
+                        definition: json!({"states": ["a"], "initial": "a", "transitions": []}),
+                    }],
+                    0,
+                )
                 .unwrap();
             let mut instance = Instance::new("i-1", "order", 1, "a", json!({}), 9);
             instance.soft_delete(10);
@@ -437,6 +546,103 @@ mod tests {
         assert_eq!(state.machines.len(), 1);
         assert_eq!(state.snapshots.len(), 1);
         assert!(state.snapshots[0].deleted);
+    }
+
+    fn record(name: &str) -> MachineRecord {
+        MachineRecord {
+            machine: name.into(),
+            version: 1,
+            definition: json!({"states": ["a"], "initial": "a", "transitions": []}),
+        }
+    }
+
+    #[test]
+    fn test_machines_file_records_wal_offset() {
+        let dir = TempDir::new().unwrap();
+        let store = SnapshotStore::open(dir.path()).unwrap();
+        store.save_machines(&[record("order")], 77).unwrap();
+
+        let state = SnapshotStore::open(dir.path())
+            .unwrap()
+            .load_recovery_state()
+            .unwrap();
+        assert_eq!(state.machines.len(), 1);
+        assert_eq!(state.machines_wal_offset, 77);
+    }
+
+    #[test]
+    fn test_legacy_machines_array_loads_with_offset_zero() {
+        let dir = TempDir::new().unwrap();
+        let legacy = serde_json::to_vec(&vec![record("order")]).unwrap();
+        fs::write(dir.path().join(MACHINES_FILE), legacy).unwrap();
+
+        let state = SnapshotStore::open(dir.path())
+            .unwrap()
+            .load_recovery_state()
+            .unwrap();
+        assert_eq!(state.machines.len(), 1);
+        assert_eq!(state.machines_wal_offset, 0);
+    }
+
+    #[test]
+    fn test_clear_removes_everything_durably() {
+        let dir = TempDir::new().unwrap();
+        let store = SnapshotStore::open(dir.path()).unwrap();
+        store.save_machines(&[record("order")], 5).unwrap();
+        for (id, off) in [("i-1", 3), ("i-2", 9)] {
+            let instance = Instance::new(id, "order", 1, "a", json!({}), off);
+            store
+                .create_snapshot(&InstanceSnapshot::from_instance(
+                    &instance,
+                    format!("snap-{id}"),
+                ))
+                .unwrap();
+        }
+
+        store.clear().unwrap();
+        assert_eq!(store.snapshot_count(), 0);
+        assert!(!dir.path().join(MACHINES_FILE).exists());
+        assert!(!dir.path().join("snap-i-1.snap").exists());
+        assert!(!dir.path().join("snap-i-2.snap").exists());
+
+        let reopened = SnapshotStore::open(dir.path()).unwrap();
+        let state = reopened.load_recovery_state().unwrap();
+        assert!(state.machines.is_empty());
+        assert!(state.snapshots.is_empty());
+    }
+
+    #[test]
+    fn test_discard_before_keeps_newer_state() {
+        let dir = TempDir::new().unwrap();
+        let store = SnapshotStore::open(dir.path()).unwrap();
+        for (id, off) in [("old", 3), ("new", 20)] {
+            let instance = Instance::new(id, "order", 1, "a", json!({}), off);
+            store
+                .create_snapshot(&InstanceSnapshot::from_instance(
+                    &instance,
+                    format!("snap-{id}"),
+                ))
+                .unwrap();
+        }
+        store.save_machines(&[record("order")], 25).unwrap();
+
+        assert_eq!(store.discard_before(10).unwrap(), 1);
+        assert!(store.get_snapshot_meta("old").is_none());
+        assert!(store.get_snapshot_meta("new").is_some());
+        assert!(!dir.path().join("snap-old.snap").exists());
+        assert!(
+            dir.path().join(MACHINES_FILE).exists(),
+            "machines at 25 >= 10 must stay"
+        );
+
+        // Idempotent, and a machines.json written at the marker offset (head
+        // captured right before the flush) is removed.
+        store.save_machines(&[record("order")], 10).unwrap();
+        assert_eq!(store.discard_before(10).unwrap(), 0);
+        assert!(!dir.path().join(MACHINES_FILE).exists());
+
+        let reopened = SnapshotStore::open(dir.path()).unwrap();
+        assert_eq!(reopened.snapshot_count(), 1);
     }
 
     #[test]

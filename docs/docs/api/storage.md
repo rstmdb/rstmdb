@@ -281,14 +281,14 @@ Requires a snapshot store to be configured on the server.
 
 ## FLUSH_ALL
 
-Clears all instances and machine definitions from the database. This is a destructive operation that removes all in-memory state.
+Clears all instances, machine definitions and idempotency records from the database. The flush is durable: a `FlushAll` marker is written to the WAL and fsynced before anything is cleared, and snapshots are removed, so the data does not come back after a restart. Older rstmdb versions cannot open a WAL that contains this marker.
 
 :::caution
 This operation is **disabled by default**. Set `storage.allow_flush_all: true` in the server configuration to enable it. Recommended only for development and testing environments.
 :::
 
 :::danger Not available with replication
-`FLUSH_ALL` is **not a replicated operation** — it would clear the primary while leaving replicas holding the old data (silent divergence). The server **refuses to start** if `storage.allow_flush_all: true` is combined with any replication role (`primary` or `replica`). It is only permitted on a `standalone` node. See [FLUSH_ALL and replication](../operations/replication#flush_all-and-replication).
+`FLUSH_ALL` is **not supported in a replicated cluster**. The server **refuses to start** if `storage.allow_flush_all: true` is combined with any replication role (`primary` or `replica`). It is only permitted on a `standalone` node. See [FLUSH_ALL and replication](../operations/replication#flush_all-and-replication).
 :::
 
 ### Request

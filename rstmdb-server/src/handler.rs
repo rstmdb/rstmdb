@@ -1035,15 +1035,23 @@ impl CommandHandler {
             ));
         }
 
-        let (instances_removed, machines_removed) = self.engine.flush_all();
+        // Keep compaction out until the store is cleared: a pass in between
+        // would snapshot pre-flush state that recovery then has to discard.
+        let _held = self.compaction_gate.get().map(|g| g.lock());
 
-        // Update gauge metrics
+        // Durable from here: the FlushAll marker is fsynced. If clearing the
+        // store fails, recovery still ignores and discards the stale files.
+        let flushed = self.engine.flush_all()?;
         self.update_gauge_metrics();
+
+        if let Some(store) = &self.snapshot_store {
+            store.clear()?;
+        }
 
         Ok(json!({
             "flushed": true,
-            "instances_removed": instances_removed,
-            "machines_removed": machines_removed,
+            "instances_removed": flushed.instances_removed,
+            "machines_removed": flushed.machines_removed,
         }))
     }
 
@@ -2451,6 +2459,57 @@ mod tests {
         let response = handler.handle(&mut session, &list_machines);
         let result = response.result.unwrap();
         assert_eq!(result["items"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn test_flush_all_clears_snapshot_store_and_stays_flushed() {
+        let dir = TempDir::new().unwrap();
+        let wal_config = || {
+            WalConfig::new(dir.path().join("wal"))
+                .with_segment_size(4096)
+                .with_fsync_policy(FsyncPolicy::EveryWrite)
+        };
+        let store = Arc::new(SnapshotStore::open(dir.path().join("snapshots")).unwrap());
+        let engine = Arc::new(StateMachineEngine::new(wal_config()).unwrap());
+        engine
+            .put_machine(
+                "order",
+                1,
+                &json!({"states": ["created"], "initial": "created", "transitions": []}),
+            )
+            .unwrap();
+        engine
+            .create_instance("i-1", "order", 1, json!({}), None)
+            .unwrap();
+        crate::compaction::snapshot_and_compact(
+            &engine,
+            &store,
+            crate::compaction::SnapshotMode::Changed,
+        )
+        .unwrap();
+        assert_eq!(store.snapshot_count(), 1);
+
+        let handler = CommandHandler::with_snapshot_store_and_auth(
+            engine.clone(),
+            store.clone(),
+            &AuthConfig::default(),
+        )
+        .with_allow_flush_all(true);
+        let mut session = test_session();
+        let response = handler.handle(&mut session, &Request::new("1", Operation::FlushAll));
+        assert!(response.is_ok());
+        assert_eq!(store.snapshot_count(), 0);
+        drop(handler);
+        drop(engine);
+
+        let store = SnapshotStore::open(dir.path().join("snapshots")).unwrap();
+        let engine = StateMachineEngine::new_with_recovery(
+            wal_config(),
+            store.load_recovery_state().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(engine.instance_count(), 0);
+        assert!(engine.get_machine("order", 1).is_err());
     }
 
     #[test]
