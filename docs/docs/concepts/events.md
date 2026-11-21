@@ -55,6 +55,12 @@ rstmdb-cli apply-event -i order-001 -e PAY -p '{
 rstmdb-cli apply-event -i order-001 -e PAY -p '{}' --idempotency-key "pay-order-001-attempt-1"
 ```
 
+A retry with the same key returns the original result with `applied: false`.
+The server remembers the last `storage.max_idempotency_keys_per_instance` keys
+per instance (default 1000). Once more keyed events than that have been applied
+to the instance, the oldest key is forgotten and a retry with it is applied
+again.
+
 ## Transition Resolution
 
 When an event is applied:

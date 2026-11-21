@@ -56,6 +56,10 @@ storage:
   # Allow the FLUSH_ALL operation to clear all data (disabled by default for safety)
   allow_flush_all: false
 
+  # Idempotency keys remembered per instance for APPLY_EVENT (0 = unlimited).
+  # The oldest key is forgotten when a new one would exceed the limit.
+  max_idempotency_keys_per_instance: 1000
+
 # TLS settings
 tls:
   # Enable TLS

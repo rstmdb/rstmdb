@@ -9,7 +9,7 @@ use parking_lot::RwLock;
 use rstmdb_wal::{Wal, WalConfig, WalEntry};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
 /// Result of applying an event.
@@ -21,6 +21,46 @@ pub struct ApplyResult {
     pub wal_offset: u64,
     pub sequence: u64,
     pub applied: bool,
+}
+
+/// Cached `APPLY_EVENT` results of one instance, keyed by idempotency key.
+///
+/// `order` holds the keys in insertion order, which is WAL order on every
+/// path (live writes, replay, snapshot records in the order they were
+/// written), so its front is always the oldest key.
+#[derive(Debug, Default)]
+struct IdempotencyScope {
+    results: HashMap<String, ApplyResult>,
+    order: VecDeque<String>,
+}
+
+impl IdempotencyScope {
+    fn get(&self, key: &str) -> Option<&ApplyResult> {
+        self.results.get(key)
+    }
+
+    /// Inserts a result, then evicts the oldest keys beyond `max`
+    /// (0 = unlimited). Re-inserting a present key replaces its result and
+    /// moves it to the newest position.
+    fn insert(&mut self, key: String, result: ApplyResult, max: usize) {
+        if self.results.insert(key.clone(), result).is_some() {
+            self.order.retain(|k| k != &key);
+        }
+        self.order.push_back(key);
+        self.trim(max);
+    }
+
+    /// Keeps only the `max` newest keys (0 = unlimited).
+    fn trim(&mut self, max: usize) {
+        if max == 0 {
+            return;
+        }
+        while self.order.len() > max {
+            if let Some(oldest) = self.order.pop_front() {
+                self.results.remove(&oldest);
+            }
+        }
+    }
 }
 
 /// A persisted machine definition, used to recover definitions whose
@@ -37,6 +77,13 @@ pub struct MachineRecord {
 /// Recovery restores machines and instance snapshots first, then replays the
 /// remaining WAL, skipping instance entries already covered by a snapshot
 /// (`entry offset <= snapshot.wal_offset`).
+/// Engine settings that recovery must already honour.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct EngineOptions {
+    /// Maximum idempotency keys kept per instance (0 = unlimited).
+    pub max_idempotency_keys: usize,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct RecoveryState {
     pub machines: Vec<MachineRecord>,
@@ -67,7 +114,11 @@ pub struct StateMachineEngine {
     ///
     /// Rebuilt on startup from snapshots and WAL `idempotency_key`s, and
     /// persisted in instance snapshots, so it survives restarts and compaction.
-    idempotency_cache: DashMap<String, HashMap<String, ApplyResult>>,
+    idempotency_cache: DashMap<String, IdempotencyScope>,
+
+    /// Maximum idempotency keys kept per instance (0 = unlimited). The oldest
+    /// key is evicted when a new one would exceed it.
+    max_idempotency_keys: usize,
 
     /// Write-ahead log.
     wal: Arc<Wal>,
@@ -109,11 +160,31 @@ impl StateMachineEngine {
         wal_config: WalConfig,
         recovery: RecoveryState,
     ) -> Result<Self, CoreError> {
-        Self::recover(Arc::new(Wal::open(wal_config)?), recovery)
+        Self::new_with_options(wal_config, recovery, EngineOptions::default())
+    }
+
+    /// Like [`Self::new_with_recovery`], with `options` applied during
+    /// recovery (so the idempotency key limit also bounds startup memory).
+    pub fn new_with_options(
+        wal_config: WalConfig,
+        recovery: RecoveryState,
+        options: EngineOptions,
+    ) -> Result<Self, CoreError> {
+        Self::recover_with_options(Arc::new(Wal::open(wal_config)?), recovery, options)
     }
 
     /// Creates an engine over an existing WAL and recovers state.
     pub fn recover(wal: Arc<Wal>, recovery: RecoveryState) -> Result<Self, CoreError> {
+        Self::recover_with_options(wal, recovery, EngineOptions::default())
+    }
+
+    /// Creates an engine over an existing WAL and recovers state, applying
+    /// `options` while replaying.
+    pub fn recover_with_options(
+        wal: Arc<Wal>,
+        recovery: RecoveryState,
+        options: EngineOptions,
+    ) -> Result<Self, CoreError> {
         let mut engine = Self {
             definitions: DashMap::new(),
             instances: DashMap::new(),
@@ -121,6 +192,7 @@ impl StateMachineEngine {
             wal,
             write_gate: RwLock::new(()),
             allow_instance_recreate: true,
+            max_idempotency_keys: options.max_idempotency_keys,
             last_flush_offset: None,
         };
 
@@ -133,6 +205,23 @@ impl StateMachineEngine {
     pub fn with_allow_instance_recreate(mut self, allow: bool) -> Self {
         self.allow_instance_recreate = allow;
         self
+    }
+
+    /// Limits cached idempotency keys per instance to the `max` newest
+    /// (0 = unlimited) and trims what recovery already loaded. Trimming to
+    /// the newest keys gives the same set as evicting one by one during
+    /// replay, because eviction always drops the oldest key.
+    pub fn with_max_idempotency_keys(mut self, max: usize) -> Self {
+        self.max_idempotency_keys = max;
+        for mut scope in self.idempotency_cache.iter_mut() {
+            scope.trim(max);
+        }
+        self
+    }
+
+    /// Maximum idempotency keys kept per instance (0 = unlimited).
+    pub fn max_idempotency_keys(&self) -> usize {
+        self.max_idempotency_keys
     }
 
     /// Creates a new engine with an existing WAL.
@@ -195,25 +284,23 @@ impl StateMachineEngine {
         for snapshot in snapshots {
             covered.insert(snapshot.instance_id.clone(), snapshot.wal_offset);
             if !snapshot.idempotency.is_empty() {
-                let cache = snapshot
-                    .idempotency
-                    .iter()
-                    .map(|r| {
-                        (
-                            r.key.clone(),
-                            ApplyResult {
-                                from_state: r.from_state.clone(),
-                                to_state: r.to_state.clone(),
-                                ctx: r.ctx.clone(),
-                                wal_offset: r.wal_offset,
-                                sequence: r.sequence,
-                                applied: true,
-                            },
-                        )
-                    })
-                    .collect();
+                let mut scope = IdempotencyScope::default();
+                for r in &snapshot.idempotency {
+                    scope.insert(
+                        r.key.clone(),
+                        ApplyResult {
+                            from_state: r.from_state.clone(),
+                            to_state: r.to_state.clone(),
+                            ctx: r.ctx.clone(),
+                            wal_offset: r.wal_offset,
+                            sequence: r.sequence,
+                            applied: true,
+                        },
+                        self.max_idempotency_keys,
+                    );
+                }
                 self.idempotency_cache
-                    .insert(snapshot.instance_id.clone(), cache);
+                    .insert(snapshot.instance_id.clone(), scope);
             }
             let mut instance = snapshot.to_instance();
             instance.ctx = normalize_ctx(instance.ctx).unwrap_or_else(empty_ctx);
@@ -359,6 +446,7 @@ impl StateMachineEngine {
                                     sequence,
                                     applied: true,
                                 },
+                                self.max_idempotency_keys,
                             );
                     }
                     instance.state = to_state;
@@ -405,8 +493,9 @@ impl StateMachineEngine {
         let _write = self.write_gate.read();
         let (sequence, local_offset) = self.wal.append(&entry)?;
         // Use the primary's offset in memory so clients see consistent offsets
-        // when reading from any node that's fully caught up.
-        self.replay_entry(primary_offset, entry)?;
+        // when reading from any node that's fully caught up. The local
+        // sequence matches the primary's, so cached results keep it.
+        self.replay_entry_at(sequence, primary_offset, entry)?;
         Ok((sequence, local_offset.as_u64()))
     }
 
@@ -811,7 +900,7 @@ impl StateMachineEngine {
             self.idempotency_cache
                 .entry(instance_id.to_string())
                 .or_default()
-                .insert(key.to_string(), result.clone());
+                .insert(key.to_string(), result.clone(), self.max_idempotency_keys);
         }
 
         Ok(result)
@@ -963,26 +1052,28 @@ impl StateMachineEngine {
             .collect()
     }
 
-    /// Cached idempotency results for one instance, ordered by WAL offset.
+    /// Cached idempotency results for one instance, oldest first (the order
+    /// eviction uses, which is WAL-offset order).
     pub fn idempotency_records(&self, instance_id: &str) -> Vec<IdempotencyRecord> {
-        let mut records: Vec<IdempotencyRecord> = self
-            .idempotency_cache
+        self.idempotency_cache
             .get(instance_id)
-            .map(|m| {
-                m.iter()
-                    .map(|(key, r)| IdempotencyRecord {
-                        key: key.clone(),
-                        from_state: r.from_state.clone(),
-                        to_state: r.to_state.clone(),
-                        ctx: r.ctx.clone(),
-                        wal_offset: r.wal_offset,
-                        sequence: r.sequence,
+            .map(|scope| {
+                scope
+                    .order
+                    .iter()
+                    .filter_map(|key| {
+                        scope.get(key).map(|r| IdempotencyRecord {
+                            key: key.clone(),
+                            from_state: r.from_state.clone(),
+                            to_state: r.to_state.clone(),
+                            ctx: r.ctx.clone(),
+                            wal_offset: r.wal_offset,
+                            sequence: r.sequence,
+                        })
                     })
                     .collect()
             })
-            .unwrap_or_default();
-        records.sort_by(|a, b| a.wal_offset.cmp(&b.wal_offset).then(a.key.cmp(&b.key)));
-        records
+            .unwrap_or_default()
     }
 
     /// All machine definitions, for persisting alongside snapshots.
@@ -2425,5 +2516,286 @@ mod tests {
         assert_eq!(seq1, 1);
         assert_eq!(seq2, 2);
         assert_eq!(engine.instance_count(), 0);
+    }
+
+    // =========================================================================
+    // Idempotency Key Limit Tests
+    // =========================================================================
+
+    fn loop_definition() -> Value {
+        json!({
+            "states": ["open"],
+            "initial": "open",
+            "transitions": [{"from": "open", "event": "TICK", "to": "open"}]
+        })
+    }
+
+    fn loop_instance(engine: &StateMachineEngine, id: &str) {
+        engine.put_machine("loop", 1, &loop_definition()).unwrap();
+        engine
+            .create_instance(id, "loop", 1, json!({}), None)
+            .unwrap();
+    }
+
+    fn tick(engine: &StateMachineEngine, id: &str, key: &str) -> ApplyResult {
+        engine
+            .apply_event(id, "TICK", json!({}), None, None, None, Some(key))
+            .unwrap()
+    }
+
+    fn cached_keys(engine: &StateMachineEngine, id: &str) -> Vec<String> {
+        engine
+            .idempotency_records(id)
+            .into_iter()
+            .map(|r| r.key)
+            .collect()
+    }
+
+    #[test]
+    fn test_key_limit_evicts_oldest_key() {
+        let (_dir, engine) = test_engine();
+        let engine = engine.with_max_idempotency_keys(3);
+        loop_instance(&engine, "i-1");
+        for i in 0..4 {
+            assert!(tick(&engine, "i-1", &format!("k{i}")).applied);
+        }
+
+        assert_eq!(engine.idempotency_records("i-1").len(), 3);
+        assert!(!tick(&engine, "i-1", "k3").applied);
+        // k0 was evicted, so a retry with it is applied again.
+        assert!(tick(&engine, "i-1", "k0").applied);
+    }
+
+    #[test]
+    fn test_default_engine_has_no_key_limit() {
+        let (_dir, engine) = test_engine();
+        assert_eq!(engine.max_idempotency_keys(), 0);
+        loop_instance(&engine, "i-1");
+        for i in 0..50 {
+            tick(&engine, "i-1", &format!("k{i}"));
+        }
+        assert_eq!(engine.idempotency_records("i-1").len(), 50);
+    }
+
+    #[test]
+    fn test_key_limit_trims_after_recovery() {
+        let (dir, engine) = test_engine();
+        loop_instance(&engine, "i-1");
+        for i in 0..5 {
+            tick(&engine, "i-1", &format!("k{i}"));
+        }
+        drop(engine);
+
+        let engine = reopen(&dir).with_max_idempotency_keys(2);
+        assert_eq!(cached_keys(&engine, "i-1"), vec!["k3", "k4"]);
+        assert!(!tick(&engine, "i-1", "k4").applied);
+        assert!(tick(&engine, "i-1", "k2").applied);
+    }
+
+    #[test]
+    fn test_key_limit_applies_during_recovery() {
+        let (dir, engine) = test_engine();
+        loop_instance(&engine, "i-1");
+        for i in 0..5 {
+            tick(&engine, "i-1", &format!("k{i}"));
+        }
+        let snapshot = snapshot_of(&engine, "i-1");
+        let machines = engine.machine_records().unwrap();
+        let head = engine.wal().latest_offset().unwrap().as_u64();
+        for i in 5..8 {
+            tick(&engine, "i-1", &format!("k{i}"));
+        }
+        drop(engine);
+
+        let config = WalConfig::new(dir.path())
+            .with_segment_size(4096)
+            .with_fsync_policy(FsyncPolicy::EveryWrite);
+        let recovery = RecoveryState {
+            machines,
+            snapshots: vec![snapshot],
+            machines_wal_offset: head,
+        };
+        let engine = StateMachineEngine::new_with_options(
+            config,
+            recovery,
+            EngineOptions {
+                max_idempotency_keys: 2,
+            },
+        )
+        .unwrap();
+        assert_eq!(engine.max_idempotency_keys(), 2);
+        assert_eq!(cached_keys(&engine, "i-1"), vec!["k6", "k7"]);
+        assert!(tick(&engine, "i-1", "k5").applied);
+    }
+
+    #[test]
+    fn test_key_limit_trims_oversized_snapshot() {
+        let (dir, engine) = test_engine();
+        loop_instance(&engine, "i-1");
+        for i in 0..5 {
+            tick(&engine, "i-1", &format!("k{i}"));
+        }
+        let snapshot = snapshot_of(&engine, "i-1");
+        let machines = engine.machine_records().unwrap();
+        let head = engine.wal().latest_offset().unwrap().as_u64();
+        drop(engine);
+
+        let recovery = RecoveryState {
+            machines,
+            snapshots: vec![snapshot],
+            machines_wal_offset: head,
+        };
+        let engine = reopen_with(&dir, recovery).with_max_idempotency_keys(2);
+        assert_eq!(cached_keys(&engine, "i-1"), vec!["k3", "k4"]);
+    }
+
+    #[test]
+    fn test_reapplied_evicted_key_is_cached_once() {
+        let (dir, engine) = test_engine();
+        let engine = engine.with_max_idempotency_keys(2);
+        loop_instance(&engine, "i-1");
+        for key in ["k0", "k1", "k2"] {
+            tick(&engine, "i-1", key);
+        }
+        assert!(tick(&engine, "i-1", "k0").applied);
+        assert_eq!(cached_keys(&engine, "i-1"), vec!["k2", "k0"]);
+        drop(engine);
+
+        // Without a limit, replay sees k0 twice in the WAL; it must still be
+        // cached once.
+        let unlimited = reopen(&dir);
+        assert_eq!(cached_keys(&unlimited, "i-1"), vec!["k1", "k2", "k0"]);
+        drop(unlimited);
+
+        let engine = reopen(&dir).with_max_idempotency_keys(2);
+        assert_eq!(cached_keys(&engine, "i-1"), vec!["k2", "k0"]);
+        assert!(!tick(&engine, "i-1", "k0").applied);
+        assert!(tick(&engine, "i-1", "k1").applied);
+    }
+
+    #[test]
+    fn test_replicated_idempotent_retry_reports_local_sequence() {
+        let (_dir, engine) = test_engine();
+        engine
+            .apply_replicated_entry(
+                1,
+                WalEntry::PutMachine {
+                    machine: "loop".to_string(),
+                    version: 1,
+                    definition_hash: "abc".to_string(),
+                    definition: loop_definition(),
+                },
+            )
+            .unwrap();
+        engine
+            .apply_replicated_entry(
+                2,
+                WalEntry::CreateInstance {
+                    instance_id: "i-1".to_string(),
+                    machine: "loop".to_string(),
+                    version: 1,
+                    initial_state: "open".to_string(),
+                    initial_ctx: json!({}),
+                    idempotency_key: None,
+                },
+            )
+            .unwrap();
+        let (seq, _) = engine
+            .apply_replicated_entry(
+                3,
+                WalEntry::ApplyEvent {
+                    instance_id: "i-1".to_string(),
+                    event: "TICK".to_string(),
+                    from_state: "open".to_string(),
+                    to_state: "open".to_string(),
+                    payload: json!({}),
+                    ctx: json!({}),
+                    event_id: None,
+                    idempotency_key: Some("k".to_string()),
+                },
+            )
+            .unwrap();
+
+        // After promotion, a retry must report the event's real sequence.
+        let retry = tick(&engine, "i-1", "k");
+        assert!(!retry.applied);
+        assert_eq!(retry.sequence, seq);
+        assert_eq!(engine.idempotency_records("i-1")[0].sequence, seq);
+    }
+
+    #[test]
+    fn test_replicated_entries_respect_key_limit() {
+        let (_dir, engine) = test_engine();
+        let engine = engine.with_max_idempotency_keys(2);
+        engine
+            .apply_replicated_entry(
+                1,
+                WalEntry::PutMachine {
+                    machine: "loop".to_string(),
+                    version: 1,
+                    definition_hash: "abc".to_string(),
+                    definition: loop_definition(),
+                },
+            )
+            .unwrap();
+        engine
+            .apply_replicated_entry(
+                2,
+                WalEntry::CreateInstance {
+                    instance_id: "i-1".to_string(),
+                    machine: "loop".to_string(),
+                    version: 1,
+                    initial_state: "open".to_string(),
+                    initial_ctx: json!({}),
+                    idempotency_key: None,
+                },
+            )
+            .unwrap();
+        for i in 0..4u64 {
+            engine
+                .apply_replicated_entry(
+                    10 + i,
+                    WalEntry::ApplyEvent {
+                        instance_id: "i-1".to_string(),
+                        event: "TICK".to_string(),
+                        from_state: "open".to_string(),
+                        to_state: "open".to_string(),
+                        payload: json!({}),
+                        ctx: json!({}),
+                        event_id: None,
+                        idempotency_key: Some(format!("k{i}")),
+                    },
+                )
+                .unwrap();
+        }
+        assert_eq!(cached_keys(&engine, "i-1"), vec!["k2", "k3"]);
+    }
+
+    #[test]
+    fn test_snapshot_records_respect_key_limit() {
+        let (_dir, engine) = test_engine();
+        let engine = engine.with_max_idempotency_keys(3);
+        loop_instance(&engine, "i-1");
+        for i in 0..5 {
+            tick(&engine, "i-1", &format!("k{i}"));
+        }
+        let snapshot = snapshot_of(&engine, "i-1");
+        let keys: Vec<&str> = snapshot
+            .idempotency
+            .iter()
+            .map(|r| r.key.as_str())
+            .collect();
+        assert_eq!(keys, vec!["k2", "k3", "k4"]);
+    }
+
+    #[test]
+    fn test_key_limit_zero_means_unlimited() {
+        let (_dir, engine) = test_engine();
+        let engine = engine.with_max_idempotency_keys(0);
+        loop_instance(&engine, "i-1");
+        for i in 0..20 {
+            tick(&engine, "i-1", &format!("k{i}"));
+        }
+        assert_eq!(engine.idempotency_records("i-1").len(), 20);
     }
 }
