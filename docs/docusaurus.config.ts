@@ -6,6 +6,12 @@ const config: Config = {
   title: "rstmdb",
   tagline: "State Machine Database with WAL Durability",
   favicon: "img/favicon.ico",
+  headTags: [
+    {
+      tagName: "link",
+      attributes: { rel: "icon", type: "image/svg+xml", href: "/img/favicon.svg" },
+    },
+  ],
 
   future: {
     v4: true,
@@ -21,7 +27,11 @@ const config: Config = {
   trailingSlash: false,
 
   onBrokenLinks: "throw",
-  onBrokenMarkdownLinks: "warn",
+  markdown: {
+    hooks: {
+      onBrokenMarkdownLinks: "warn",
+    },
+  },
 
   i18n: {
     defaultLocale: "en",
@@ -54,6 +64,7 @@ const config: Config = {
       logo: {
         alt: "rstmdb Logo",
         src: "img/logo.svg",
+        srcDark: "img/logo-dark.svg",
       },
       items: [
         {
