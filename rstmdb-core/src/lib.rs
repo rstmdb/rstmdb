@@ -15,7 +15,7 @@ pub mod guard;
 pub mod instance;
 
 pub use definition::{MachineDefinition, State, Transition};
-pub use engine::{FlushAllResult, MachineRecord, RecoveryState, StateMachineEngine};
+pub use engine::{EngineOptions, FlushAllResult, MachineRecord, RecoveryState, StateMachineEngine};
 pub use error::CoreError;
 pub use guard::{GuardEvaluator, GuardExpr};
 pub use instance::{IdempotencyRecord, Instance, InstanceSnapshot, InstanceState};

@@ -231,6 +231,8 @@ pub struct StorageConfig {
     pub allow_instance_recreate: bool,
     /// Allow the FLUSH_ALL operation to clear all data.
     pub allow_flush_all: bool,
+    /// Maximum idempotency keys kept per instance (0 = unlimited).
+    pub max_idempotency_keys_per_instance: usize,
 }
 
 /// Fsync policy for WAL writes.
@@ -256,23 +258,30 @@ impl Default for StorageConfig {
             max_machine_versions: 0, // unlimited
             allow_instance_recreate: true,
             allow_flush_all: false,
+            max_idempotency_keys_per_instance: 1000,
         }
     }
 }
 
 impl StorageConfig {
     fn apply_env_overrides(&mut self) {
-        if let Ok(dir) = std::env::var("RSTMDB_DATA") {
+        self.apply_overrides_from(|key| std::env::var(key).ok());
+    }
+
+    /// Applies overrides read through `get` (the process environment in
+    /// production, a fixed map in tests).
+    fn apply_overrides_from(&mut self, get: impl Fn(&str) -> Option<String>) {
+        if let Some(dir) = get("RSTMDB_DATA") {
             self.data_dir = PathBuf::from(dir);
         }
 
-        if let Ok(size) = std::env::var("RSTMDB_WAL_SEGMENT_SIZE_MB") {
+        if let Some(size) = get("RSTMDB_WAL_SEGMENT_SIZE_MB") {
             if let Ok(mb) = size.parse() {
                 self.wal_segment_size_mb = mb;
             }
         }
 
-        if let Ok(policy) = std::env::var("RSTMDB_FSYNC_POLICY") {
+        if let Some(policy) = get("RSTMDB_FSYNC_POLICY") {
             self.fsync_policy = match policy.to_lowercase().as_str() {
                 "every_write" | "everywrite" => FsyncPolicy::EveryWrite,
                 "never" => FsyncPolicy::Never,
@@ -288,17 +297,23 @@ impl StorageConfig {
             };
         }
 
-        if let Ok(max) = std::env::var("RSTMDB_MAX_MACHINE_VERSIONS") {
+        if let Some(max) = get("RSTMDB_MAX_MACHINE_VERSIONS") {
             if let Ok(n) = max.parse() {
                 self.max_machine_versions = n;
             }
         }
 
-        if let Ok(val) = std::env::var("RSTMDB_ALLOW_INSTANCE_RECREATE") {
+        if let Some(max) = get("RSTMDB_MAX_IDEMPOTENCY_KEYS_PER_INSTANCE") {
+            if let Ok(n) = max.parse() {
+                self.max_idempotency_keys_per_instance = n;
+            }
+        }
+
+        if let Some(val) = get("RSTMDB_ALLOW_INSTANCE_RECREATE") {
             self.allow_instance_recreate = val == "1" || val.to_lowercase() == "true";
         }
 
-        if let Ok(val) = std::env::var("RSTMDB_ALLOW_FLUSH_ALL") {
+        if let Some(val) = get("RSTMDB_ALLOW_FLUSH_ALL") {
             self.allow_flush_all = val == "1" || val.to_lowercase() == "true";
         }
     }
@@ -993,6 +1008,40 @@ mod tests {
         let config = StorageConfig::default();
         assert_eq!(config.wal_dir(), PathBuf::from("./data/wal"));
         assert_eq!(config.snapshots_dir(), PathBuf::from("./data/snapshots"));
+    }
+
+    #[test]
+    fn test_idempotency_limit_default() {
+        assert_eq!(
+            Config::default().storage.max_idempotency_keys_per_instance,
+            1000
+        );
+    }
+
+    #[test]
+    fn test_idempotency_limit_from_yaml() {
+        let cfg: Config =
+            serde_yaml::from_str("storage:\n  max_idempotency_keys_per_instance: 0\n").unwrap();
+        assert_eq!(cfg.storage.max_idempotency_keys_per_instance, 0);
+        let cfg: Config = serde_yaml::from_str("storage:\n  data_dir: ./d\n").unwrap();
+        assert_eq!(cfg.storage.max_idempotency_keys_per_instance, 1000);
+    }
+
+    #[test]
+    fn test_idempotency_limit_env_override() {
+        let env = |value: &'static str| {
+            move |key: &str| {
+                (key == "RSTMDB_MAX_IDEMPOTENCY_KEYS_PER_INSTANCE").then(|| value.to_string())
+            }
+        };
+
+        let mut storage = StorageConfig::default();
+        storage.apply_overrides_from(env("0"));
+        assert_eq!(storage.max_idempotency_keys_per_instance, 0);
+
+        let mut storage = StorageConfig::default();
+        storage.apply_overrides_from(env("not-a-number"));
+        assert_eq!(storage.max_idempotency_keys_per_instance, 1000);
     }
 
     #[test]

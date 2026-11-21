@@ -256,8 +256,14 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
 
     // Create state machine engine
     let engine = Arc::new(
-        StateMachineEngine::new_with_recovery(wal_config, recovery)?
-            .with_allow_instance_recreate(config.storage.allow_instance_recreate),
+        StateMachineEngine::new_with_options(
+            wal_config,
+            recovery,
+            rstmdb_core::EngineOptions {
+                max_idempotency_keys: config.storage.max_idempotency_keys_per_instance,
+            },
+        )?
+        .with_allow_instance_recreate(config.storage.allow_instance_recreate),
     );
 
     // A FLUSH_ALL marker newer than the snapshot store (crash before the

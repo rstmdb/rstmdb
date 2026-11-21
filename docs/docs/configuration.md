@@ -55,6 +55,11 @@ storage:
   # would diverge the cluster, so the server refuses to start with both set.
   allow_flush_all: false
 
+  # Idempotency keys remembered per instance for APPLY_EVENT (0 = unlimited).
+  # When a new key would exceed the limit, the oldest key is forgotten and a
+  # retry with it is applied again. Use the same value on primary and replicas.
+  max_idempotency_keys_per_instance: 1000
+
 # Authentication settings
 auth:
   # Require authentication
@@ -176,6 +181,7 @@ All configuration options can be set via environment variables:
 | `RSTMDB_MAX_MACHINE_VERSIONS` | `storage.max_machine_versions` | `0` |
 | `RSTMDB_ALLOW_INSTANCE_RECREATE` | `storage.allow_instance_recreate` | `true` |
 | `RSTMDB_ALLOW_FLUSH_ALL` | `storage.allow_flush_all` | `false` |
+| `RSTMDB_MAX_IDEMPOTENCY_KEYS_PER_INSTANCE` | `storage.max_idempotency_keys_per_instance` | `1000` |
 
 ### Authentication
 
