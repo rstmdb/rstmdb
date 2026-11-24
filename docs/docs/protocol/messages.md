@@ -421,6 +421,10 @@ Sent asynchronously for active subscriptions. Event fields are **top-level** (no
 
 - Batch operations array field is `ops` (not `operations`).
 - Max ops per batch: 100 (server default).
+- `"mode": "atomic"` validates every op before applying any, and applies all or
+  none; only `PUT_MACHINE`, `CREATE_INSTANCE`, `APPLY_EVENT` and
+  `DELETE_INSTANCE` are allowed. `"mode": "best_effort"` applies each op on its
+  own and reports per-op results.
 
 ## Request ID Requirements
 

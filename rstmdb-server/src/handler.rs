@@ -10,6 +10,7 @@ use crate::replication::{ReplicaClient, ReplicationManager};
 use crate::session::{Session, SessionState, WireMode};
 use base64::Engine as _;
 use parking_lot::Mutex as PlMutex;
+use rstmdb_core::engine::{ApplyResult, BatchError, BatchOp, BatchOpResult};
 use rstmdb_core::instance::InstanceSnapshot;
 use rstmdb_core::StateMachineEngine;
 use rstmdb_protocol::message::*;
@@ -17,7 +18,7 @@ use rstmdb_protocol::ErrorCode;
 use rstmdb_protocol::PROTOCOL_VERSION;
 use rstmdb_storage::SnapshotStore;
 use serde_json::{json, Value};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::{Arc, OnceLock};
 use tokio::sync::broadcast;
@@ -477,11 +478,30 @@ impl CommandHandler {
 
         match result {
             Ok(value) => Response::ok(&request.id, value),
-            Err(e) => Response::error(
-                &request.id,
-                ResponseError::new(e.error_code(), e.to_string()),
-            ),
+            Err(e) => Response::error(&request.id, Self::response_error(&e)),
         }
+    }
+
+    /// Builds the protocol error for a failed request.
+    fn response_error(e: &ServerError) -> ResponseError {
+        let mut error = ResponseError::new(e.error_code(), e.to_string());
+        if let ServerError::AtomicBatchFailed {
+            index,
+            committed,
+            op_code,
+            ..
+        } = e
+        {
+            error = error
+                .with_detail("failed_op_index", *index as u64)
+                .with_detail("failed_op_code", op_code.to_string())
+                .with_detail("committed_ops", *committed as u64);
+            // Retrying a partially committed batch would apply its prefix twice.
+            if *committed > 0 {
+                error.retryable = false;
+            }
+        }
+        error
     }
 
     /// Returns the string name for an operation.
@@ -534,6 +554,7 @@ impl CommandHandler {
             ErrorCode::InvalidTransition => "INVALID_TRANSITION",
             ErrorCode::GuardFailed => "GUARD_FAILED",
             ErrorCode::Conflict => "CONFLICT",
+            ErrorCode::IdempotencyConflict => "IDEMPOTENCY_CONFLICT",
             ErrorCode::WalIoError => "WAL_IO_ERROR",
             ErrorCode::InternalError => "INTERNAL_ERROR",
             ErrorCode::RateLimited => "RATE_LIMITED",
@@ -907,19 +928,14 @@ impl CommandHandler {
 
         // Notify watchers if event was actually applied
         if result.applied {
-            if let Some(broadcaster) = &self.broadcaster {
-                broadcaster.notify(InstanceEvent {
-                    instance_id: p.instance_id.clone(),
-                    machine: instance.machine.clone(),
-                    version: instance.version,
-                    wal_offset: result.wal_offset,
-                    from_state: result.from_state.clone(),
-                    to_state: result.to_state.clone(),
-                    event: p.event.clone(),
-                    payload: p.payload,
-                    ctx: result.ctx.clone(),
-                });
-            }
+            self.notify_applied(
+                &p.instance_id,
+                &instance.machine,
+                instance.version,
+                &p.event,
+                p.payload,
+                &result,
+            );
 
             // Update gauge metrics after successful apply
             self.update_gauge_metrics();
@@ -937,6 +953,31 @@ impl CommandHandler {
         Ok(serde_json::to_value(apply_result)?)
     }
 
+    /// Notifies watchers of an applied event.
+    fn notify_applied(
+        &self,
+        instance_id: &str,
+        machine: &str,
+        version: u32,
+        event: &str,
+        payload: Value,
+        result: &ApplyResult,
+    ) {
+        if let Some(broadcaster) = &self.broadcaster {
+            broadcaster.notify(InstanceEvent {
+                instance_id: instance_id.to_string(),
+                machine: machine.to_string(),
+                version,
+                wal_offset: result.wal_offset,
+                from_state: result.from_state.clone(),
+                to_state: result.to_state.clone(),
+                event: event.to_string(),
+                payload,
+                ctx: result.ctx.clone(),
+            });
+        }
+    }
+
     fn handle_batch(&self, session: &mut Session, params: &Value) -> Result<Value, ServerError> {
         let mode = params["mode"].as_str().unwrap_or("best_effort");
         let ops = params["ops"]
@@ -949,6 +990,10 @@ impl CommandHandler {
                 ops.len(),
                 self.info.max_batch_ops
             )));
+        }
+
+        if mode == "atomic" {
+            return self.handle_atomic_batch(ops);
         }
 
         let mut results = Vec::new();
@@ -968,14 +1013,6 @@ impl CommandHandler {
 
             let response = self.handle(session, &request);
 
-            if mode == "atomic" && response.is_error() {
-                // Atomic mode: fail entire batch on first error
-                return Err(ServerError::InvalidRequest(format!(
-                    "atomic batch failed: {:?}",
-                    response.error
-                )));
-            }
-
             results.push(json!({
                 "status": if response.is_ok() { "ok" } else { "error" },
                 "result": response.result,
@@ -986,6 +1023,260 @@ impl CommandHandler {
         Ok(json!({
             "results": results,
         }))
+    }
+
+    /// Atomic batch: every op is parsed and validated before any is applied,
+    /// then all are committed under the engine write gate. On failure nothing
+    /// is applied, unless a WAL write fails part way (reported via
+    /// `committed_ops`).
+    fn handle_atomic_batch(&self, ops: &[Value]) -> Result<Value, ServerError> {
+        let total = ops.len();
+        let rejected = |index: usize, e: ServerError| {
+            let op_code = e.error_code();
+            ServerError::AtomicBatchFailed {
+                index,
+                committed: 0,
+                rejected: true,
+                op_code,
+                message: format!(
+                    "atomic batch rejected at op {} ({}): {}; no operations were applied",
+                    index, op_code, e
+                ),
+            }
+        };
+
+        let mut batch_ops = Vec::with_capacity(total);
+        for (index, op) in ops.iter().enumerate() {
+            batch_ops.push(Self::parse_atomic_op(op).map_err(|e| rejected(index, e))?);
+        }
+        self.check_atomic_batch(&batch_ops)
+            .map_err(|(index, e)| rejected(index, e))?;
+
+        let results = match self.engine.apply_batch_atomic(&batch_ops) {
+            Ok(results) => results,
+            Err(BatchError::Rejected { index, error }) => {
+                return Err(rejected(index, ServerError::Core(error)));
+            }
+            Err(BatchError::CommitFailed { index, error }) => {
+                let e = ServerError::Core(error);
+                let op_code = e.error_code();
+                return Err(ServerError::AtomicBatchFailed {
+                    index,
+                    committed: index,
+                    rejected: false,
+                    op_code,
+                    message: format!(
+                        "atomic batch failed at op {} ({}) after committing {} of {} operations: {}",
+                        index, op_code, index, total, e
+                    ),
+                });
+            }
+        };
+
+        let mut out = Vec::with_capacity(results.len());
+        for (op, result) in batch_ops.into_iter().zip(results) {
+            let value = match (op, result) {
+                (
+                    BatchOp::PutMachine {
+                        machine, version, ..
+                    },
+                    BatchOpResult::PutMachine { checksum, created },
+                ) => serde_json::to_value(PutMachineResult {
+                    machine,
+                    version,
+                    stored_checksum: checksum,
+                    created,
+                })?,
+                (
+                    BatchOp::CreateInstance { .. },
+                    BatchOpResult::CreateInstance { instance, .. },
+                ) => serde_json::to_value(CreateInstanceResult {
+                    instance_id: instance.id,
+                    state: instance.state,
+                    wal_offset: instance.last_wal_offset,
+                })?,
+                (
+                    BatchOp::ApplyEvent {
+                        instance_id,
+                        event,
+                        payload,
+                        event_id,
+                        ..
+                    },
+                    BatchOpResult::ApplyEvent {
+                        result,
+                        machine,
+                        version,
+                    },
+                ) => {
+                    if result.applied {
+                        self.notify_applied(
+                            &instance_id,
+                            &machine,
+                            version,
+                            &event,
+                            payload,
+                            &result,
+                        );
+                    }
+                    serde_json::to_value(ApplyEventResult {
+                        from_state: result.from_state,
+                        to_state: result.to_state,
+                        ctx: Some(result.ctx),
+                        wal_offset: result.wal_offset,
+                        applied: result.applied,
+                        event_id,
+                    })?
+                }
+                (
+                    BatchOp::DeleteInstance { instance_id, .. },
+                    BatchOpResult::DeleteInstance { wal_offset },
+                ) => json!({
+                    "instance_id": instance_id,
+                    "deleted": true,
+                    "wal_offset": wal_offset,
+                }),
+                _ => {
+                    return Err(ServerError::InvalidRequest(
+                        "atomic batch result does not match its operation".to_string(),
+                    ))
+                }
+            };
+            out.push(json!({
+                "status": "ok",
+                "result": value,
+                "error": Value::Null,
+            }));
+        }
+
+        self.update_gauge_metrics();
+
+        Ok(json!({
+            "results": out,
+        }))
+    }
+
+    /// Parses one op of an atomic batch. Only write operations are allowed.
+    fn parse_atomic_op(op: &Value) -> Result<BatchOp, ServerError> {
+        let op_type = op["op"]
+            .as_str()
+            .ok_or_else(|| ServerError::InvalidRequest("missing op type".to_string()))?;
+        let operation: Operation = serde_json::from_value(json!(op_type))
+            .map_err(|e| ServerError::InvalidRequest(e.to_string()))?;
+        let params = op["params"].clone();
+        let invalid = |e: serde_json::Error| ServerError::InvalidRequest(e.to_string());
+
+        match operation {
+            Operation::PutMachine => {
+                let p: PutMachineParams = serde_json::from_value(params).map_err(invalid)?;
+                Ok(BatchOp::PutMachine {
+                    machine: p.machine,
+                    version: p.version,
+                    definition: p.definition,
+                })
+            }
+            Operation::CreateInstance => {
+                let p: CreateInstanceParams = serde_json::from_value(params).map_err(invalid)?;
+                Ok(BatchOp::CreateInstance {
+                    instance_id: p
+                        .instance_id
+                        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+                    machine: p.machine,
+                    version: p.version,
+                    initial_ctx: p.initial_ctx,
+                    idempotency_key: p.idempotency_key,
+                })
+            }
+            Operation::ApplyEvent => {
+                let p: ApplyEventParams = serde_json::from_value(params).map_err(invalid)?;
+                Ok(BatchOp::ApplyEvent {
+                    instance_id: p.instance_id,
+                    event: p.event,
+                    payload: p.payload,
+                    expected_state: p.expected_state,
+                    expected_wal_offset: p.expected_wal_offset,
+                    event_id: p.event_id,
+                    idempotency_key: p.idempotency_key,
+                })
+            }
+            Operation::DeleteInstance => {
+                let instance_id = params["instance_id"]
+                    .as_str()
+                    .ok_or_else(|| ServerError::InvalidRequest("missing instance_id".to_string()))?;
+                Ok(BatchOp::DeleteInstance {
+                    instance_id: instance_id.to_string(),
+                    idempotency_key: params["idempotency_key"].as_str().map(str::to_string),
+                })
+            }
+            other => Err(ServerError::InvalidRequest(format!(
+                "{} is not allowed in an atomic batch (allowed: PUT_MACHINE, CREATE_INSTANCE, APPLY_EVENT, DELETE_INSTANCE)",
+                Self::operation_name(&other)
+            ))),
+        }
+    }
+
+    /// Server-level checks for an atomic batch that the engine does not make:
+    /// the machine version limit, and offset expectations the client cannot
+    /// know. Returns the index of the failing op.
+    fn check_atomic_batch(&self, ops: &[BatchOp]) -> Result<(), (usize, ServerError)> {
+        let mut new_versions: HashMap<&str, HashSet<u32>> = HashMap::new();
+        let mut changed: HashMap<&str, usize> = HashMap::new();
+
+        for (index, op) in ops.iter().enumerate() {
+            match op {
+                BatchOp::PutMachine {
+                    machine, version, ..
+                } => {
+                    if self.max_machine_versions == 0 {
+                        continue;
+                    }
+                    let mut versions: HashSet<u32> = self
+                        .engine
+                        .get_machine_versions(machine)
+                        .into_iter()
+                        .collect();
+                    let added = new_versions.entry(machine.as_str()).or_default();
+                    versions.extend(added.iter().copied());
+                    if !versions.contains(version)
+                        && versions.len() >= self.max_machine_versions as usize
+                    {
+                        return Err((
+                            index,
+                            ServerError::MachineVersionLimitExceeded(format!(
+                                "machine '{}' already has {} versions (limit: {})",
+                                machine,
+                                versions.len(),
+                                self.max_machine_versions
+                            )),
+                        ));
+                    }
+                    added.insert(*version);
+                }
+                BatchOp::CreateInstance { instance_id, .. }
+                | BatchOp::DeleteInstance { instance_id, .. } => {
+                    changed.insert(instance_id.as_str(), index);
+                }
+                BatchOp::ApplyEvent {
+                    instance_id,
+                    expected_wal_offset,
+                    ..
+                } => {
+                    if expected_wal_offset.is_some() {
+                        if let Some(earlier) = changed.get(instance_id.as_str()) {
+                            return Err((
+                                index,
+                                ServerError::InvalidRequest(format!(
+                                    "expected_wal_offset cannot be used on instance '{}' after op {} of the same atomic batch changed it (its new offset is only assigned at commit)",
+                                    instance_id, earlier
+                                )),
+                            ));
+                        }
+                    }
+                    changed.insert(instance_id.as_str(), index);
+                }
+            }
+        }
+        Ok(())
     }
 
     fn handle_snapshot_instance(&self, params: &Value) -> Result<Value, ServerError> {
@@ -1862,6 +2153,200 @@ mod tests {
         let response = handler.handle(&mut session, &batch_request);
 
         assert!(response.is_error());
+    }
+
+    fn setup_atomic_batch_fixture(handler: &CommandHandler, session: &mut Session) {
+        let put_request = Request::new("s1", Operation::PutMachine).with_params(json!({
+            "machine": "flow",
+            "version": 1,
+            "definition": {
+                "states": ["a", "b", "c"],
+                "initial": "a",
+                "transitions": [
+                    {"from": "a", "event": "NEXT", "to": "b"},
+                    {"from": "b", "event": "NEXT", "to": "c"}
+                ]
+            }
+        }));
+        assert!(handler.handle(session, &put_request).is_ok());
+        for id in ["x-1", "x-2"] {
+            let create_request = Request::new("s2", Operation::CreateInstance).with_params(json!({
+                "instance_id": id,
+                "machine": "flow",
+                "version": 1
+            }));
+            assert!(handler.handle(session, &create_request).is_ok());
+        }
+    }
+
+    fn instance_state(handler: &CommandHandler, session: &mut Session, id: &str) -> Value {
+        let request = Request::new("g", Operation::GetInstance).with_params(json!({
+            "instance_id": id
+        }));
+        let response = handler.handle(session, &request);
+        response.result.unwrap()["state"].clone()
+    }
+
+    #[test]
+    fn test_batch_atomic_second_of_three_fails_leaves_first_unapplied() {
+        let (_dir, handler, mut session) = test_handler();
+        setup_atomic_batch_fixture(&handler, &mut session);
+        let seq_before = handler.engine.wal().next_sequence();
+
+        let batch_request = Request::new("1", Operation::Batch).with_params(json!({
+            "mode": "atomic",
+            "ops": [
+                {"op": "APPLY_EVENT", "params": {"instance_id": "x-1", "event": "NEXT"}},
+                {"op": "APPLY_EVENT", "params": {"instance_id": "missing", "event": "NEXT"}},
+                {"op": "APPLY_EVENT", "params": {"instance_id": "x-2", "event": "NEXT"}}
+            ]
+        }));
+        let response = handler.handle(&mut session, &batch_request);
+        assert!(response.is_error());
+
+        // Nothing was applied or written.
+        assert_eq!(instance_state(&handler, &mut session, "x-1"), "a");
+        assert_eq!(instance_state(&handler, &mut session, "x-2"), "a");
+        assert_eq!(handler.engine.wal().next_sequence(), seq_before);
+
+        // The error names the failing op and its own error code.
+        let error = response.error.unwrap();
+        assert_eq!(error.code, ErrorCode::BadRequest);
+        assert!(error.message.contains("op 1"), "{}", error.message);
+        assert!(
+            error.message.contains("INSTANCE_NOT_FOUND"),
+            "{}",
+            error.message
+        );
+        assert_eq!(error.details["failed_op_index"], 1);
+        assert_eq!(error.details["failed_op_code"], "INSTANCE_NOT_FOUND");
+    }
+
+    #[test]
+    fn test_batch_atomic_invalid_transition_after_valid_ops_applies_nothing() {
+        // The failure depends on the effect of earlier ops in the same batch:
+        // x-1 goes a -> b -> c, then a third NEXT from c has no transition.
+        let (_dir, handler, mut session) = test_handler();
+        setup_atomic_batch_fixture(&handler, &mut session);
+        let seq_before = handler.engine.wal().next_sequence();
+
+        let batch_request = Request::new("1", Operation::Batch).with_params(json!({
+            "mode": "atomic",
+            "ops": [
+                {"op": "APPLY_EVENT", "params": {"instance_id": "x-1", "event": "NEXT"}},
+                {"op": "APPLY_EVENT", "params": {"instance_id": "x-1", "event": "NEXT"}},
+                {"op": "APPLY_EVENT", "params": {"instance_id": "x-1", "event": "NEXT"}}
+            ]
+        }));
+        let response = handler.handle(&mut session, &batch_request);
+        let error = response.error.expect("atomic batch must fail");
+        assert_eq!(error.details["failed_op_index"], 2);
+        assert_eq!(error.details["failed_op_code"], "INVALID_TRANSITION");
+
+        assert_eq!(instance_state(&handler, &mut session, "x-1"), "a");
+        assert_eq!(handler.engine.wal().next_sequence(), seq_before);
+    }
+
+    #[test]
+    fn test_batch_atomic_all_succeed_applies_in_order() {
+        let (_dir, handler, mut session) = test_handler();
+        setup_atomic_batch_fixture(&handler, &mut session);
+
+        let batch_request = Request::new("1", Operation::Batch).with_params(json!({
+            "mode": "atomic",
+            "ops": [
+                {"op": "CREATE_INSTANCE", "params": {"instance_id": "x-3", "machine": "flow", "version": 1, "initial_ctx": {}}},
+                {"op": "APPLY_EVENT", "params": {"instance_id": "x-3", "event": "NEXT", "payload": {"k": 1}}},
+                {"op": "APPLY_EVENT", "params": {"instance_id": "x-1", "event": "NEXT"}},
+                {"op": "DELETE_INSTANCE", "params": {"instance_id": "x-2"}}
+            ]
+        }));
+        let response = handler.handle(&mut session, &batch_request);
+        assert!(response.is_ok(), "{:?}", response.error);
+        let result = response.result.unwrap();
+        let results = result["results"].as_array().unwrap();
+        assert_eq!(results.len(), 4);
+        assert!(results.iter().all(|r| r["status"] == "ok"));
+        assert_eq!(results[0]["result"]["instance_id"], "x-3");
+        assert_eq!(results[1]["result"]["to_state"], "b");
+        assert_eq!(results[1]["result"]["ctx"]["k"], 1);
+        assert_eq!(results[3]["result"]["deleted"], true);
+
+        assert_eq!(instance_state(&handler, &mut session, "x-3"), "b");
+        assert_eq!(instance_state(&handler, &mut session, "x-1"), "b");
+        let get_deleted = Request::new("g", Operation::GetInstance).with_params(json!({
+            "instance_id": "x-2"
+        }));
+        assert!(handler.handle(&mut session, &get_deleted).is_error());
+    }
+
+    #[test]
+    fn test_batch_atomic_rejects_non_write_ops_before_applying() {
+        let (_dir, handler, mut session) = test_handler();
+        setup_atomic_batch_fixture(&handler, &mut session);
+
+        let batch_request = Request::new("1", Operation::Batch).with_params(json!({
+            "mode": "atomic",
+            "ops": [
+                {"op": "APPLY_EVENT", "params": {"instance_id": "x-1", "event": "NEXT"}},
+                {"op": "GET_INSTANCE", "params": {"instance_id": "x-1"}}
+            ]
+        }));
+        let response = handler.handle(&mut session, &batch_request);
+        let error = response
+            .error
+            .expect("read op must be rejected in atomic mode");
+        assert_eq!(error.code, ErrorCode::BadRequest);
+        assert_eq!(instance_state(&handler, &mut session, "x-1"), "a");
+    }
+
+    #[test]
+    fn test_batch_atomic_rejects_offset_expectation_after_change() {
+        let (_dir, handler, mut session) = test_handler();
+        setup_atomic_batch_fixture(&handler, &mut session);
+        let offset = handler.engine.get_instance("x-1").unwrap().last_wal_offset;
+
+        let batch_request = Request::new("1", Operation::Batch).with_params(json!({
+            "mode": "atomic",
+            "ops": [
+                {"op": "APPLY_EVENT", "params": {"instance_id": "x-1", "event": "NEXT"}},
+                {"op": "APPLY_EVENT", "params": {"instance_id": "x-1", "event": "NEXT", "expected_wal_offset": offset}}
+            ]
+        }));
+        let response = handler.handle(&mut session, &batch_request);
+        let error = response.error.expect("offset expectation must be rejected");
+        assert_eq!(error.code, ErrorCode::BadRequest);
+        assert_eq!(error.details["failed_op_index"], 1);
+        assert_eq!(error.details["committed_ops"], 0);
+        assert!(
+            error.message.contains("expected_wal_offset"),
+            "{}",
+            error.message
+        );
+        assert_eq!(instance_state(&handler, &mut session, "x-1"), "a");
+    }
+
+    #[test]
+    fn test_batch_best_effort_still_applies_around_failures() {
+        let (_dir, handler, mut session) = test_handler();
+        setup_atomic_batch_fixture(&handler, &mut session);
+
+        let batch_request = Request::new("1", Operation::Batch).with_params(json!({
+            "mode": "best_effort",
+            "ops": [
+                {"op": "APPLY_EVENT", "params": {"instance_id": "x-1", "event": "NEXT"}},
+                {"op": "APPLY_EVENT", "params": {"instance_id": "missing", "event": "NEXT"}},
+                {"op": "APPLY_EVENT", "params": {"instance_id": "x-2", "event": "NEXT"}}
+            ]
+        }));
+        let response = handler.handle(&mut session, &batch_request);
+        let result = response.result.unwrap();
+        let results = result["results"].as_array().unwrap();
+        assert_eq!(results[0]["status"], "ok");
+        assert_eq!(results[1]["status"], "error");
+        assert_eq!(results[2]["status"], "ok");
+        assert_eq!(instance_state(&handler, &mut session, "x-1"), "b");
+        assert_eq!(instance_state(&handler, &mut session, "x-2"), "b");
     }
 
     #[test]

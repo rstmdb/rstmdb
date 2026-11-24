@@ -52,6 +52,10 @@ pub struct Instance {
     /// instance. A retry with the same key returns this instance.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub create_idempotency_key: Option<String>,
+
+    /// Canonical request fingerprint paired with `create_idempotency_key`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub create_request_hash: Option<String>,
 }
 
 impl Instance {
@@ -93,6 +97,7 @@ impl Instance {
             created_at: now,
             updated_at: now,
             create_idempotency_key: None,
+            create_request_hash: None,
         }
     }
 
@@ -166,6 +171,9 @@ pub struct IdempotencyRecord {
     /// WAL sequence of the original APPLY_EVENT.
     #[serde(default)]
     pub sequence: u64,
+    /// Canonical request fingerprint (`event`, `event_id`, `payload`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_hash: Option<String>,
 }
 
 /// Snapshot of an instance at a point in time.
@@ -210,6 +218,10 @@ pub struct InstanceSnapshot {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub create_idempotency_key: Option<String>,
 
+    /// Canonical request fingerprint of the creating request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub create_request_hash: Option<String>,
+
     /// Cached APPLY_EVENT results for this instance.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub idempotency: Vec<IdempotencyRecord>,
@@ -233,6 +245,7 @@ impl InstanceSnapshot {
             deleted: instance.is_deleted(),
             last_event_id: instance.last_event_id.clone(),
             create_idempotency_key: instance.create_idempotency_key.clone(),
+            create_request_hash: instance.create_request_hash.clone(),
             idempotency: Vec::new(),
         }
     }
@@ -261,6 +274,7 @@ impl InstanceSnapshot {
             created_at: self.created_at,
             updated_at: self.created_at,
             create_idempotency_key: self.create_idempotency_key.clone(),
+            create_request_hash: self.create_request_hash.clone(),
         }
     }
 }
@@ -328,6 +342,7 @@ mod tests {
             ctx: json!({}),
             wal_offset: 7,
             sequence: 3,
+            request_hash: Some("hash-1".to_string()),
         };
         let snapshot = InstanceSnapshot::from_instance(&instance, "snap-1")
             .with_idempotency(vec![record.clone()]);

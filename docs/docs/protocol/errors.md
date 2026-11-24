@@ -137,6 +137,7 @@ Errors related to concurrent operations.
 | Code | Retryable | Description |
 |------|-----------|-------------|
 | `CONFLICT` | No | Concurrent modification detected (expected_state mismatch) |
+| `IDEMPOTENCY_CONFLICT` | No | Idempotency key was already used for a different request |
 
 **Example:**
 ```json
@@ -238,6 +239,22 @@ async function safeApplyEvent(instanceId, event, payload) {
 ## Error Details
 
 Some errors include additional details:
+
+### BATCH Atomic Failure
+
+When batch mode is `atomic` and an operation fails validation, nothing is
+applied and the batch returns `BAD_REQUEST` with details:
+
+| Detail | Description |
+|--------|-------------|
+| `failed_op_index` | Zero-based index of the failing op in `ops` |
+| `failed_op_code` | Error code the op would have returned on its own |
+| `committed_ops` | Operations applied before the failure: 0 when validation rejected the batch |
+
+If a WAL write fails part way through committing (an I/O error), the error
+code is the op's own (for example `WAL_IO_ERROR`), `committed_ops` is greater
+than 0, and `retryable` is `false`, because retrying would apply the committed
+prefix again.
 
 ### BATCH Partial Failure
 

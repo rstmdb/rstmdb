@@ -8,8 +8,10 @@ use dashmap::DashMap;
 use parking_lot::RwLock;
 use rstmdb_wal::{Wal, WalConfig, WalEntry};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
-use std::collections::{HashMap, VecDeque};
+use serde_json::{Map, Value};
+use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::fmt::Write as _;
 use std::sync::Arc;
 
 /// Result of applying an event.
@@ -23,6 +25,65 @@ pub struct ApplyResult {
     pub applied: bool,
 }
 
+#[derive(Debug, Clone)]
+struct CachedApply {
+    result: ApplyResult,
+    request_hash: Option<String>,
+}
+
+/// Recursively sorts JSON object keys so semantically identical objects yield the
+/// exact same serialized bytes regardless of map insertion order.
+///
+/// `serde_json::Map` uses `BTreeMap` by default today (without `preserve_order`),
+/// so this explicit recursive sort is a safeguard in case `preserve_order` is ever
+/// enabled anywhere in the workspace.
+fn canonical_value(value: &Value) -> Value {
+    match value {
+        Value::Array(items) => Value::Array(items.iter().map(canonical_value).collect()),
+        Value::Object(map) => {
+            let sorted: BTreeMap<&String, Value> =
+                map.iter().map(|(k, v)| (k, canonical_value(v))).collect();
+            let mut out = Map::with_capacity(sorted.len());
+            for (k, v) in sorted {
+                out.insert(k.clone(), v);
+            }
+            Value::Object(out)
+        }
+        other => other.clone(),
+    }
+}
+
+fn sha256_canonical(value: &Value) -> String {
+    let encoded = serde_json::to_string(&canonical_value(value)).unwrap_or_default();
+    let digest = Sha256::digest(encoded.as_bytes());
+    let mut hex = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        let _ = write!(&mut hex, "{byte:02x}");
+    }
+    hex
+}
+
+/// Deterministic SHA-256 fingerprint of an `APPLY_EVENT` request.
+///
+/// Hashes only `(event, canonical_json(payload))` — per-attempt metadata like
+/// `event_id` is intentionally excluded so retries with fresh event IDs succeed.
+/// Note: JSON numbers `10` and `10.0` serialize differently (`serde_json` integer
+/// vs float) and therefore produce distinct fingerprints.
+pub fn request_fingerprint(event: &str, payload: &Value) -> String {
+    sha256_canonical(&serde_json::json!({
+        "event": event,
+        "payload": payload,
+    }))
+}
+
+fn create_request_fingerprint(machine: &str, version: u32, initial_ctx: &Value) -> String {
+    sha256_canonical(&serde_json::json!({
+        "machine": machine,
+        "version": version,
+        "initial_ctx": initial_ctx,
+    }))
+}
+
 /// Cached `APPLY_EVENT` results of one instance, keyed by idempotency key.
 ///
 /// `order` holds the keys in insertion order, which is WAL order on every
@@ -30,20 +91,20 @@ pub struct ApplyResult {
 /// written), so its front is always the oldest key.
 #[derive(Debug, Default)]
 struct IdempotencyScope {
-    results: HashMap<String, ApplyResult>,
+    results: HashMap<String, CachedApply>,
     order: VecDeque<String>,
 }
 
 impl IdempotencyScope {
-    fn get(&self, key: &str) -> Option<&ApplyResult> {
+    fn get(&self, key: &str) -> Option<&CachedApply> {
         self.results.get(key)
     }
 
     /// Inserts a result, then evicts the oldest keys beyond `max`
     /// (0 = unlimited). Re-inserting a present key replaces its result and
     /// moves it to the newest position.
-    fn insert(&mut self, key: String, result: ApplyResult, max: usize) {
-        if self.results.insert(key.clone(), result).is_some() {
+    fn insert(&mut self, key: String, entry: CachedApply, max: usize) {
+        if self.results.insert(key.clone(), entry).is_some() {
             self.order.retain(|k| k != &key);
         }
         self.order.push_back(key);
@@ -288,13 +349,16 @@ impl StateMachineEngine {
                 for r in &snapshot.idempotency {
                     scope.insert(
                         r.key.clone(),
-                        ApplyResult {
-                            from_state: r.from_state.clone(),
-                            to_state: r.to_state.clone(),
-                            ctx: r.ctx.clone(),
-                            wal_offset: r.wal_offset,
-                            sequence: r.sequence,
-                            applied: true,
+                        CachedApply {
+                            result: ApplyResult {
+                                from_state: r.from_state.clone(),
+                                to_state: r.to_state.clone(),
+                                ctx: r.ctx.clone(),
+                                wal_offset: r.wal_offset,
+                                sequence: r.sequence,
+                                applied: true,
+                            },
+                            request_hash: r.request_hash.clone(),
                         },
                         self.max_idempotency_keys,
                     );
@@ -405,6 +469,9 @@ impl StateMachineEngine {
                 if should_create {
                     // Older WALs may hold `null` contexts; heal them on replay.
                     let initial_ctx = normalize_ctx(initial_ctx).unwrap_or_else(empty_ctx);
+                    let create_request_hash = idempotency_key
+                        .as_ref()
+                        .map(|_| create_request_fingerprint(&machine, version, &initial_ctx));
                     let mut instance = Instance::new(
                         instance_id.clone(),
                         machine,
@@ -414,6 +481,7 @@ impl StateMachineEngine {
                         offset,
                     );
                     instance.create_idempotency_key = idempotency_key;
+                    instance.create_request_hash = create_request_hash;
                     // A (re)created instance starts with a fresh idempotency scope.
                     self.idempotency_cache.remove(&instance_id);
                     self.instances
@@ -423,28 +491,33 @@ impl StateMachineEngine {
 
             WalEntry::ApplyEvent {
                 instance_id,
+                event,
                 from_state,
                 to_state,
+                payload,
                 ctx,
                 event_id,
                 idempotency_key,
-                ..
             } => {
                 if let Some(instance_lock) = self.instances.get(&instance_id) {
                     let mut instance = instance_lock.write();
                     if let Some(key) = idempotency_key {
+                        let hash = request_fingerprint(&event, &payload);
                         self.idempotency_cache
                             .entry(instance_id.clone())
                             .or_default()
                             .insert(
                                 key,
-                                ApplyResult {
-                                    from_state,
-                                    to_state: to_state.clone(),
-                                    ctx: ctx.clone(),
-                                    wal_offset: offset,
-                                    sequence,
-                                    applied: true,
+                                CachedApply {
+                                    result: ApplyResult {
+                                        from_state,
+                                        to_state: to_state.clone(),
+                                        ctx: ctx.clone(),
+                                        wal_offset: offset,
+                                        sequence,
+                                        applied: true,
+                                    },
+                                    request_hash: Some(hash),
                                 },
                                 self.max_idempotency_keys,
                             );
@@ -535,6 +608,15 @@ impl StateMachineEngine {
         definition_json: &Value,
     ) -> Result<(String, bool), CoreError> {
         let _write = self.write_gate.read();
+        self.put_machine_unlocked(name, version, definition_json)
+    }
+
+    fn put_machine_unlocked(
+        &self,
+        name: &str,
+        version: u32,
+        definition_json: &Value,
+    ) -> Result<(String, bool), CoreError> {
         let key = (name.to_string(), version);
 
         // Check if already exists
@@ -655,6 +737,17 @@ impl StateMachineEngine {
         idempotency_key: Option<&str>,
     ) -> Result<(Instance, u64), CoreError> {
         let _write = self.write_gate.read();
+        self.create_instance_unlocked(instance_id, machine, version, initial_ctx, idempotency_key)
+    }
+
+    fn create_instance_unlocked(
+        &self,
+        instance_id: &str,
+        machine: &str,
+        version: u32,
+        initial_ctx: Value,
+        idempotency_key: Option<&str>,
+    ) -> Result<(Instance, u64), CoreError> {
         // The context is always a JSON object; an omitted/null initial_ctx
         // means `{}` (anything else would make later payload merges no-ops).
         let initial_ctx = normalize_ctx(initial_ctx).ok_or_else(|| CoreError::InvalidContext {
@@ -662,16 +755,27 @@ impl StateMachineEngine {
         })?;
 
         // Idempotent retry: the live instance was created by a request with
-        // the same key (and the same machine/version).
-        if let Some(key) = idempotency_key {
+        // the same key; reject if machine/version/initial_ctx differs.
+        let create_hash =
+            idempotency_key.map(|_| create_request_fingerprint(machine, version, &initial_ctx));
+        if let (Some(key), Some(incoming_hash)) = (idempotency_key, create_hash.as_deref()) {
             if let Some(instance_lock) = self.instances.get(instance_id) {
                 let instance = instance_lock.read();
-                if !instance.is_deleted()
-                    && instance.create_idempotency_key.as_deref() == Some(key)
-                    && instance.machine == machine
-                    && instance.version == version
+                if !instance.is_deleted() && instance.create_idempotency_key.as_deref() == Some(key)
                 {
-                    return Ok((instance.clone(), instance.last_wal_offset));
+                    let matches = instance.machine == machine
+                        && instance.version == version
+                        && instance
+                            .create_request_hash
+                            .as_deref()
+                            .is_none_or(|h| h == incoming_hash);
+                    if matches {
+                        return Ok((instance.clone(), instance.last_wal_offset));
+                    }
+                    return Err(CoreError::IdempotencyConflict {
+                        instance_id: instance_id.to_string(),
+                        key: key.to_string(),
+                    });
                 }
             }
         }
@@ -714,6 +818,7 @@ impl StateMachineEngine {
             offset.as_u64(),
         );
         instance.create_idempotency_key = idempotency_key.map(|s| s.to_string());
+        instance.create_request_hash = create_hash;
 
         // A (re)created instance starts with a fresh idempotency scope.
         self.idempotency_cache.remove(instance_id);
@@ -784,6 +889,28 @@ impl StateMachineEngine {
         idempotency_key: Option<&str>,
     ) -> Result<ApplyResult, CoreError> {
         let _write = self.write_gate.read();
+        self.apply_event_unlocked(
+            instance_id,
+            event,
+            payload,
+            expected_state,
+            expected_wal_offset,
+            event_id,
+            idempotency_key,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn apply_event_unlocked(
+        &self,
+        instance_id: &str,
+        event: &str,
+        payload: Value,
+        expected_state: Option<&str>,
+        expected_wal_offset: Option<u64>,
+        event_id: Option<&str>,
+        idempotency_key: Option<&str>,
+    ) -> Result<ApplyResult, CoreError> {
         // Get instance (with write lock for the duration)
         let instance_lock =
             self.instances
@@ -795,17 +922,29 @@ impl StateMachineEngine {
         let mut instance = instance_lock.write();
 
         // Check idempotency cache under the instance lock, so two concurrent
-        // requests with the same key cannot both apply. A replay reports
-        // `applied: false` (the event was not applied again).
-        if let Some(key) = idempotency_key {
+        // requests with the same key cannot both apply. A replay with the
+        // same request returns `applied: false`; a different request with the
+        // same key fails with `IdempotencyConflict`.
+        let incoming_hash = idempotency_key.map(|_| request_fingerprint(event, &payload));
+        if let (Some(key), Some(hash)) = (idempotency_key, incoming_hash.as_deref()) {
             if let Some(cached) = self
                 .idempotency_cache
                 .get(instance_id)
                 .and_then(|m| m.get(key).cloned())
             {
+                if cached
+                    .request_hash
+                    .as_deref()
+                    .is_some_and(|recorded| recorded != hash)
+                {
+                    return Err(CoreError::IdempotencyConflict {
+                        instance_id: instance_id.to_string(),
+                        key: key.to_string(),
+                    });
+                }
                 return Ok(ApplyResult {
                     applied: false,
-                    ..cached
+                    ..cached.result
                 });
             }
         }
@@ -817,49 +956,19 @@ impl StateMachineEngine {
             });
         }
 
-        // Check expected state
-        if let Some(expected) = expected_state {
-            if instance.state != expected {
-                return Err(CoreError::StateConflict {
-                    expected: expected.to_string(),
-                    actual: instance.state.clone(),
-                });
-            }
-        }
-
-        // Check expected WAL offset
-        if let Some(expected) = expected_wal_offset {
-            if instance.last_wal_offset != expected {
-                return Err(CoreError::WalOffsetConflict {
-                    expected,
-                    actual: instance.last_wal_offset,
-                });
-            }
-        }
+        // Check expected state and WAL offset
+        check_expectations(
+            &instance.state,
+            instance.last_wal_offset,
+            expected_state,
+            expected_wal_offset,
+        )?;
 
         // Get machine definition
         let definition = self.get_machine(&instance.machine, instance.version)?;
 
-        // Look up transition
-        let current_state = State::from(instance.state.as_str());
-        let (to_state, guard) = definition
-            .get_transition(&current_state, event)
-            .ok_or_else(|| CoreError::InvalidTransition {
-                state: instance.state.clone(),
-                event: event.to_string(),
-            })?;
-
-        // Evaluate guard
-        if !GuardEvaluator::evaluate_opt(guard, &instance.ctx) {
-            return Err(CoreError::GuardFailed {
-                reason: format!(
-                    "guard failed for transition '{}' -> '{}' on event '{}'",
-                    instance.state,
-                    to_state.as_str(),
-                    event
-                ),
-            });
-        }
+        // Look up transition and evaluate guard
+        let to_state = resolve_transition(&definition, &instance.state, &instance.ctx, event)?;
 
         // Merge payload into context
         let new_ctx = merge_ctx(&instance.ctx, &payload);
@@ -900,7 +1009,14 @@ impl StateMachineEngine {
             self.idempotency_cache
                 .entry(instance_id.to_string())
                 .or_default()
-                .insert(key.to_string(), result.clone(), self.max_idempotency_keys);
+                .insert(
+                    key.to_string(),
+                    CachedApply {
+                        result: result.clone(),
+                        request_hash: incoming_hash,
+                    },
+                    self.max_idempotency_keys,
+                );
         }
 
         Ok(result)
@@ -933,6 +1049,14 @@ impl StateMachineEngine {
         idempotency_key: Option<&str>,
     ) -> Result<u64, CoreError> {
         let _write = self.write_gate.read();
+        self.delete_instance_unlocked(instance_id, idempotency_key)
+    }
+
+    fn delete_instance_unlocked(
+        &self,
+        instance_id: &str,
+        idempotency_key: Option<&str>,
+    ) -> Result<u64, CoreError> {
         let instance_lock =
             self.instances
                 .get(instance_id)
@@ -958,6 +1082,107 @@ impl StateMachineEngine {
         instance.soft_delete(offset.as_u64());
 
         Ok(offset.as_u64())
+    }
+
+    /// Validates and commits a sequence of write operations atomically.
+    ///
+    /// Every operation is checked in order against the current engine state plus
+    /// the effects of earlier operations in the same batch while the engine
+    /// write gate is held exclusively. If any validation fails, [`BatchError::Rejected`]
+    /// is returned without writing anything to the WAL or mutating engine state.
+    ///
+    /// The WAL has no multi-record transaction: each operation is its own WAL
+    /// record. If writing one fails (an I/O error) the earlier ones stay
+    /// committed and [`BatchError::CommitFailed`] reports how many; a crash while
+    /// the batch is being written can likewise leave a prefix of it in the WAL.
+    pub fn apply_batch_atomic(&self, ops: &[BatchOp]) -> Result<Vec<BatchOpResult>, BatchError> {
+        let _write = self.write_gate.write();
+
+        let mut plan = BatchPlan::new(self);
+        for (index, op) in ops.iter().enumerate() {
+            plan.check(op)
+                .map_err(|error| BatchError::Rejected { index, error })?;
+        }
+
+        let mut results = Vec::with_capacity(ops.len());
+        for (index, op) in ops.iter().enumerate() {
+            let result = self
+                .commit_batch_op(op)
+                .map_err(|error| BatchError::CommitFailed { index, error })?;
+            results.push(result);
+        }
+        Ok(results)
+    }
+
+    /// Applies one validated batch operation. The caller holds the write gate.
+    fn commit_batch_op(&self, op: &BatchOp) -> Result<BatchOpResult, CoreError> {
+        match op {
+            BatchOp::PutMachine {
+                machine,
+                version,
+                definition,
+            } => {
+                let (checksum, created) =
+                    self.put_machine_unlocked(machine, *version, definition)?;
+                Ok(BatchOpResult::PutMachine { checksum, created })
+            }
+            BatchOp::CreateInstance {
+                instance_id,
+                machine,
+                version,
+                initial_ctx,
+                idempotency_key,
+            } => {
+                let (instance, sequence) = self.create_instance_unlocked(
+                    instance_id,
+                    machine,
+                    *version,
+                    initial_ctx.clone(),
+                    idempotency_key.as_deref(),
+                )?;
+                Ok(BatchOpResult::CreateInstance { instance, sequence })
+            }
+            BatchOp::ApplyEvent {
+                instance_id,
+                event,
+                payload,
+                expected_state,
+                expected_wal_offset,
+                event_id,
+                idempotency_key,
+            } => {
+                let (machine, version) = self
+                    .instances
+                    .get(instance_id)
+                    .map(|r| {
+                        let instance = r.read();
+                        (instance.machine.clone(), instance.version)
+                    })
+                    .unwrap_or_default();
+                let result = self.apply_event_unlocked(
+                    instance_id,
+                    event,
+                    payload.clone(),
+                    expected_state.as_deref(),
+                    *expected_wal_offset,
+                    event_id.as_deref(),
+                    idempotency_key.as_deref(),
+                )?;
+                Ok(BatchOpResult::ApplyEvent {
+                    result,
+                    machine,
+                    version,
+                })
+            }
+            BatchOp::DeleteInstance {
+                instance_id,
+                idempotency_key,
+            } => {
+                let wal_offset =
+                    self.delete_instance_unlocked(instance_id, idempotency_key.as_deref())?;
+                Ok(BatchOpResult::DeleteInstance { wal_offset })
+            }
+        }
     }
 
     // =========================================================================
@@ -1062,13 +1287,14 @@ impl StateMachineEngine {
                     .order
                     .iter()
                     .filter_map(|key| {
-                        scope.get(key).map(|r| IdempotencyRecord {
+                        scope.get(key).map(|entry| IdempotencyRecord {
                             key: key.clone(),
-                            from_state: r.from_state.clone(),
-                            to_state: r.to_state.clone(),
-                            ctx: r.ctx.clone(),
-                            wal_offset: r.wal_offset,
-                            sequence: r.sequence,
+                            from_state: entry.result.from_state.clone(),
+                            to_state: entry.result.to_state.clone(),
+                            ctx: entry.result.ctx.clone(),
+                            wal_offset: entry.result.wal_offset,
+                            sequence: entry.result.sequence,
+                            request_hash: entry.request_hash.clone(),
                         })
                     })
                     .collect()
@@ -1114,6 +1340,421 @@ impl StateMachineEngine {
     pub fn sync(&self) -> Result<(), CoreError> {
         self.wal.sync()?;
         Ok(())
+    }
+}
+
+/// Checks the optimistic-concurrency expectations of an event.
+fn check_expectations(
+    state: &str,
+    last_wal_offset: u64,
+    expected_state: Option<&str>,
+    expected_wal_offset: Option<u64>,
+) -> Result<(), CoreError> {
+    if let Some(expected) = expected_state {
+        if state != expected {
+            return Err(CoreError::StateConflict {
+                expected: expected.to_string(),
+                actual: state.to_string(),
+            });
+        }
+    }
+    if let Some(expected) = expected_wal_offset {
+        if last_wal_offset != expected {
+            return Err(CoreError::WalOffsetConflict {
+                expected,
+                actual: last_wal_offset,
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Looks up the transition for `event` from `state` and evaluates its guard
+/// against `ctx`. Returns the target state.
+fn resolve_transition(
+    definition: &MachineDefinition,
+    state: &str,
+    ctx: &Value,
+    event: &str,
+) -> Result<State, CoreError> {
+    let current_state = State::from(state);
+    let (to_state, guard) = definition
+        .get_transition(&current_state, event)
+        .ok_or_else(|| CoreError::InvalidTransition {
+            state: state.to_string(),
+            event: event.to_string(),
+        })?;
+
+    if !GuardEvaluator::evaluate_opt(guard, ctx) {
+        return Err(CoreError::GuardFailed {
+            reason: format!(
+                "guard failed for transition '{}' -> '{}' on event '{}'",
+                state,
+                to_state.as_str(),
+                event
+            ),
+        });
+    }
+
+    Ok(to_state.clone())
+}
+
+/// One write operation of an atomic batch.
+#[derive(Debug, Clone)]
+pub enum BatchOp {
+    /// Register a machine definition (see [`StateMachineEngine::put_machine`]).
+    PutMachine {
+        machine: String,
+        version: u32,
+        definition: Value,
+    },
+    /// Create an instance (see [`StateMachineEngine::create_instance`]).
+    CreateInstance {
+        instance_id: String,
+        machine: String,
+        version: u32,
+        initial_ctx: Value,
+        idempotency_key: Option<String>,
+    },
+    /// Apply an event (see [`StateMachineEngine::apply_event`]).
+    ///
+    /// An `expected_wal_offset` on an instance that an earlier op of the same
+    /// batch changed always conflicts: its new offset is only assigned at commit.
+    ApplyEvent {
+        instance_id: String,
+        event: String,
+        payload: Value,
+        expected_state: Option<String>,
+        expected_wal_offset: Option<u64>,
+        event_id: Option<String>,
+        idempotency_key: Option<String>,
+    },
+    /// Soft-delete an instance (see [`StateMachineEngine::delete_instance`]).
+    DeleteInstance {
+        instance_id: String,
+        idempotency_key: Option<String>,
+    },
+}
+
+/// Result of one committed atomic batch operation, in the shape the matching
+/// single operation method returns.
+#[derive(Debug, Clone)]
+pub enum BatchOpResult {
+    PutMachine {
+        checksum: String,
+        created: bool,
+    },
+    CreateInstance {
+        instance: Instance,
+        sequence: u64,
+    },
+    ApplyEvent {
+        result: ApplyResult,
+        /// Machine of the instance the event was applied to.
+        machine: String,
+        /// Machine version of the instance the event was applied to.
+        version: u32,
+    },
+    DeleteInstance {
+        wal_offset: u64,
+    },
+}
+
+/// Why an atomic batch did not commit.
+#[derive(Debug)]
+pub enum BatchError {
+    /// Validation rejected the operation at `index`. Nothing was written.
+    Rejected { index: usize, error: CoreError },
+    /// Writing the operation at `index` failed (an I/O error). The `index`
+    /// operations before it are committed.
+    CommitFailed { index: usize, error: CoreError },
+}
+
+impl BatchError {
+    /// Index of the operation that failed.
+    pub fn index(&self) -> usize {
+        match self {
+            BatchError::Rejected { index, .. } | BatchError::CommitFailed { index, .. } => *index,
+        }
+    }
+
+    /// Number of operations that were committed before the failure.
+    pub fn committed(&self) -> usize {
+        match self {
+            BatchError::Rejected { .. } => 0,
+            BatchError::CommitFailed { index, .. } => *index,
+        }
+    }
+
+    /// The error of the failing operation.
+    pub fn error(&self) -> &CoreError {
+        match self {
+            BatchError::Rejected { error, .. } | BatchError::CommitFailed { error, .. } => error,
+        }
+    }
+}
+
+/// An instance as it would be after the batch operations validated so far.
+#[derive(Debug, Clone)]
+struct PlannedInstance {
+    machine: String,
+    version: u32,
+    state: String,
+    ctx: Value,
+    deleted: bool,
+    /// Offset of the instance before this batch (0 if the batch creates it).
+    last_wal_offset: u64,
+    /// True once an earlier op of the batch changed the instance. Its new
+    /// offset is only assigned at commit, so an offset expectation conflicts.
+    changed: bool,
+    create_idempotency_key: Option<String>,
+    create_request_hash: Option<String>,
+}
+
+/// Validation overlay for an atomic batch: the engine state plus the effects
+/// of the operations checked so far. Mirrors the checks of the single
+/// operation methods without writing anything.
+struct BatchPlan<'a> {
+    engine: &'a StateMachineEngine,
+    definitions: HashMap<(String, u32), Arc<MachineDefinition>>,
+    instances: HashMap<String, PlannedInstance>,
+    applied_keys: HashMap<String, HashMap<String, Option<String>>>,
+    reset_idempotency: HashSet<String>,
+}
+
+impl<'a> BatchPlan<'a> {
+    fn new(engine: &'a StateMachineEngine) -> Self {
+        Self {
+            engine,
+            definitions: HashMap::new(),
+            instances: HashMap::new(),
+            applied_keys: HashMap::new(),
+            reset_idempotency: HashSet::new(),
+        }
+    }
+
+    fn definition(&self, machine: &str, version: u32) -> Option<Arc<MachineDefinition>> {
+        let key = (machine.to_string(), version);
+        self.definitions
+            .get(&key)
+            .cloned()
+            .or_else(|| self.engine.definitions.get(&key).map(|r| r.clone()))
+    }
+
+    fn instance(&self, instance_id: &str) -> Option<PlannedInstance> {
+        if let Some(planned) = self.instances.get(instance_id) {
+            return Some(planned.clone());
+        }
+        self.engine.instances.get(instance_id).map(|r| {
+            let instance = r.read();
+            PlannedInstance {
+                machine: instance.machine.clone(),
+                version: instance.version,
+                state: instance.state.clone(),
+                ctx: instance.ctx.clone(),
+                deleted: instance.is_deleted(),
+                last_wal_offset: instance.last_wal_offset,
+                changed: false,
+                create_idempotency_key: instance.create_idempotency_key.clone(),
+                create_request_hash: instance.create_request_hash.clone(),
+            }
+        })
+    }
+
+    fn lookup_event_idempotency(&self, instance_id: &str, key: &str) -> Option<Option<String>> {
+        if let Some(cached) = self.applied_keys.get(instance_id).and_then(|m| m.get(key)) {
+            return Some(cached.clone());
+        }
+        if self.reset_idempotency.contains(instance_id) {
+            return None;
+        }
+        self.engine
+            .idempotency_cache
+            .get(instance_id)
+            .and_then(|m| m.get(key).map(|c| c.request_hash.clone()))
+    }
+
+    fn check(&mut self, op: &BatchOp) -> Result<(), CoreError> {
+        match op {
+            BatchOp::PutMachine {
+                machine,
+                version,
+                definition,
+            } => {
+                let new_def = MachineDefinition::from_json(machine, *version, definition)?;
+                if let Some(existing) = self.definition(machine, *version) {
+                    if existing.checksum != new_def.checksum {
+                        return Err(CoreError::MachineVersionExists {
+                            machine: machine.clone(),
+                            version: *version,
+                        });
+                    }
+                    return Ok(());
+                }
+                self.definitions
+                    .insert((machine.clone(), *version), Arc::new(new_def));
+                Ok(())
+            }
+
+            BatchOp::CreateInstance {
+                instance_id,
+                machine,
+                version,
+                initial_ctx,
+                idempotency_key,
+            } => {
+                let initial_ctx = normalize_ctx(initial_ctx.clone()).ok_or_else(|| {
+                    CoreError::InvalidContext {
+                        reason: "initial_ctx must be a JSON object".to_string(),
+                    }
+                })?;
+                let existing = self.instance(instance_id);
+                let create_hash = idempotency_key
+                    .as_deref()
+                    .map(|_| create_request_fingerprint(machine, *version, &initial_ctx));
+                if let (Some(key), Some(incoming_hash), Some(existing_inst)) = (
+                    idempotency_key.as_deref(),
+                    create_hash.as_deref(),
+                    existing.as_ref(),
+                ) {
+                    if !existing_inst.deleted
+                        && existing_inst.create_idempotency_key.as_deref() == Some(key)
+                    {
+                        let matches = existing_inst.machine == *machine
+                            && existing_inst.version == *version
+                            && existing_inst
+                                .create_request_hash
+                                .as_deref()
+                                .is_none_or(|h| h == incoming_hash);
+                        if matches {
+                            return Ok(());
+                        }
+                        return Err(CoreError::IdempotencyConflict {
+                            instance_id: instance_id.clone(),
+                            key: key.to_string(),
+                        });
+                    }
+                }
+                if let Some(existing) = existing {
+                    if !(existing.deleted && self.engine.allow_instance_recreate) {
+                        return Err(CoreError::InstanceExists {
+                            instance_id: instance_id.clone(),
+                        });
+                    }
+                }
+                let definition = self.definition(machine, *version).ok_or_else(|| {
+                    CoreError::MachineVersionNotFound {
+                        machine: machine.clone(),
+                        version: *version,
+                    }
+                })?;
+                self.applied_keys.remove(instance_id);
+                self.reset_idempotency.insert(instance_id.clone());
+                self.instances.insert(
+                    instance_id.clone(),
+                    PlannedInstance {
+                        machine: machine.clone(),
+                        version: *version,
+                        state: definition.initial.as_str().to_string(),
+                        ctx: initial_ctx,
+                        deleted: false,
+                        last_wal_offset: 0,
+                        changed: true,
+                        create_idempotency_key: idempotency_key.clone(),
+                        create_request_hash: create_hash,
+                    },
+                );
+                Ok(())
+            }
+
+            BatchOp::ApplyEvent {
+                instance_id,
+                event,
+                payload,
+                expected_state,
+                expected_wal_offset,
+                event_id: _,
+                idempotency_key,
+            } => {
+                let not_found = || CoreError::InstanceNotFound {
+                    instance_id: instance_id.clone(),
+                };
+                let mut planned = self.instance(instance_id).ok_or_else(not_found)?;
+                let incoming_hash = idempotency_key
+                    .as_deref()
+                    .map(|_| request_fingerprint(event, payload));
+                if let (Some(key), Some(hash)) =
+                    (idempotency_key.as_deref(), incoming_hash.as_deref())
+                {
+                    if let Some(recorded_hash) = self.lookup_event_idempotency(instance_id, key) {
+                        if recorded_hash
+                            .as_deref()
+                            .is_some_and(|recorded| recorded != hash)
+                        {
+                            return Err(CoreError::IdempotencyConflict {
+                                instance_id: instance_id.clone(),
+                                key: key.to_string(),
+                            });
+                        }
+                        return Ok(());
+                    }
+                }
+                if planned.deleted {
+                    return Err(not_found());
+                }
+                check_expectations(
+                    &planned.state,
+                    planned.last_wal_offset,
+                    expected_state.as_deref(),
+                    None,
+                )?;
+                if let Some(expected) = *expected_wal_offset {
+                    // After an earlier op of the batch changed the instance, the
+                    // offset this op would see is only assigned at commit, so no
+                    // expectation can match; `actual` reports the pre-batch offset.
+                    if planned.changed || planned.last_wal_offset != expected {
+                        return Err(CoreError::WalOffsetConflict {
+                            expected,
+                            actual: planned.last_wal_offset,
+                        });
+                    }
+                }
+                let definition = self
+                    .definition(&planned.machine, planned.version)
+                    .ok_or_else(|| CoreError::MachineVersionNotFound {
+                        machine: planned.machine.clone(),
+                        version: planned.version,
+                    })?;
+                let to_state =
+                    resolve_transition(&definition, &planned.state, &planned.ctx, event)?;
+
+                planned.ctx = merge_ctx(&planned.ctx, payload);
+                planned.state = to_state.as_str().to_string();
+                planned.changed = true;
+                self.instances.insert(instance_id.clone(), planned);
+                if let Some(key) = idempotency_key {
+                    self.applied_keys
+                        .entry(instance_id.clone())
+                        .or_default()
+                        .insert(key.clone(), incoming_hash);
+                }
+                Ok(())
+            }
+
+            BatchOp::DeleteInstance { instance_id, .. } => {
+                let mut planned =
+                    self.instance(instance_id)
+                        .ok_or_else(|| CoreError::InstanceNotFound {
+                            instance_id: instance_id.clone(),
+                        })?;
+                if !planned.deleted {
+                    planned.deleted = true;
+                    planned.changed = true;
+                    self.instances.insert(instance_id.clone(), planned);
+                }
+                Ok(())
+            }
+        }
     }
 }
 
@@ -1600,6 +2241,494 @@ mod tests {
         assert_eq!(engine.get_instance("i-1").unwrap().state, "paid");
     }
 
+    fn flow_definition() -> Value {
+        json!({
+            "states": ["a", "b", "c"],
+            "initial": "a",
+            "transitions": [
+                {"from": "a", "event": "NEXT", "to": "b"},
+                {"from": "b", "event": "NEXT", "to": "c", "guard": "ctx.ready"},
+                {"from": ["a", "b", "c"], "event": "TICK", "to": "a"}
+            ]
+        })
+    }
+
+    fn event_op(instance_id: &str, event: &str, payload: Value) -> BatchOp {
+        BatchOp::ApplyEvent {
+            instance_id: instance_id.to_string(),
+            event: event.to_string(),
+            payload,
+            expected_state: None,
+            expected_wal_offset: None,
+            event_id: None,
+            idempotency_key: None,
+        }
+    }
+
+    fn create_op(instance_id: &str, machine: &str) -> BatchOp {
+        BatchOp::CreateInstance {
+            instance_id: instance_id.to_string(),
+            machine: machine.to_string(),
+            version: 1,
+            initial_ctx: json!({}),
+            idempotency_key: None,
+        }
+    }
+
+    #[test]
+    fn test_atomic_batch_second_of_three_fails_applies_nothing() {
+        let (_dir, engine) = test_engine();
+        engine.put_machine("flow", 1, &flow_definition()).unwrap();
+        engine
+            .create_instance("x-1", "flow", 1, json!({}), None)
+            .unwrap();
+        let before = engine.get_instance("x-1").unwrap();
+        let seq_before = engine.wal().next_sequence();
+
+        let err = engine
+            .apply_batch_atomic(&[
+                event_op("x-1", "NEXT", json!({"k": 1})),
+                event_op("missing", "NEXT", json!({})),
+                event_op("x-1", "TICK", json!({})),
+            ])
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            BatchError::Rejected {
+                index: 1,
+                error: CoreError::InstanceNotFound { .. }
+            }
+        ));
+        assert_eq!(err.committed(), 0);
+
+        let after = engine.get_instance("x-1").unwrap();
+        assert_eq!(after.state, "a");
+        assert_eq!(after.ctx, before.ctx);
+        assert_eq!(after.last_wal_offset, before.last_wal_offset);
+        assert_eq!(engine.wal().next_sequence(), seq_before);
+    }
+
+    #[test]
+    fn test_atomic_batch_validates_against_effects_of_earlier_ops() {
+        let (_dir, engine) = test_engine();
+        engine.put_machine("flow", 1, &flow_definition()).unwrap();
+        engine
+            .create_instance("x-1", "flow", 1, json!({}), None)
+            .unwrap();
+
+        // The guard of the second NEXT reads the ctx the first NEXT merged.
+        let results = engine
+            .apply_batch_atomic(&[
+                event_op("x-1", "NEXT", json!({"ready": true})),
+                event_op("x-1", "NEXT", json!({})),
+            ])
+            .unwrap();
+        assert_eq!(results.len(), 2);
+        assert_eq!(engine.get_instance("x-1").unwrap().state, "c");
+
+        // Without the flag the second op's guard fails, so the first is not applied.
+        engine
+            .create_instance("x-2", "flow", 1, json!({}), None)
+            .unwrap();
+        let err = engine
+            .apply_batch_atomic(&[
+                event_op("x-2", "NEXT", json!({})),
+                event_op("x-2", "NEXT", json!({})),
+            ])
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            BatchError::Rejected {
+                index: 1,
+                error: CoreError::GuardFailed { .. }
+            }
+        ));
+        assert_eq!(engine.get_instance("x-2").unwrap().state, "a");
+
+        // A machine registered and an instance created earlier in the batch are usable.
+        engine
+            .apply_batch_atomic(&[
+                BatchOp::PutMachine {
+                    machine: "fresh".to_string(),
+                    version: 1,
+                    definition: flow_definition(),
+                },
+                create_op("f-1", "fresh"),
+                event_op("f-1", "NEXT", json!({})),
+            ])
+            .unwrap();
+        assert_eq!(engine.get_instance("f-1").unwrap().state, "b");
+    }
+
+    #[test]
+    fn test_atomic_batch_matches_sequential_application() {
+        // Every op kind and the idempotent / recreate edges: validation must
+        // accept exactly what sequential application accepts, and the result
+        // must be the same state and the same number of WAL entries.
+        let ops = vec![
+            BatchOp::PutMachine {
+                machine: "flow".to_string(),
+                version: 1,
+                definition: flow_definition(),
+            },
+            // Same definition again: idempotent.
+            BatchOp::PutMachine {
+                machine: "flow".to_string(),
+                version: 1,
+                definition: flow_definition(),
+            },
+            create_op("i-1", "flow"),
+            create_op("i-2", "flow"),
+            event_op("i-1", "NEXT", json!({"ready": true})),
+            BatchOp::ApplyEvent {
+                instance_id: "i-1".to_string(),
+                event: "NEXT".to_string(),
+                payload: json!({"n": 2}),
+                expected_state: Some("b".to_string()),
+                expected_wal_offset: None,
+                event_id: Some("evt-2".to_string()),
+                idempotency_key: Some("k-2".to_string()),
+            },
+            // Same idempotency key and identical request: a no-op replay.
+            BatchOp::ApplyEvent {
+                instance_id: "i-1".to_string(),
+                event: "NEXT".to_string(),
+                payload: json!({"n": 2}),
+                expected_state: None,
+                expected_wal_offset: None,
+                event_id: Some("evt-2".to_string()),
+                idempotency_key: Some("k-2".to_string()),
+            },
+            BatchOp::DeleteInstance {
+                instance_id: "i-2".to_string(),
+                idempotency_key: None,
+            },
+            // Deleting again: idempotent.
+            BatchOp::DeleteInstance {
+                instance_id: "i-2".to_string(),
+                idempotency_key: None,
+            },
+            // Re-create the deleted id.
+            create_op("i-2", "flow"),
+            event_op("i-2", "TICK", json!({"t": true})),
+        ];
+
+        let (dir_batch, batch_engine) = test_engine();
+        let results = batch_engine.apply_batch_atomic(&ops).unwrap();
+        assert_eq!(results.len(), ops.len());
+
+        let (_dir_seq, seq_engine) = test_engine();
+        for op in &ops {
+            match op {
+                BatchOp::PutMachine {
+                    machine,
+                    version,
+                    definition,
+                } => {
+                    seq_engine
+                        .put_machine(machine, *version, definition)
+                        .unwrap();
+                }
+                BatchOp::CreateInstance {
+                    instance_id,
+                    machine,
+                    version,
+                    initial_ctx,
+                    idempotency_key,
+                } => {
+                    seq_engine
+                        .create_instance(
+                            instance_id,
+                            machine,
+                            *version,
+                            initial_ctx.clone(),
+                            idempotency_key.as_deref(),
+                        )
+                        .unwrap();
+                }
+                BatchOp::ApplyEvent {
+                    instance_id,
+                    event,
+                    payload,
+                    expected_state,
+                    expected_wal_offset,
+                    event_id,
+                    idempotency_key,
+                } => {
+                    seq_engine
+                        .apply_event(
+                            instance_id,
+                            event,
+                            payload.clone(),
+                            expected_state.as_deref(),
+                            *expected_wal_offset,
+                            event_id.as_deref(),
+                            idempotency_key.as_deref(),
+                        )
+                        .unwrap();
+                }
+                BatchOp::DeleteInstance {
+                    instance_id,
+                    idempotency_key,
+                } => {
+                    seq_engine
+                        .delete_instance(instance_id, idempotency_key.as_deref())
+                        .unwrap();
+                }
+            }
+        }
+
+        let summary = |engine: &StateMachineEngine| {
+            let mut v: Vec<_> = engine
+                .get_all_instances()
+                .into_iter()
+                .map(|i| (i.id, i.state, i.ctx))
+                .collect();
+            v.sort_by(|a, b| a.0.cmp(&b.0));
+            v
+        };
+        assert_eq!(summary(&batch_engine), summary(&seq_engine));
+        assert_eq!(
+            batch_engine.wal().next_sequence(),
+            seq_engine.wal().next_sequence()
+        );
+        assert_eq!(batch_engine.get_instance("i-1").unwrap().state, "c");
+        assert_eq!(batch_engine.get_instance("i-2").unwrap().state, "a");
+
+        // The committed batch is recovered by WAL replay.
+        let expected = summary(&batch_engine);
+        drop(batch_engine);
+        let config = WalConfig::new(dir_batch.path())
+            .with_segment_size(4096)
+            .with_fsync_policy(FsyncPolicy::EveryWrite);
+        let reopened = StateMachineEngine::new(config).unwrap();
+        assert_eq!(summary(&reopened), expected);
+    }
+
+    #[test]
+    fn test_atomic_batch_idempotency_key_conflict_rejects_whole_batch() {
+        let (_dir, engine) = test_engine();
+        engine.put_machine("flow", 1, &flow_definition()).unwrap();
+        engine
+            .create_instance("x-1", "flow", 1, json!({}), None)
+            .unwrap();
+        let before = engine.get_instance("x-1").unwrap();
+        let seq_before = engine.wal().next_sequence();
+
+        // Reuse within the same batch with a changed payload rejects before writing anything.
+        let err = engine
+            .apply_batch_atomic(&[
+                BatchOp::ApplyEvent {
+                    instance_id: "x-1".to_string(),
+                    event: "NEXT".to_string(),
+                    payload: json!({"n": 1}),
+                    expected_state: None,
+                    expected_wal_offset: None,
+                    event_id: None,
+                    idempotency_key: Some("k-1".to_string()),
+                },
+                BatchOp::ApplyEvent {
+                    instance_id: "x-1".to_string(),
+                    event: "NEXT".to_string(),
+                    payload: json!({"n": 2}),
+                    expected_state: None,
+                    expected_wal_offset: None,
+                    event_id: None,
+                    idempotency_key: Some("k-1".to_string()),
+                },
+            ])
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            BatchError::Rejected {
+                index: 1,
+                error: CoreError::IdempotencyConflict { .. }
+            }
+        ));
+        assert_eq!(engine.get_instance("x-1").unwrap().state, before.state);
+        assert_eq!(engine.wal().next_sequence(), seq_before);
+
+        // Reuse against a previously committed key also rejects the entire batch.
+        engine
+            .apply_event(
+                "x-1",
+                "NEXT",
+                json!({"n": 1}),
+                None,
+                None,
+                None,
+                Some("k-prev"),
+            )
+            .unwrap();
+        let committed_seq = engine.wal().next_sequence();
+        let err = engine
+            .apply_batch_atomic(&[
+                create_op("x-2", "flow"),
+                BatchOp::ApplyEvent {
+                    instance_id: "x-1".to_string(),
+                    event: "NEXT".to_string(),
+                    payload: json!({"n": 2}),
+                    expected_state: None,
+                    expected_wal_offset: None,
+                    event_id: None,
+                    idempotency_key: Some("k-prev".to_string()),
+                },
+            ])
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            BatchError::Rejected {
+                index: 1,
+                error: CoreError::IdempotencyConflict { .. }
+            }
+        ));
+        assert!(engine.get_instance("x-2").is_err());
+        assert_eq!(engine.wal().next_sequence(), committed_seq);
+    }
+
+    #[test]
+    fn test_atomic_batch_offset_expectation_after_change_conflicts() {
+        let (_dir, engine) = test_engine();
+        engine.put_machine("flow", 1, &flow_definition()).unwrap();
+        engine
+            .create_instance("x-1", "flow", 1, json!({}), None)
+            .unwrap();
+        let offset = engine.get_instance("x-1").unwrap().last_wal_offset;
+
+        // A correct expectation on an unchanged instance passes.
+        engine
+            .apply_batch_atomic(&[BatchOp::ApplyEvent {
+                instance_id: "x-1".to_string(),
+                event: "TICK".to_string(),
+                payload: json!({}),
+                expected_state: None,
+                expected_wal_offset: Some(offset),
+                event_id: None,
+                idempotency_key: None,
+            }])
+            .unwrap();
+        let offset = engine.get_instance("x-1").unwrap().last_wal_offset;
+
+        // Once an earlier op changed the instance, no expectation can match.
+        let err = engine
+            .apply_batch_atomic(&[
+                event_op("x-1", "TICK", json!({})),
+                BatchOp::ApplyEvent {
+                    instance_id: "x-1".to_string(),
+                    event: "TICK".to_string(),
+                    payload: json!({}),
+                    expected_state: None,
+                    expected_wal_offset: Some(offset),
+                    event_id: None,
+                    idempotency_key: None,
+                },
+            ])
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            BatchError::Rejected {
+                index: 1,
+                error: CoreError::WalOffsetConflict { .. }
+            }
+        ));
+        assert_eq!(engine.get_instance("x-1").unwrap().last_wal_offset, offset);
+    }
+
+    #[test]
+    fn test_atomic_batch_commit_failure_reports_committed_count() {
+        let (_dir, engine) = test_engine();
+        engine.put_machine("flow", 1, &flow_definition()).unwrap();
+        engine
+            .create_instance("x-1", "flow", 1, json!({}), None)
+            .unwrap();
+        // Validation passes, but the first WAL write fails.
+        engine.wal().close().unwrap();
+
+        let err = engine
+            .apply_batch_atomic(&[
+                event_op("x-1", "NEXT", json!({})),
+                event_op("x-1", "TICK", json!({})),
+            ])
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            BatchError::CommitFailed {
+                index: 0,
+                error: CoreError::Wal(_)
+            }
+        ));
+        assert_eq!(err.committed(), 0);
+        assert_eq!(engine.get_instance("x-1").unwrap().state, "a");
+    }
+
+    #[test]
+    fn test_atomic_batch_is_not_interleaved_with_concurrent_writes() {
+        use rstmdb_wal::WalOffset;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let dir = TempDir::new().unwrap();
+        let config = WalConfig::new(dir.path()).with_fsync_policy(FsyncPolicy::Never);
+        let engine = Arc::new(StateMachineEngine::new(config).unwrap());
+        engine.put_machine("flow", 1, &flow_definition()).unwrap();
+        engine
+            .create_instance("batch", "flow", 1, json!({}), None)
+            .unwrap();
+        engine
+            .create_instance("single", "flow", 1, json!({}), None)
+            .unwrap();
+
+        let done = Arc::new(AtomicBool::new(false));
+        let writer = {
+            let engine = Arc::clone(&engine);
+            let done = Arc::clone(&done);
+            std::thread::spawn(move || {
+                while !done.load(Ordering::Relaxed) {
+                    engine
+                        .apply_event("single", "TICK", json!({}), None, None, None, None)
+                        .unwrap();
+                }
+            })
+        };
+
+        const BATCH_LEN: usize = 3;
+        for _ in 0..50 {
+            let ops: Vec<_> = (0..BATCH_LEN)
+                .map(|_| event_op("batch", "TICK", json!({})))
+                .collect();
+            engine.apply_batch_atomic(&ops).unwrap();
+        }
+        done.store(true, Ordering::Relaxed);
+        writer.join().unwrap();
+
+        // In WAL sequence order, every run of batch entries is whole batches.
+        let mut entries = engine
+            .wal()
+            .read_from(WalOffset::from_u64(0), None)
+            .unwrap();
+        entries.sort_by_key(|(seq, _, _)| *seq);
+        let mut run = 0;
+        let mut total = 0;
+        for (_, _, entry) in entries {
+            let is_batch = matches!(
+                &entry,
+                WalEntry::ApplyEvent { instance_id, .. } if instance_id == "batch"
+            );
+            if is_batch {
+                run += 1;
+                total += 1;
+            } else {
+                assert_eq!(
+                    run % BATCH_LEN,
+                    0,
+                    "a single write interleaved with a batch"
+                );
+                run = 0;
+            }
+        }
+        assert_eq!(run % BATCH_LEN, 0);
+        assert_eq!(total, 50 * BATCH_LEN);
+    }
+
     #[test]
     fn test_recovery_from_snapshots_skips_covered_entries() {
         let (dir, engine) = test_engine();
@@ -1651,10 +2780,12 @@ mod tests {
         assert_eq!(i.state, "shipped");
         // SHIP carried no event_id, so (as in live apply) it cleared e-1.
         assert_eq!(i.last_event_id, None);
-        for key in ["pay", "ship"] {
-            let event = if key == "pay" { "PAY" } else { "SHIP" };
+        for (key, event, payload, evt_id) in [
+            ("pay", "PAY", json!({"items_ready": true}), None),
+            ("ship", "SHIP", json!({}), None),
+        ] {
             let r = engine
-                .apply_event("i-1", event, json!({}), None, None, None, Some(key))
+                .apply_event("i-1", event, payload, None, None, evt_id, Some(key))
                 .unwrap();
             assert!(!r.applied, "{key} must be remembered");
         }
@@ -2797,5 +3928,224 @@ mod tests {
             tick(&engine, "i-1", &format!("k{i}"));
         }
         assert_eq!(engine.idempotency_records("i-1").len(), 20);
+    }
+
+    #[test]
+    fn test_idempotency_reuse_conflicts_on_different_event_or_payload_and_survives_recovery() {
+        let dir = TempDir::new().unwrap();
+        let wal_dir = dir.path().join("wal");
+        let wal_cfg = || WalConfig::new(&wal_dir).with_fsync_policy(rstmdb_wal::FsyncPolicy::Never);
+        let def = json!({
+            "states": ["created", "paid", "cancelled"],
+            "initial": "created",
+            "transitions": [
+                {"from": "created", "event": "PAY", "to": "paid"},
+                {"from": "created", "event": "CANCEL", "to": "cancelled"}
+            ]
+        });
+
+        let saved_snapshot;
+        let machine_records;
+        {
+            let engine = StateMachineEngine::new(wal_cfg()).unwrap();
+            engine.put_machine("order", 1, &def).unwrap();
+            engine
+                .create_instance("i-1", "order", 1, json!({"tag": "orig"}), Some("create-k1"))
+                .unwrap();
+
+            // Same create_instance idempotency key with different initial_ctx is rejected.
+            let create_conflict = engine
+                .create_instance(
+                    "i-1",
+                    "order",
+                    1,
+                    json!({"tag": "other"}),
+                    Some("create-k1"),
+                )
+                .unwrap_err();
+            assert!(
+                matches!(create_conflict, CoreError::IdempotencyConflict { .. }),
+                "{create_conflict:?}"
+            );
+
+            // Apply PAY with two-key payload under k-1.
+            let first = engine
+                .apply_event(
+                    "i-1",
+                    "PAY",
+                    json!({"amount": 10, "currency": "EUR"}),
+                    None,
+                    None,
+                    Some("evt-1"),
+                    Some("k-1"),
+                )
+                .unwrap();
+            assert!(first.applied);
+
+            // Identical request with reordered JSON keys replays cleanly.
+            let mut reordered = serde_json::Map::new();
+            reordered.insert("currency".to_string(), json!("EUR"));
+            reordered.insert("amount".to_string(), json!(10));
+            let replay = engine
+                .apply_event(
+                    "i-1",
+                    "PAY",
+                    Value::Object(reordered),
+                    None,
+                    None,
+                    Some("evt-1"),
+                    Some("k-1"),
+                )
+                .unwrap();
+            assert!(!replay.applied);
+            assert_eq!(replay.to_state, "paid");
+
+            // Different event with same key is rejected and state stays unchanged.
+            let err_event = engine
+                .apply_event(
+                    "i-1",
+                    "CANCEL",
+                    json!({"amount": 10, "currency": "EUR"}),
+                    None,
+                    None,
+                    Some("evt-1"),
+                    Some("k-1"),
+                )
+                .unwrap_err();
+            assert!(
+                matches!(err_event, CoreError::IdempotencyConflict { .. }),
+                "{err_event:?}"
+            );
+
+            // Same event + different payload is rejected.
+            let err_payload = engine
+                .apply_event(
+                    "i-1",
+                    "PAY",
+                    json!({"amount": 20, "currency": "EUR"}),
+                    None,
+                    None,
+                    Some("evt-1"),
+                    Some("k-1"),
+                )
+                .unwrap_err();
+            assert!(matches!(err_payload, CoreError::IdempotencyConflict { .. }));
+
+            // Same event + payload + different event_id replays cleanly (event_id excluded).
+            let retry_evt_id = engine
+                .apply_event(
+                    "i-1",
+                    "PAY",
+                    json!({"amount": 10, "currency": "EUR"}),
+                    None,
+                    None,
+                    Some("evt-2"),
+                    Some("k-1"),
+                )
+                .unwrap();
+            assert!(!retry_evt_id.applied);
+            assert_eq!(retry_evt_id.wal_offset, first.wal_offset);
+
+            saved_snapshot = snapshot_of(&engine, "i-1");
+            assert!(saved_snapshot.idempotency[0].request_hash.is_some());
+            machine_records = engine.machine_records().unwrap();
+        }
+
+        // Reopen from WAL replay (recomputes fingerprint).
+        let replayed = StateMachineEngine::new(wal_cfg()).unwrap();
+        let replay_conflict = replayed
+            .apply_event("i-1", "CANCEL", json!({}), None, None, None, Some("k-1"))
+            .unwrap_err();
+        assert!(matches!(
+            replay_conflict,
+            CoreError::IdempotencyConflict { .. }
+        ));
+        let replay_create_conflict = replayed
+            .create_instance(
+                "i-1",
+                "order",
+                1,
+                json!({"tag": "other"}),
+                Some("create-k1"),
+            )
+            .unwrap_err();
+        assert!(matches!(
+            replay_create_conflict,
+            CoreError::IdempotencyConflict { .. }
+        ));
+
+        // Reopen purely from snapshot (no WAL) -> preserves request_hash.
+        let snap_dir = TempDir::new().unwrap();
+        let snap_engine = StateMachineEngine::new_with_recovery(
+            WalConfig::new(snap_dir.path()).with_fsync_policy(rstmdb_wal::FsyncPolicy::Never),
+            RecoveryState {
+                machines: machine_records,
+                machines_wal_offset: 100,
+                snapshots: vec![saved_snapshot],
+            },
+        )
+        .unwrap();
+        let snap_conflict = snap_engine
+            .apply_event(
+                "i-1",
+                "PAY",
+                json!({"amount": 99}),
+                None,
+                None,
+                Some("evt-1"),
+                Some("k-1"),
+            )
+            .unwrap_err();
+        assert!(matches!(
+            snap_conflict,
+            CoreError::IdempotencyConflict { .. }
+        ));
+    }
+
+    #[test]
+    fn test_legacy_snapshot_without_request_hash_replays_cleanly() {
+        let dir = TempDir::new().unwrap();
+        let legacy_snap_json = r#"{
+            "snapshot_id": "snap-legacy",
+            "instance_id": "i-legacy",
+            "machine": "loop",
+            "version": 1,
+            "state": "open",
+            "ctx": {},
+            "wal_offset": 2,
+            "created_at": 0,
+            "idempotency": [{
+                "key": "k-old",
+                "from_state": "open",
+                "to_state": "open",
+                "ctx": {},
+                "wal_offset": 2,
+                "sequence": 2
+            }]
+        }"#;
+        let snapshot: InstanceSnapshot = serde_json::from_str(legacy_snap_json).unwrap();
+        assert!(snapshot.idempotency[0].request_hash.is_none());
+
+        let engine = StateMachineEngine::new_with_recovery(
+            WalConfig::new(dir.path()).with_fsync_policy(rstmdb_wal::FsyncPolicy::Never),
+            RecoveryState {
+                machines: vec![],
+                machines_wal_offset: 0,
+                snapshots: vec![snapshot],
+            },
+        )
+        .unwrap();
+        let res = engine
+            .apply_event(
+                "i-legacy",
+                "TICK",
+                json!({}),
+                None,
+                None,
+                None,
+                Some("k-old"),
+            )
+            .unwrap();
+        assert!(!res.applied);
     }
 }

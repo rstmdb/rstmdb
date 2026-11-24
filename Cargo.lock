@@ -1407,6 +1407,7 @@ dependencies = [
  "rstmdb-wal",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "thiserror",
  "tracing",
