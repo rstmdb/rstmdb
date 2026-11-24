@@ -168,7 +168,7 @@ Client                              Server
 | `INVALID_TRANSITION`     | State       | No        | Transition not allowed       |
 | `GUARD_FAILED`           | State       | No        | Guard condition failed       |
 | `CONFLICT`               | Concurrency | No        | State/offset mismatch        |
-| `WAL_IO_ERROR`           | System      | Yes       | WAL I/O failure              |
+| `WAL_IO_ERROR`           | System      | Yes       | WAL I/O failure (not retryable when the WAL segment was deleted or replaced) |
 | `INTERNAL_ERROR`         | System      | Yes       | Server error                 |
 | `RATE_LIMITED`           | System      | Yes       | Rate limit exceeded          |
 

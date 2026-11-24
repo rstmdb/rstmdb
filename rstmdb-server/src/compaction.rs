@@ -52,6 +52,9 @@ fn snapshot_and_compact_with(
     mode: SnapshotMode,
     after_machines: impl FnOnce(),
 ) -> Result<SnapshotPass, StorageError> {
+    // Fail closed before touching the snapshot store or WAL segments.
+    engine.wal().check_writable()?;
+
     let mut pass = SnapshotPass::default();
 
     // WAL head before anything is persisted. Entries appended during the pass
@@ -142,7 +145,7 @@ impl CompactionManager {
 
     /// Checks if compaction should run based on current conditions.
     fn should_compact(&self) -> bool {
-        if self.config.is_disabled() {
+        if self.config.is_disabled() || self.engine.wal().is_detached() {
             return false;
         }
 
@@ -586,5 +589,48 @@ mod tests {
             done.load(Ordering::SeqCst),
             "compaction did not complete after the gate was released"
         );
+    }
+
+    #[test]
+    fn snapshot_and_compact_refuses_when_wal_detached() {
+        use rstmdb_wal::WalError;
+        use serde_json::json;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let engine = Arc::new(StateMachineEngine::new(small_wal(tmp.path())).unwrap());
+        let store = Arc::new(SnapshotStore::open(tmp.path().join("snapshots")).unwrap());
+        engine
+            .put_machine(
+                "m",
+                1,
+                &json!({
+                    "states": ["a"],
+                    "initial": "a",
+                    "transitions": []
+                }),
+            )
+            .unwrap();
+        engine
+            .create_instance("i-1", "m", 1, json!({}), None)
+            .unwrap();
+
+        let wal_dir = tmp.path().join("wal");
+        let seg_name = rstmdb_wal::segment::segment_filename(engine.wal().segment_ids()[0]);
+        std::fs::remove_file(wal_dir.join(&seg_name)).unwrap();
+
+        let err = snapshot_and_compact(&engine, &store, SnapshotMode::Changed).unwrap_err();
+        assert!(matches!(
+            err,
+            StorageError::Wal(WalError::SegmentDetached { .. })
+        ));
+        assert!(store.get_snapshot_meta("i-1").is_none());
+
+        let config = CompactionConfig {
+            events_threshold: 1,
+            min_interval_secs: 0,
+            ..CompactionConfig::default()
+        };
+        let mgr = CompactionManager::new(engine, store, config);
+        assert!(!mgr.should_compact());
     }
 }

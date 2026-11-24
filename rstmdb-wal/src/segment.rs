@@ -33,11 +33,42 @@ pub fn parse_segment_filename(name: &str) -> Option<SegmentId> {
 /// Minimum spacing between in-memory record-boundary checkpoints.
 const INDEX_INTERVAL: u64 = 64 * 1024;
 
+/// Identity of an open file: device and inode on Unix. Elsewhere only the
+/// file's existence at its path can be checked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileIdentity {
+    #[cfg(unix)]
+    dev: u64,
+    #[cfg(unix)]
+    ino: u64,
+}
+
+impl FileIdentity {
+    fn of(meta: &std::fs::Metadata) -> Self {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            Self {
+                dev: meta.dev(),
+                ino: meta.ino(),
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = meta;
+            Self {}
+        }
+    }
+}
+
 /// A single WAL segment file.
 pub struct Segment {
     id: SegmentId,
     path: PathBuf,
     file: File,
+    /// Identity of `file` when it was opened, to detect the path being
+    /// deleted or replaced while the segment is in use.
+    identity: FileIdentity,
     size: u64,
     max_size: u64,
     sync_pending: bool,
@@ -71,11 +102,13 @@ impl Segment {
         // Persist the new directory entry: without it a record fsynced into
         // this segment can vanish with the file after a power loss.
         sync_dir(dir)?;
+        let identity = FileIdentity::of(&file.metadata()?);
 
         Ok(Self {
             id,
             path,
             file,
+            identity,
             size: 0,
             max_size,
             sync_pending: false,
@@ -88,17 +121,35 @@ impl Segment {
         let path = dir.join(segment_filename(id));
         let file = OpenOptions::new().read(true).write(true).open(&path)?;
 
-        let size = file.metadata()?.len();
+        let meta = file.metadata()?;
+        let size = meta.len();
+        let identity = FileIdentity::of(&meta);
 
         Ok(Self {
             id,
             path,
             file,
+            identity,
             size,
             max_size,
             sync_pending: false,
             index: Vec::new(),
         })
+    }
+
+    /// Checks that the file at this segment's path is still the file the
+    /// segment has open. Returns why not otherwise: the path was deleted
+    /// (unlinked), or a different file now exists there (replaced; detected
+    /// by device and inode on Unix). One `stat` of the path.
+    pub fn verify_on_disk(&self) -> Result<(), String> {
+        match std::fs::metadata(&self.path) {
+            Ok(meta) if FileIdentity::of(&meta) == self.identity => Ok(()),
+            Ok(_) => Err("a different file now exists at this path (replaced)".to_string()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                Err("the file was deleted (unlinked)".to_string())
+            }
+            Err(e) => Err(format!("the file cannot be checked: {}", e)),
+        }
     }
 
     /// Returns the segment ID.

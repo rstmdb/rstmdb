@@ -33,6 +33,14 @@ pub enum WalError {
     #[error("invalid WAL state: {0}")]
     InvalidState(String),
 
+    /// The open segment is no longer the file at its path, so a write could
+    /// not be recovered after a restart. Sticky until the WAL is reopened.
+    #[error(
+        "WAL segment {path} is no longer the file this server writes to ({reason}); \
+         writes are refused until the server is restarted"
+    )]
+    SegmentDetached { path: String, reason: String },
+
     #[error("JSON serialization error: {0}")]
     Json(#[from] serde_json::Error),
 }

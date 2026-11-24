@@ -55,6 +55,11 @@ pub struct Metrics {
     pub wal_segments: Gauge,
     /// WAL total size in bytes.
     pub wal_size_bytes: Gauge,
+    /// Whether the WAL is writable (1 = writable, 0 = detached/fail-closed).
+    pub wal_writable: Gauge,
+    /// Optional WAL handle used by `/health`, `/healthz`, and `/metrics` to
+    /// reflect live WAL detachment even before a write fails.
+    wal: Arc<std::sync::OnceLock<Arc<rstmdb_wal::Wal>>>,
     /// Total bytes written to WAL.
     pub wal_bytes_written_total: Counter,
     /// Total bytes read from WAL.
@@ -187,6 +192,13 @@ impl Metrics {
         ))?;
         registry.register(Box::new(wal_size_bytes.clone()))?;
 
+        let wal_writable = Gauge::with_opts(Opts::new(
+            "rstmdb_wal_writable",
+            "Whether the WAL is writable (1 = writable, 0 = detached/fail-closed)",
+        ))?;
+        wal_writable.set(1.0);
+        registry.register(Box::new(wal_writable.clone()))?;
+
         let wal_bytes_written_total = Counter::with_opts(Opts::new(
             "rstmdb_wal_bytes_written_total",
             "Total bytes written to WAL",
@@ -286,6 +298,8 @@ impl Metrics {
             wal_entries,
             wal_segments,
             wal_size_bytes,
+            wal_writable,
+            wal: Arc::new(std::sync::OnceLock::new()),
             wal_bytes_written_total,
             wal_bytes_read_total,
             wal_writes_total,
@@ -301,6 +315,32 @@ impl Metrics {
             replication_replica_lag_entries,
             replication_replica_last_acked_sequence,
         })
+    }
+
+    /// Attaches a WAL handle so `/health`, `/healthz`, and `/metrics` can probe
+    /// WAL writability directly.
+    pub fn set_wal(&self, wal: Arc<rstmdb_wal::Wal>) {
+        let _ = self.wal.set(wal);
+    }
+
+    /// Checks whether the WAL is writable, updating `rstmdb_wal_writable`.
+    pub fn check_wal_health(&self) -> Result<(), String> {
+        if let Some(wal) = self.wal.get() {
+            match wal.check_writable() {
+                Ok(()) => {
+                    self.wal_writable.set(1.0);
+                    Ok(())
+                }
+                Err(e) => {
+                    self.wal_writable.set(0.0);
+                    Err(e.to_string())
+                }
+            }
+        } else if self.wal_writable.get() > 0.0 {
+            Ok(())
+        } else {
+            Err("WAL is detached and not writable".to_string())
+        }
     }
 
     /// Updates WAL I/O counters from the given stats.
@@ -375,6 +415,11 @@ pub fn refresh_engine_gauges(engine: &rstmdb_core::StateMachineEngine, metrics: 
     metrics.wal_entries.set(entry_count as f64);
     metrics.wal_segments.set(wal.segment_ids().len() as f64);
     metrics.wal_size_bytes.set(wal.total_size() as f64);
+    metrics.wal_writable.set(if wal.check_writable().is_ok() {
+        1.0
+    } else {
+        0.0
+    });
 
     metrics.update_wal_stats(wal.stats());
 }
@@ -461,6 +506,7 @@ async fn handle_request(
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
     let response = match req.uri().path() {
         "/metrics" => {
+            let _ = metrics.check_wal_health();
             let body = metrics.encode();
             Response::builder()
                 .status(StatusCode::OK)
@@ -468,10 +514,16 @@ async fn handle_request(
                 .body(Full::new(Bytes::from(body)))
                 .unwrap()
         }
-        "/health" | "/healthz" => Response::builder()
-            .status(StatusCode::OK)
-            .body(Full::new(Bytes::from("OK")))
-            .unwrap(),
+        "/health" | "/healthz" => match metrics.check_wal_health() {
+            Ok(()) => Response::builder()
+                .status(StatusCode::OK)
+                .body(Full::new(Bytes::from("OK")))
+                .unwrap(),
+            Err(err) => Response::builder()
+                .status(StatusCode::SERVICE_UNAVAILABLE)
+                .body(Full::new(Bytes::from(err)))
+                .unwrap(),
+        },
         "/" => Response::builder()
             .status(StatusCode::OK)
             .header("Content-Type", "text/html")
@@ -564,5 +616,83 @@ mod tests {
         assert!(encoded.contains("rstmdb_instances_total 100"));
         assert!(encoded.contains("rstmdb_machines_total 10"));
         assert!(encoded.contains("rstmdb_wal_entries 50000"));
+        assert!(encoded.contains("rstmdb_wal_writable 1"));
+    }
+
+    #[tokio::test]
+    async fn health_and_metrics_reflect_detached_wal() {
+        use rstmdb_wal::{FsyncPolicy, Wal, WalConfig, WalEntry};
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let wal = Arc::new(
+            Wal::open(WalConfig::new(dir.path()).with_fsync_policy(FsyncPolicy::EveryWrite))
+                .unwrap(),
+        );
+        wal.append(&WalEntry::FlushAll { timestamp: 1 }).unwrap();
+
+        let metrics = Arc::new(Metrics::new().unwrap());
+        metrics.set_wal(wal.clone());
+        assert!(metrics.check_wal_health().is_ok());
+
+        // Spawn the HTTP metrics server on an ephemeral port.
+        let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = probe.local_addr().unwrap();
+        drop(probe);
+        let (tx, rx) = broadcast::channel::<()>(1);
+        let m_srv = metrics.clone();
+        let srv = tokio::spawn(async move {
+            let _ = run_metrics_server(addr, m_srv, rx).await;
+        });
+
+        let http_get = |path: &str| {
+            let path = path.to_string();
+            async move {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut stream = loop {
+                    if let Ok(s) = tokio::net::TcpStream::connect(addr).await {
+                        break s;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                };
+                let req = format!(
+                    "GET {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
+                    path, addr
+                );
+                stream.write_all(req.as_bytes()).await.unwrap();
+                let mut buf = String::new();
+                stream.read_to_string(&mut buf).await.unwrap();
+                buf
+            }
+        };
+
+        let ok_health = http_get("/health").await;
+        assert!(ok_health.starts_with("HTTP/1.1 200 OK"), "{}", ok_health);
+
+        let seg = dir
+            .path()
+            .join(rstmdb_wal::segment::segment_filename(wal.segment_ids()[0]));
+        std::fs::remove_file(&seg).unwrap();
+
+        let bad_health = http_get("/health").await;
+        assert!(
+            bad_health.starts_with("HTTP/1.1 503 Service Unavailable"),
+            "{}",
+            bad_health
+        );
+        let bad_healthz = http_get("/healthz").await;
+        assert!(
+            bad_healthz.starts_with("HTTP/1.1 503 Service Unavailable"),
+            "{}",
+            bad_healthz
+        );
+        let metrics_body = http_get("/metrics").await;
+        assert!(
+            metrics_body.contains("rstmdb_wal_writable 0"),
+            "{}",
+            metrics_body
+        );
+
+        let _ = tx.send(());
+        let _ = srv.await;
     }
 }

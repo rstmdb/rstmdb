@@ -290,6 +290,47 @@ The WAL handles partial writes (incomplete entries at end of file):
 - Truncated to last valid entry
 - No data loss for previously acknowledged writes
 
+### Detached Segment
+
+The server keeps the current segment file open. If that file is deleted, or
+a different file is put at its path (for example when the data directory is
+removed or restored from a copy while the server runs), writes to the open
+file would be acknowledged but lost on the next restart.
+
+Before every append (and before compaction or snapshot creation) the server
+checks, with one `stat` of the open segment path, that the path still refers to
+the file it has open (same device and inode on Unix; on other platforms only
+that the path still exists; any `stat` error other than `NotFound`, such as
+`EACCES` or `EIO`, also latches fail-closed). On a mismatch it fails closed:
+
+- the write (as well as `COMPACT`, background compaction, and
+  `SNAPSHOT_INSTANCE`) is refused with `WAL_IO_ERROR` (`retryable: false`),
+  and so is every later write, until the server is restarted, so restored
+  WAL segments and snapshot files are never deleted or overwritten
+- an error is logged once, naming the segment path and whether it was deleted
+  or replaced
+- `INFO` reports `"wal": {"writable": false, "error": "..."}`; `INFO` runs the
+  same check, so the condition shows even before the next write
+- `/health` and `/healthz` return `503 Service Unavailable`, and the
+  `rstmdb_wal_writable` Prometheus gauge transitions from `1` to `0`
+
+Reads keep working from memory. Writes acknowledged before the change are in
+the file descriptor the server still has open:
+
+- if the segment file was **deleted (unlinked)**, those acknowledged writes
+  exist only in the open unlinked descriptor and are lost on restart unless
+  copied out before stopping (on Linux, via `/proc/<pid>/fd/<n>`); restoring
+  the WAL directory from an older backup cannot recover writes accepted after
+  that backup
+- if the directory was **replaced** from a copy, keeping or restoring the
+  complete copy before restarting preserves all writes contained in it
+
+Normal segment rotation and compaction never trigger this: rotation opens a new
+file, and compaction deletes only segments older than the current one.
+
+Cost: one `stat` per append, under the segment lock (about 1.6 µs measured
+on Linux, next to about 1.5 ms for an `every_write` append with fsync).
+
 ## Best Practices
 
 ### Choose Appropriate Fsync Policy

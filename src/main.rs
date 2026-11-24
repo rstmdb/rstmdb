@@ -285,6 +285,7 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
     // Create metrics if enabled
     let (metrics, shutdown_tx) = if config.metrics.enabled {
         let metrics = Arc::new(Metrics::new()?);
+        metrics.set_wal(engine.wal().clone());
         let (shutdown_tx, _) = broadcast::channel::<()>(1);
         tracing::info!("  Metrics: enabled at {}", config.metrics.bind_addr);
         (Some(metrics), Some(shutdown_tx))

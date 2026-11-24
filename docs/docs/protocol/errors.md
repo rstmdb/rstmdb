@@ -159,7 +159,7 @@ Errors related to server internals.
 
 | Code | Retryable | Description |
 |------|-----------|-------------|
-| `WAL_IO_ERROR` | Yes | Failed to write to WAL |
+| `WAL_IO_ERROR` | Yes | Failed to write to WAL. Not retryable (`retryable: false`) when the open WAL segment was deleted or replaced on disk: the server refuses writes until restarted |
 | `INTERNAL_ERROR` | Yes | Unexpected server error |
 | `RATE_LIMITED` | Yes | Too many requests |
 

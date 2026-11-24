@@ -79,6 +79,9 @@ impl ServerError {
                 "WAL_IO_ERROR" => ErrorCode::WalIoError,
                 _ => ErrorCode::InternalError,
             },
+            ServerError::Storage(rstmdb_storage::StorageError::Wal(
+                rstmdb_wal::WalError::SegmentDetached { .. },
+            )) => ErrorCode::WalIoError,
             ServerError::Storage(_) => ErrorCode::InternalError,
             ServerError::Wal(_) => ErrorCode::WalIoError,
             ServerError::Json(_) => ErrorCode::BadRequest,
