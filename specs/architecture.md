@@ -309,7 +309,11 @@ All mutations must be durably written to the WAL before acknowledgment. This ens
 **Atomicity**:
 
 - Single instance operations are atomic (hold write lock)
-- Batch operations with `mode: atomic` use transaction semantics
+- Batch operations with `mode: atomic` are all-or-nothing: every op is
+  validated against the state plus earlier ops of the batch before any is
+  applied, under an engine write gate that excludes other writes. Each op is
+  still its own WAL record, so a WAL I/O error or crash mid-commit can leave a
+  prefix
 - WAL writes are sequential (single writer)
 
 **Metrics**:

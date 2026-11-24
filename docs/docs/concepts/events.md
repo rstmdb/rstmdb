@@ -202,7 +202,7 @@ Apply multiple events atomically:
   "op": "BATCH",
   "params": {
     "mode": "atomic",
-    "operations": [
+    "ops": [
       {"op": "APPLY_EVENT", "params": {"instance_id": "order-001", "event": "PAY", "payload": {}}},
       {"op": "APPLY_EVENT", "params": {"instance_id": "order-002", "event": "PAY", "payload": {}}}
     ]
@@ -211,7 +211,8 @@ Apply multiple events atomically:
 ```
 
 Modes:
-- `atomic` - All operations succeed or all fail
+- `atomic` - Every operation is validated first; if any would fail, none is
+  applied. See [Batch](../api/events.md#atomic-mode) for the limits
 - `best_effort` - Apply as many as possible, report failures
 
 ## Best Practices

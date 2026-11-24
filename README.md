@@ -11,7 +11,7 @@ A state machine database with WAL durability and snapshot compaction.
 - **TLS Support** - Optional TLS encryption with mutual TLS (mTLS) support
 - **Guard Expressions** - Conditional transitions based on context
 - **Idempotency** - Safe retries with idempotency keys
-- **Batch Operations** - Execute multiple operations atomically
+- **Batch Operations** - `atomic` mode validates every operation first and applies all or none; `best_effort` applies what it can
 - **Event Streaming** - Watch instance changes in real-time with WATCH_INSTANCE and WATCH_ALL
 
 ## Quick Start

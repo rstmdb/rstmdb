@@ -59,6 +59,21 @@ pub enum ServerError {
 
     #[error("not found: {0}")]
     NotFound(String),
+
+    /// An atomic batch did not commit. `committed` is 0 when validation
+    /// rejected the batch (nothing was applied).
+    #[error("{message}")]
+    AtomicBatchFailed {
+        /// Index of the failing operation in `ops`.
+        index: usize,
+        /// Operations committed before the failure.
+        committed: usize,
+        /// Whether validation rejected the batch before anything was written.
+        rejected: bool,
+        /// Error code of the failing operation itself.
+        op_code: ErrorCode,
+        message: String,
+    },
 }
 
 impl ServerError {
@@ -95,6 +110,15 @@ impl ServerError {
             ServerError::ReplicationError(_) => ErrorCode::ReplicationError,
             ServerError::Internal(_) => ErrorCode::InternalError,
             ServerError::NotFound(_) => ErrorCode::NotFound,
+            ServerError::AtomicBatchFailed {
+                rejected, op_code, ..
+            } => {
+                if *rejected {
+                    ErrorCode::BadRequest
+                } else {
+                    *op_code
+                }
+            }
         }
     }
 

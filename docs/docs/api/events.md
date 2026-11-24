@@ -162,15 +162,30 @@ Executes multiple operations in a single request.
 
 #### Atomic Mode
 
-All operations succeed or the batch fails:
+All operations are applied, or none are:
 
 ```json
 {"mode": "atomic", ...}
 ```
 
-- Operations are applied in order
-- If any operation fails, the batch stops and returns an error
-- **Note:** This is NOT transactional — already-applied writes within the batch are not rolled back
+- Every operation is parsed and validated first, in order, against the current
+  state plus the effects of the operations before it (an op can use an instance
+  created, or a context field written, by an earlier op of the same batch)
+- If any operation would fail, the batch is rejected with `BAD_REQUEST` and
+  nothing is applied or written to the WAL. The error names the failing op
+  (see [Atomic batch failure](#atomic-batch-failure))
+- Otherwise all operations are applied in order. No other write runs between
+  validation and the last operation of the batch
+- Only `PUT_MACHINE`, `CREATE_INSTANCE`, `APPLY_EVENT` and `DELETE_INSTANCE` are
+  allowed; any other op rejects the batch
+- `expected_wal_offset` cannot be used on an instance that an earlier op of the
+  same batch changed (its new offset is only assigned when the batch commits);
+  such a batch is rejected
+- Limit: each operation is its own WAL record, and the WAL has no multi-record
+  transaction. If a WAL write fails part way (an I/O error) the operations
+  before it stay applied, and the error reports how many (`committed_ops`,
+  not retryable). A crash while the batch is being written can likewise
+  leave a prefix of it after recovery
 
 #### Best Effort Mode
 
@@ -188,11 +203,13 @@ Apply as many as possible:
 
 Operations that can be batched:
 
+- `PUT_MACHINE` (atomic mode)
 - `CREATE_INSTANCE`
 - `APPLY_EVENT`
 - `DELETE_INSTANCE`
 
-Read operations (GET_INSTANCE, LIST_INSTANCES) cannot be batched.
+Read operations (GET_INSTANCE, LIST_INSTANCES) cannot be batched; atomic mode
+rejects them.
 
 ### Response (Best Effort)
 
@@ -209,7 +226,7 @@ Read operations (GET_INSTANCE, LIST_INSTANCES) cannot be batched.
 }
 ```
 
-### Response (Atomic — All Succeed)
+### Response (Atomic, All Succeed)
 
 ```json
 {
@@ -222,6 +239,29 @@ Read operations (GET_INSTANCE, LIST_INSTANCES) cannot be batched.
   }
 }
 ```
+
+### Atomic Batch Failure
+
+If validation rejects op 1 of the batch, nothing is applied:
+
+```json
+{
+  "status": "error",
+  "error": {
+    "code": "BAD_REQUEST",
+    "message": "atomic batch rejected at op 1 (INSTANCE_NOT_FOUND): core error: instance not found: order-404; no operations were applied",
+    "retryable": false,
+    "details": {
+      "failed_op_index": 1,
+      "failed_op_code": "INSTANCE_NOT_FOUND",
+      "committed_ops": 0
+    }
+  }
+}
+```
+
+`failed_op_index` is the zero-based index in `ops`, and `failed_op_code` is the
+error code the op would have returned on its own.
 
 ---
 
