@@ -168,6 +168,7 @@ Client                              Server
 | `INVALID_TRANSITION`     | State       | No        | Transition not allowed       |
 | `GUARD_FAILED`           | State       | No        | Guard condition failed       |
 | `CONFLICT`               | Concurrency | No        | State/offset mismatch        |
+| `IDEMPOTENCY_CONFLICT`   | Concurrency | No        | Key reused for another request |
 | `WAL_IO_ERROR`           | System      | Yes       | WAL I/O failure              |
 | `INTERNAL_ERROR`         | System      | Yes       | Server error                 |
 | `RATE_LIMITED`           | System      | Yes       | Rate limit exceeded          |

@@ -80,6 +80,7 @@ Applies an event to an instance, triggering a state transition.
 | `INVALID_TRANSITION` | No valid transition for this event from current state |
 | `GUARD_FAILED` | Guard condition not satisfied |
 | `CONFLICT` | `expected_state` or `expected_wal_offset` doesn't match |
+| `IDEMPOTENCY_CONFLICT` | Idempotency key reused for a different event, payload, or `event_id` |
 
 ### Payload Merging
 

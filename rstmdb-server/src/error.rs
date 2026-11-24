@@ -75,6 +75,7 @@ impl ServerError {
                 "INVALID_TRANSITION" => ErrorCode::InvalidTransition,
                 "GUARD_FAILED" => ErrorCode::GuardFailed,
                 "CONFLICT" => ErrorCode::Conflict,
+                "IDEMPOTENCY_CONFLICT" => ErrorCode::IdempotencyConflict,
                 "BAD_REQUEST" => ErrorCode::BadRequest,
                 "WAL_IO_ERROR" => ErrorCode::WalIoError,
                 _ => ErrorCode::InternalError,

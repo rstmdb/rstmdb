@@ -534,6 +534,7 @@ impl CommandHandler {
             ErrorCode::InvalidTransition => "INVALID_TRANSITION",
             ErrorCode::GuardFailed => "GUARD_FAILED",
             ErrorCode::Conflict => "CONFLICT",
+            ErrorCode::IdempotencyConflict => "IDEMPOTENCY_CONFLICT",
             ErrorCode::WalIoError => "WAL_IO_ERROR",
             ErrorCode::InternalError => "INTERNAL_ERROR",
             ErrorCode::RateLimited => "RATE_LIMITED",

@@ -32,6 +32,9 @@ pub enum CoreError {
     #[error("WAL offset conflict: expected {expected}, actual {actual}")]
     WalOffsetConflict { expected: u64, actual: u64 },
 
+    #[error("idempotency key '{key}' on instance '{instance_id}' was already used for a different request")]
+    IdempotencyConflict { instance_id: String, key: String },
+
     #[error("invalid machine definition: {reason}")]
     InvalidDefinition { reason: String },
 
@@ -66,6 +69,7 @@ impl CoreError {
             CoreError::GuardFailed { .. } => "GUARD_FAILED",
             CoreError::StateConflict { .. } => "CONFLICT",
             CoreError::WalOffsetConflict { .. } => "CONFLICT",
+            CoreError::IdempotencyConflict { .. } => "IDEMPOTENCY_CONFLICT",
             CoreError::InvalidDefinition { .. } => "BAD_REQUEST",
             CoreError::InvalidGuard { .. } => "BAD_REQUEST",
             CoreError::InvalidContext { .. } => "BAD_REQUEST",
