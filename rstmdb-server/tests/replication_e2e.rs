@@ -1217,10 +1217,25 @@ async fn e2e_idempotency_keys_work_under_replication() {
     let r2 = cluster
         .primary
         .engine
-        .apply_event("idem", "PAY", json!({"n": 2}), None, None, None, Some("k1"))
+        .apply_event("idem", "PAY", json!({"n": 1}), None, None, None, Some("k1"))
         .unwrap();
+    assert!(!r2.applied);
     assert_eq!(r1.wal_offset, r2.wal_offset);
     assert_eq!(r1.to_state, r2.to_state);
+
+    let conflict = cluster.primary.engine.apply_event(
+        "idem",
+        "PAY",
+        json!({"n": 2}),
+        None,
+        None,
+        None,
+        Some("k1"),
+    );
+    assert!(matches!(
+        conflict,
+        Err(rstmdb_core::CoreError::IdempotencyConflict { .. })
+    ));
 
     cluster.wait_converged(Duration::from_secs(3)).await;
 
