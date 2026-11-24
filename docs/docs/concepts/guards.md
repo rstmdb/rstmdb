@@ -215,13 +215,63 @@ If all matching transitions have guards and none pass, the event fails with `GUA
 
 ### Missing Fields
 
-Accessing a missing field evaluates to `null`, which is falsy:
+By default, accessing a missing field evaluates to `null`, which is falsy:
 
 ```
 ctx.missing_field        // false (field doesn't exist)
 ctx.missing_field == null  // true
 !ctx.missing_field       // true
 ```
+
+This default fails open for negated guards and inequalities: `!ctx.blocked` and
+`ctx.status != "rejected"` both pass when the field was never written.
+
+### Strict Guards
+
+Set `"strict_guards": true` on a machine definition to make its guards fail closed
+on missing fields:
+
+```json
+{
+  "states": ["open", "done"],
+  "initial": "open",
+  "strict_guards": true,
+  "transitions": [
+    {"from": "open", "event": "CLOSE", "to": "done", "guard": "!ctx.blocked"}
+  ]
+}
+```
+
+With strict guards, before a guard is evaluated every `ctx.` path it references
+must exist in the instance context. If one is missing, the event is rejected with
+`GUARD_UNKNOWN`, the message names the first missing path in source order, and the
+instance state, context and WAL are unchanged:
+
+```json
+{
+  "status": "error",
+  "error": {
+    "code": "GUARD_UNKNOWN",
+    "message": "guard unknown: missing field 'ctx.blocked' (strict_guards: transition 'open' -> 'done' on event 'CLOSE')"
+  }
+}
+```
+
+Rules in strict mode:
+
+- All referenced paths are checked, including the ones a short-circuiting `&&` or
+  `||` would skip, so the result does not depend on evaluation order.
+- A key present with an explicit `null` value is present: `!ctx.blocked` passes
+  for `{"blocked": null}`.
+- A nested path is missing if any segment is missing or an intermediate value is
+  not an object (`ctx.order.paid` on `{"order": 5}`).
+- Guards are evaluated against the context before the event payload is merged, so
+  write the fields a guard reads (for example with an earlier event or at
+  instance creation) before sending the guarded event.
+
+The flag is part of the definition, so it is fixed per machine version. It is
+omitted from the stored definition when false, so existing definitions keep their
+checksum. To turn it on for an existing machine, register a new version.
 
 ## Best Practices
 

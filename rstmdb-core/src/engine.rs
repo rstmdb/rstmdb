@@ -849,6 +849,22 @@ impl StateMachineEngine {
                 event: event.to_string(),
             })?;
 
+        // Strict guard mode: a missing field fails closed before evaluation, so it can never
+        // make a negated guard or an inequality pass.
+        if definition.strict_guards() {
+            if let Some(path) = guard.and_then(|g| g.first_missing_path(&instance.ctx)) {
+                return Err(CoreError::GuardUnknown {
+                    path: format!("ctx.{}", path),
+                    reason: format!(
+                        "strict_guards: transition '{}' -> '{}' on event '{}'",
+                        instance.state,
+                        to_state.as_str(),
+                        event
+                    ),
+                });
+            }
+        }
+
         // Evaluate guard
         if !GuardEvaluator::evaluate_opt(guard, &instance.ctx) {
             return Err(CoreError::GuardFailed {
@@ -1300,6 +1316,142 @@ mod tests {
             .apply_event("i-2", "SHIP", json!({}), None, None, None, None)
             .unwrap();
         assert_eq!(result.to_state, "shipped");
+    }
+
+    fn gate_definition(strict: bool) -> Value {
+        let mut def = json!({
+            "states": ["open", "done"],
+            "initial": "open",
+            "transitions": [
+                {"from": "open", "event": "CLOSE", "to": "done", "guard": "!ctx.blocked"},
+                {"from": "open", "event": "ACCEPT", "to": "done", "guard": "ctx.status != \"rejected\""}
+            ]
+        });
+        if strict {
+            def["strict_guards"] = json!(true);
+        }
+        def
+    }
+
+    #[test]
+    fn test_strict_guards_reject_missing_negated_field() {
+        let (_dir, engine) = test_engine();
+        engine
+            .put_machine("gate", 1, &gate_definition(true))
+            .unwrap();
+        engine
+            .create_instance("g-1", "gate", 1, json!({"other": 1}), None)
+            .unwrap();
+        let before = engine.get_instance("g-1").unwrap();
+        let wal_seq_before = engine.wal().next_sequence();
+
+        let err = engine
+            .apply_event("g-1", "CLOSE", json!({}), None, None, None, None)
+            .unwrap_err();
+        match &err {
+            CoreError::GuardUnknown { path, .. } => assert_eq!(path, "ctx.blocked"),
+            other => panic!("expected GuardUnknown, got {:?}", other),
+        }
+        assert_eq!(err.error_code(), "GUARD_UNKNOWN");
+        assert!(err.to_string().contains("ctx.blocked"));
+
+        let after = engine.get_instance("g-1").unwrap();
+        assert_eq!(after.state, "open");
+        assert_eq!(after.ctx, before.ctx);
+        assert_eq!(after.last_wal_offset, before.last_wal_offset);
+        assert_eq!(engine.wal().next_sequence(), wal_seq_before);
+    }
+
+    #[test]
+    fn test_strict_guards_reject_missing_field_in_inequality() {
+        let (_dir, engine) = test_engine();
+        engine
+            .put_machine("gate", 1, &gate_definition(true))
+            .unwrap();
+        engine
+            .create_instance("g-1", "gate", 1, json!({}), None)
+            .unwrap();
+
+        let err = engine
+            .apply_event("g-1", "ACCEPT", json!({}), None, None, None, None)
+            .unwrap_err();
+        match &err {
+            CoreError::GuardUnknown { path, .. } => assert_eq!(path, "ctx.status"),
+            other => panic!("expected GuardUnknown, got {:?}", other),
+        }
+        assert_eq!(engine.get_instance("g-1").unwrap().state, "open");
+    }
+
+    #[test]
+    fn test_strict_guards_evaluate_present_fields_normally() {
+        let (_dir, engine) = test_engine();
+        engine
+            .put_machine("gate", 1, &gate_definition(true))
+            .unwrap();
+
+        // Present and true: the negated guard fails the ordinary way.
+        engine
+            .create_instance("g-1", "gate", 1, json!({"blocked": true}), None)
+            .unwrap();
+        let result = engine.apply_event("g-1", "CLOSE", json!({}), None, None, None, None);
+        assert!(matches!(result, Err(CoreError::GuardFailed { .. })));
+
+        // Present and false: passes.
+        engine
+            .create_instance("g-2", "gate", 1, json!({"blocked": false}), None)
+            .unwrap();
+        let result = engine
+            .apply_event("g-2", "CLOSE", json!({}), None, None, None, None)
+            .unwrap();
+        assert_eq!(result.to_state, "done");
+
+        // Present with an explicit null is a present field, not a missing one.
+        engine
+            .create_instance("g-3", "gate", 1, json!({"blocked": null}), None)
+            .unwrap();
+        let result = engine
+            .apply_event("g-3", "CLOSE", json!({}), None, None, None, None)
+            .unwrap();
+        assert_eq!(result.to_state, "done");
+    }
+
+    #[test]
+    fn test_lenient_guards_keep_missing_field_as_null() {
+        let (_dir, engine) = test_engine();
+        engine
+            .put_machine("gate", 1, &gate_definition(false))
+            .unwrap();
+        engine
+            .create_instance("g-1", "gate", 1, json!({}), None)
+            .unwrap();
+        let result = engine
+            .apply_event("g-1", "CLOSE", json!({}), None, None, None, None)
+            .unwrap();
+        assert_eq!(result.to_state, "done");
+    }
+
+    #[test]
+    fn test_strict_guards_survive_wal_replay() {
+        let dir = TempDir::new().unwrap();
+        let config = || {
+            WalConfig::new(dir.path())
+                .with_segment_size(4096)
+                .with_fsync_policy(FsyncPolicy::EveryWrite)
+        };
+        {
+            let engine = StateMachineEngine::new(config()).unwrap();
+            engine
+                .put_machine("gate", 1, &gate_definition(true))
+                .unwrap();
+            engine
+                .create_instance("g-1", "gate", 1, json!({}), None)
+                .unwrap();
+        }
+
+        let engine = StateMachineEngine::new(config()).unwrap();
+        assert!(engine.get_machine("gate", 1).unwrap().strict_guards());
+        let result = engine.apply_event("g-1", "CLOSE", json!({}), None, None, None, None);
+        assert!(matches!(result, Err(CoreError::GuardUnknown { .. })));
     }
 
     #[test]

@@ -26,6 +26,10 @@ pub enum CoreError {
     #[error("guard failed: {reason}")]
     GuardFailed { reason: String },
 
+    /// Strict guard mode: the guard references a context path that is missing.
+    #[error("guard unknown: missing field '{path}' ({reason})")]
+    GuardUnknown { path: String, reason: String },
+
     #[error("state conflict: expected '{expected}', actual '{actual}'")]
     StateConflict { expected: String, actual: String },
 
@@ -64,6 +68,7 @@ impl CoreError {
             CoreError::InstanceExists { .. } => "INSTANCE_EXISTS",
             CoreError::InvalidTransition { .. } => "INVALID_TRANSITION",
             CoreError::GuardFailed { .. } => "GUARD_FAILED",
+            CoreError::GuardUnknown { .. } => "GUARD_UNKNOWN",
             CoreError::StateConflict { .. } => "CONFLICT",
             CoreError::WalOffsetConflict { .. } => "CONFLICT",
             CoreError::InvalidDefinition { .. } => "BAD_REQUEST",

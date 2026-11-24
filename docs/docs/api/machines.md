@@ -49,6 +49,7 @@ Registers a new machine definition or version.
 | `states` | string[] | Yes | List of valid states |
 | `initial` | string | Yes | Initial state for new instances |
 | `transitions` | Transition[] | Yes | Allowed transitions |
+| `strict_guards` | boolean | No | Default `false`. When `true`, a guard that references a missing context field is rejected with `GUARD_UNKNOWN` instead of reading the field as `null` (see [Guards](../concepts/guards.md#strict-guards)) |
 | `meta` | object | No | Arbitrary metadata |
 
 ### Transition Object

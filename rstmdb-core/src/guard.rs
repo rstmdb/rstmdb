@@ -22,6 +22,11 @@
 //! - `(ctx.a || ctx.b) && ctx.c` - grouping to change precedence
 //! - `!ctx.disabled` - negation
 //! - `ctx.status == "active"` - string comparison
+//!
+//! Missing fields: [`GuardExpr::evaluate`] reads a path that does not exist in the
+//! context as `null` (so `!ctx.missing` is true). Machines that set
+//! `strict_guards` use [`GuardExpr::first_missing_path`] first, and the engine
+//! rejects the event with `GUARD_UNKNOWN` instead of evaluating the guard.
 
 use crate::error::CoreError;
 use serde_json::Value;
@@ -106,6 +111,59 @@ impl GuardExpr {
             GuardExpr::Not(inner) => !inner.evaluate(ctx),
         }
     }
+
+    /// Returns every context path the expression references, in source order
+    /// (without the `ctx.` prefix). A path referenced twice is listed twice.
+    pub fn referenced_paths(&self) -> Vec<&str> {
+        let mut paths = Vec::new();
+        self.collect_paths(&mut paths);
+        paths
+    }
+
+    /// Returns the first referenced path (in source order, without the `ctx.`
+    /// prefix) that is absent from `ctx`, or `None` if every path is present.
+    ///
+    /// All referenced paths are checked, not only the ones a short-circuiting
+    /// evaluation would read, so the result does not depend on evaluation order.
+    /// A key that is present with an explicit `null` value counts as present.
+    pub fn first_missing_path(&self, ctx: &Value) -> Option<&str> {
+        self.referenced_paths()
+            .into_iter()
+            .find(|path| !has_field(ctx, path))
+    }
+
+    fn collect_paths<'a>(&'a self, out: &mut Vec<&'a str>) {
+        match self {
+            GuardExpr::Truthy(field)
+            | GuardExpr::Falsy(field)
+            | GuardExpr::Eq(field, _)
+            | GuardExpr::Ne(field, _)
+            | GuardExpr::Gt(field, _)
+            | GuardExpr::Ge(field, _)
+            | GuardExpr::Lt(field, _)
+            | GuardExpr::Le(field, _) => out.push(field.as_str()),
+            GuardExpr::And(left, right) | GuardExpr::Or(left, right) => {
+                left.collect_paths(out);
+                right.collect_paths(out);
+            }
+            GuardExpr::Not(inner) => inner.collect_paths(out),
+        }
+    }
+}
+
+/// Returns true if every segment of the dotted `field` path exists in `ctx`.
+fn has_field(ctx: &Value, field: &str) -> bool {
+    let mut current = ctx;
+    for part in field.split('.') {
+        match current {
+            Value::Object(map) => match map.get(part) {
+                Some(next) => current = next,
+                None => return false,
+            },
+            _ => return false,
+        }
+    }
+    true
 }
 
 fn get_field(ctx: &Value, field: &str) -> Value {
@@ -819,6 +877,39 @@ mod tests {
         // String value should fail numeric comparison
         assert!(!guard.evaluate(&json!({"value": "not a number"})));
         assert!(!guard.evaluate(&json!({"value": null})));
+    }
+
+    #[test]
+    fn test_referenced_paths_in_source_order() {
+        let guard = GuardExpr::parse("(ctx.a || !ctx.b.c) && ctx.d != \"x\" && ctx.e > 1").unwrap();
+        assert_eq!(guard.referenced_paths(), vec!["a", "b.c", "d", "e"]);
+    }
+
+    #[test]
+    fn test_first_missing_path() {
+        let guard = GuardExpr::parse("!ctx.blocked").unwrap();
+        assert_eq!(guard.first_missing_path(&json!({})), Some("blocked"));
+        assert_eq!(guard.first_missing_path(&json!({"blocked": false})), None);
+        // An explicit null is present, not missing.
+        assert_eq!(guard.first_missing_path(&json!({"blocked": null})), None);
+        // A non-object context has no fields.
+        assert_eq!(guard.first_missing_path(&json!(null)), Some("blocked"));
+
+        // Nested: a missing intermediate, or a non-object intermediate, is missing.
+        let guard = GuardExpr::parse("ctx.order.paid").unwrap();
+        assert_eq!(guard.first_missing_path(&json!({})), Some("order.paid"));
+        assert_eq!(
+            guard.first_missing_path(&json!({"order": 5})),
+            Some("order.paid")
+        );
+        assert_eq!(
+            guard.first_missing_path(&json!({"order": {"paid": true}})),
+            None
+        );
+
+        // Every path is checked, even one a short-circuit would skip.
+        let guard = GuardExpr::parse("ctx.a || ctx.b").unwrap();
+        assert_eq!(guard.first_missing_path(&json!({"a": true})), Some("b"));
     }
 
     #[test]

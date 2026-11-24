@@ -272,6 +272,11 @@ ctx.items > 0
 !ctx.cancelled
 ```
 
+By default a missing field reads as `null`, so `!ctx.cancelled` passes when
+`cancelled` was never written. Set `"strict_guards": true` on the definition to
+reject such events with `GUARD_UNKNOWN` (naming the missing path) instead; see
+`docs/docs/concepts/guards.md`.
+
 ## Monitoring
 
 rstmdb exposes Prometheus metrics on port 9090 by default.

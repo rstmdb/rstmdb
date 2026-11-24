@@ -533,6 +533,7 @@ impl CommandHandler {
             ErrorCode::InstanceExists => "INSTANCE_EXISTS",
             ErrorCode::InvalidTransition => "INVALID_TRANSITION",
             ErrorCode::GuardFailed => "GUARD_FAILED",
+            ErrorCode::GuardUnknown => "GUARD_UNKNOWN",
             ErrorCode::Conflict => "CONFLICT",
             ErrorCode::WalIoError => "WAL_IO_ERROR",
             ErrorCode::InternalError => "INTERNAL_ERROR",
@@ -2106,6 +2107,49 @@ mod tests {
         }));
         let response = handler.handle(&mut session, &apply_request);
         assert!(response.is_error());
+    }
+
+    #[test]
+    fn test_apply_event_strict_guard_missing_field_is_guard_unknown() {
+        let (_dir, handler, mut session) = test_handler();
+
+        let put_request = Request::new("1", Operation::PutMachine).with_params(json!({
+            "machine": "gate",
+            "version": 1,
+            "definition": {
+                "states": ["open", "done"],
+                "initial": "open",
+                "strict_guards": true,
+                "transitions": [
+                    {"from": "open", "event": "CLOSE", "to": "done", "guard": "!ctx.blocked"}
+                ]
+            }
+        }));
+        assert!(handler.handle(&mut session, &put_request).is_ok());
+
+        let create_request = Request::new("2", Operation::CreateInstance).with_params(json!({
+            "instance_id": "g-1",
+            "machine": "gate",
+            "version": 1
+        }));
+        assert!(handler.handle(&mut session, &create_request).is_ok());
+
+        let apply_request = Request::new("3", Operation::ApplyEvent).with_params(json!({
+            "instance_id": "g-1",
+            "event": "CLOSE"
+        }));
+        let response = handler.handle(&mut session, &apply_request);
+        let error = response
+            .error
+            .expect("strict guard must reject a missing field");
+        assert_eq!(error.code, ErrorCode::GuardUnknown);
+        assert!(error.message.contains("ctx.blocked"));
+
+        let get_request = Request::new("4", Operation::GetInstance).with_params(json!({
+            "instance_id": "g-1"
+        }));
+        let response = handler.handle(&mut session, &get_request);
+        assert_eq!(response.result.unwrap()["state"], "open");
     }
 
     #[test]

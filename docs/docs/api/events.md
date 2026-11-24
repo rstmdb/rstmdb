@@ -79,6 +79,7 @@ Applies an event to an instance, triggering a state transition.
 | `INSTANCE_NOT_FOUND` | Instance doesn't exist |
 | `INVALID_TRANSITION` | No valid transition for this event from current state |
 | `GUARD_FAILED` | Guard condition not satisfied |
+| `GUARD_UNKNOWN` | Machine has `strict_guards` and the guard references a context field the instance does not have |
 | `CONFLICT` | `expected_state` or `expected_wal_offset` doesn't match |
 
 ### Payload Merging
