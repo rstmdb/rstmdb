@@ -190,6 +190,7 @@ async fn deleting_the_wal_directory_makes_the_server_refuse_writes() {
     stop(node).await;
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn replacing_the_wal_directory_refuses_writes_and_keeps_acknowledged_data() {
     // What happened on the live server: the data directory was recreated
