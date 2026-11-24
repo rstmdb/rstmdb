@@ -3,7 +3,7 @@
 use crate::entry::{WalEntry, WalRecord};
 use crate::error::WalError;
 use crate::segment::{Segment, SegmentId, SegmentScanner};
-use crate::DEFAULT_SEGMENT_SIZE;
+use crate::{DEFAULT_SEGMENT_SIZE, RECORD_HEADER_SIZE};
 use bytes::Bytes;
 use parking_lot::{Mutex, RwLock};
 use std::collections::BTreeMap;
@@ -268,9 +268,19 @@ impl Wal {
 
     /// Rotates to a new segment.
     fn rotate_segment(&self) -> Result<(), WalError> {
-        let segments = self.segments.read();
-        let next_id = segments.keys().next_back().map(|&id| id + 1).unwrap_or(1);
-        drop(segments);
+        let mut current = self.current_segment.lock();
+        self.rotate_segment_locked(&mut current)
+    }
+
+    /// Rotates to a new segment with `self.current_segment` already held.
+    fn rotate_segment_locked(&self, current: &mut Option<Segment>) -> Result<(), WalError> {
+        let next_id = self
+            .segments
+            .read()
+            .keys()
+            .next_back()
+            .map(|&id| id + 1)
+            .unwrap_or(1);
 
         let segment = Segment::create(&self.config.dir, next_id, self.config.segment_size)?;
 
@@ -284,7 +294,7 @@ impl Wal {
             )?)),
         );
 
-        *self.current_segment.lock() = Some(segment);
+        *current = Some(segment);
 
         tracing::debug!("Rotated to segment {}", next_id);
         Ok(())
@@ -314,7 +324,7 @@ impl Wal {
         }
 
         let payload = serde_json::to_vec(entry)?;
-        let sequence = self.next_sequence.fetch_add(1, Ordering::SeqCst);
+        let record_size = RECORD_HEADER_SIZE + payload.len();
 
         // Test-only interleaving hook: fires after the sequence is allocated but
         // before the segment write, so a test can block this writer and let a
@@ -322,31 +332,39 @@ impl Wal {
         // non-monotonic sequence/offset ordering that concurrent writes cause in
         // production. Compiled out entirely without the `test-hooks` feature.
         #[cfg(feature = "test-hooks")]
-        {
+        let sequence_override = {
             let hook = self.append_hook.lock().clone();
             if let Some(hook) = hook {
-                hook(sequence);
+                let seq = self.next_sequence.fetch_add(1, Ordering::SeqCst);
+                hook(seq);
+                Some(seq)
+            } else {
+                None
             }
-        }
-
-        let record = WalRecord::new(entry.entry_type(), sequence, Bytes::from(payload));
-        let record_size = record.disk_size();
+        };
 
         let mut current = self.current_segment.lock();
 
         // Fail closed: never acknowledge a write into a segment that is no
         // longer the file at its path (it would be lost on restart). Checked
-        // under the segment lock, right before the write: one stat per append.
+        // under the segment lock, right before rotation or write: one stat per append.
         if let Some(segment) = current.as_ref() {
             self.verify_segment(segment)?;
         }
 
-        // Check if we need to rotate
+        // Check if we need to rotate while holding `current` so directory
+        // replacement cannot race between verification and segment creation.
         if current.is_none() || !current.as_ref().unwrap().can_fit(record_size) {
-            drop(current);
-            self.rotate_segment()?;
-            current = self.current_segment.lock();
+            self.rotate_segment_locked(&mut current)?;
         }
+
+        #[cfg(feature = "test-hooks")]
+        let sequence =
+            sequence_override.unwrap_or_else(|| self.next_sequence.fetch_add(1, Ordering::SeqCst));
+        #[cfg(not(feature = "test-hooks"))]
+        let sequence = self.next_sequence.fetch_add(1, Ordering::SeqCst);
+
+        let record = WalRecord::new(entry.entry_type(), sequence, Bytes::from(payload));
 
         let segment = current.as_mut().unwrap();
         let segment_id = segment.id();
@@ -398,8 +416,11 @@ impl Wal {
             if self.detached.set((path.clone(), reason.clone())).is_ok() {
                 tracing::error!(
                     "WAL segment {} is no longer the file this server writes to ({}); \
-                     refusing all writes until restart. Writes acknowledged so far are in \
-                     memory; restore the WAL directory before restarting.",
+                     refusing all writes until restart. Previously acknowledged writes \
+                     remain in memory: if the file was unlinked they exist only in the open \
+                     descriptor (on Linux, copy from /proc/<pid>/fd/<n> before stopping, or \
+                     they are lost on restart); if replaced from a copy, keep the complete \
+                     WAL directory before restarting.",
                     path,
                     reason
                 );
@@ -409,6 +430,11 @@ impl Wal {
                 .unwrap_or(WalError::SegmentDetached { path, reason }));
         }
         Ok(())
+    }
+
+    /// Returns `true` if the WAL has already latched into a detached fail-closed state.
+    pub fn is_detached(&self) -> bool {
+        self.detached.get().is_some()
     }
 
     /// Checks now whether the WAL can accept writes: `Err(SegmentDetached)`
@@ -539,6 +565,10 @@ impl Wal {
     ///
     /// Returns the number of segments deleted.
     pub fn compact_before(&self, before_offset: WalOffset) -> Result<usize, WalError> {
+        // Fail closed before touching any on-disk segment files: once the WAL is
+        // detached, in-memory segment paths can point to restored backup files.
+        self.check_writable()?;
+
         let target_segment_id = before_offset.segment_id();
 
         // Find segments to delete (all segments before the target)
@@ -582,15 +612,17 @@ impl Wal {
 
     /// Returns the total size of all segments in bytes.
     pub fn total_size(&self) -> u64 {
+        let current_info = {
+            let current = self.current_segment.lock();
+            current.as_ref().map(|seg| (seg.id(), seg.size()))
+        };
         let segments = self.segments.read();
         let mut total: u64 = segments.values().map(|s| s.lock().size()).sum();
 
         // Also include current segment if it's not in the map
-        let current = self.current_segment.lock();
-        if let Some(seg) = current.as_ref() {
-            let current_id = seg.id();
+        if let Some((current_id, current_size)) = current_info {
             if !segments.contains_key(&current_id) {
-                total += seg.size();
+                total += current_size;
             }
         }
 
@@ -967,6 +999,70 @@ mod tests {
             wal.append(&tick(n)).unwrap();
         }
         wal.check_writable().unwrap();
+    }
+
+    #[test]
+    fn test_first_refused_append_takes_no_sequence() {
+        let dir = TempDir::new().unwrap();
+        let wal = Wal::open(test_config(dir.path())).unwrap();
+        wal.append(&tick(0)).unwrap();
+        let segment = dir.path().join(segment_filename(wal.segment_ids()[0]));
+        std::fs::remove_file(&segment).unwrap();
+
+        let seq_before = wal.next_sequence();
+        // Calling `append` directly without checking `check_writable` first must
+        // refuse without allocating a sequence number.
+        assert_detached(wal.append(&tick(1)), &segment, "deleted");
+        assert_eq!(wal.next_sequence(), seq_before);
+        assert_eq!(wal.stats().writes, 1);
+    }
+
+    #[test]
+    fn test_compact_before_refuses_when_detached_and_preserves_restored_files() {
+        let dir = TempDir::new().unwrap();
+        let wal = Wal::open(test_config(dir.path())).unwrap();
+        let mut last = WalOffset::from_u64(0);
+        for n in 0..200 {
+            let (_, offset) = wal.append(&tick(n)).unwrap();
+            last = offset;
+        }
+        let ids = wal.segment_ids();
+        assert!(ids.len() >= 3, "expected >=3 segments, got {:?}", ids);
+
+        // Simulate replacing the WAL directory with a copy (Unix) or removing
+        // the current segment so compaction would otherwise unlink on-disk state.
+        #[cfg(unix)]
+        {
+            let copy = dir.path().join("wal-copy");
+            std::fs::create_dir(&copy).unwrap();
+            for &id in &ids {
+                let src = dir.path().join(segment_filename(id));
+                let dst = copy.join(segment_filename(id));
+                std::fs::copy(&src, &dst).unwrap();
+                std::fs::remove_file(&src).unwrap();
+                std::fs::rename(&dst, &src).unwrap();
+            }
+            std::fs::remove_dir(&copy).unwrap();
+        }
+        #[cfg(not(unix))]
+        {
+            let current = dir.path().join(segment_filename(*ids.last().unwrap()));
+            std::fs::remove_file(&current).unwrap();
+        }
+
+        assert!(matches!(
+            wal.compact_before(last),
+            Err(WalError::SegmentDetached { .. })
+        ));
+        assert!(wal.is_detached());
+        // None of the older restored segments were deleted by compaction.
+        for &id in &ids[..ids.len() - 1] {
+            assert!(
+                dir.path().join(segment_filename(id)).exists(),
+                "segment {} should still exist after refused compaction",
+                id
+            );
+        }
     }
 
     #[test]

@@ -492,6 +492,9 @@ impl CommandHandler {
                 | ServerError::Core(rstmdb_core::CoreError::Wal(
                     rstmdb_wal::WalError::SegmentDetached { .. }
                 ))
+                | ServerError::Storage(rstmdb_storage::StorageError::Wal(
+                    rstmdb_wal::WalError::SegmentDetached { .. }
+                ))
         ) {
             error.retryable = false;
         }
@@ -1016,6 +1019,9 @@ impl CommandHandler {
         if self.read_only {
             return Err(ServerError::ReadOnlyMode);
         }
+
+        // Refuse persisting snapshots once the WAL is detached from disk.
+        self.engine.wal().check_writable()?;
 
         let instance_id = params["instance_id"]
             .as_str()

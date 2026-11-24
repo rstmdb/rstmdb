@@ -261,3 +261,69 @@ async fn rotation_and_compaction_never_refuse_writes() {
     assert_eq!(node.client.get_instance("c-1").await.unwrap().ctx["n"], 200);
     stop(node).await;
 }
+
+#[tokio::test]
+async fn compaction_and_snapshot_refuse_and_preserve_files_when_detached() {
+    let data = TempDir::new().unwrap();
+    let node = start(data.path(), 4096).await;
+    seed(&node.client, 150).await;
+    let segments = node.engine.wal().segment_ids();
+    assert!(
+        segments.len() >= 4,
+        "expected rotations, got {:?}",
+        segments
+    );
+
+    let wal_dir = data.path().join("wal");
+    #[cfg(unix)]
+    {
+        let copy = data.path().join("wal-copy");
+        std::fs::create_dir(&copy).unwrap();
+        for entry in std::fs::read_dir(&wal_dir).unwrap() {
+            let entry = entry.unwrap();
+            std::fs::copy(entry.path(), copy.join(entry.file_name())).unwrap();
+        }
+        std::fs::remove_dir_all(&wal_dir).unwrap();
+        std::fs::rename(&copy, &wal_dir).unwrap();
+    }
+    #[cfg(not(unix))]
+    {
+        let current = wal_dir.join(rstmdb_wal::segment::segment_filename(
+            *segments.last().unwrap(),
+        ));
+        std::fs::remove_file(&current).unwrap();
+    }
+
+    let snap_err = node.client.snapshot_instance("c-1").await.unwrap_err();
+    assert!(matches!(
+        snap_err,
+        ClientError::ServerError {
+            code: ErrorCode::WalIoError,
+            retryable: false,
+            ..
+        }
+    ));
+
+    let compact_err = node.client.compact(true).await.unwrap_err();
+    assert!(matches!(
+        compact_err,
+        ClientError::ServerError {
+            code: ErrorCode::WalIoError,
+            retryable: false,
+            ..
+        }
+    ));
+
+    // None of the older WAL segments on disk were deleted by the refused compaction.
+    for &seg_id in &segments[..segments.len() - 1] {
+        assert!(
+            wal_dir
+                .join(rstmdb_wal::segment::segment_filename(seg_id))
+                .exists(),
+            "segment {} should remain intact",
+            seg_id
+        );
+    }
+    assert_eq!(wal_info(&node.client).await["writable"], false);
+    stop(node).await;
+}
