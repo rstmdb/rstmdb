@@ -221,6 +221,11 @@ echo "Backup created: $BACKUP_FILE.gz"
 
 ### Full Recovery
 
+Stop the server before restoring or replacing its data directory. A running
+server that finds its open WAL segment deleted or replaced stops accepting
+writes (`WAL_IO_ERROR`, `INFO` shows `"wal": {"writable": false}`) until it is
+restarted, so that it never acknowledges a write it could not recover.
+
 Restore from a complete backup:
 
 ```bash

@@ -11,6 +11,7 @@ A state machine database with WAL durability and snapshot compaction.
 - **TLS Support** - Optional TLS encryption with mutual TLS (mTLS) support
 - **Guard Expressions** - Conditional transitions based on context
 - **Idempotency** - Safe retries with idempotency keys
+- **Fail-closed WAL** - If the open WAL file is deleted or replaced on disk, the server refuses writes (and says so in `INFO`) instead of acknowledging writes it cannot recover
 - **Batch Operations** - Execute multiple operations atomically
 - **Event Streaming** - Watch instance changes in real-time with WATCH_INSTANCE and WATCH_ALL
 

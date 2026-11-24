@@ -477,13 +477,26 @@ impl CommandHandler {
 
         match result {
             Ok(value) => Response::ok(&request.id, value),
-            Err(e) => Response::error(
-                &request.id,
-                ResponseError::new(e.error_code(), e.to_string()),
-            ),
+            Err(e) => Response::error(&request.id, Self::response_error(&e)),
         }
     }
 
+    /// Builds the protocol error for a failed request.
+    fn response_error(e: &ServerError) -> ResponseError {
+        let mut error = ResponseError::new(e.error_code(), e.to_string());
+        // A detached WAL refuses every write until the server is restarted:
+        // retrying cannot succeed.
+        if matches!(
+            e,
+            ServerError::Wal(rstmdb_wal::WalError::SegmentDetached { .. })
+                | ServerError::Core(rstmdb_core::CoreError::Wal(
+                    rstmdb_wal::WalError::SegmentDetached { .. }
+                ))
+        ) {
+            error.retryable = false;
+        }
+        error
+    }
     /// Returns the string name for an operation.
     fn operation_name(op: &Operation) -> &'static str {
         match op {
@@ -638,6 +651,12 @@ impl CommandHandler {
     }
 
     fn handle_info(&self) -> Result<Value, ServerError> {
+        // Re-checks the open WAL segment against the file at its path (one
+        // stat), so a deleted or replaced WAL shows here before any write.
+        let wal = match self.engine.wal().check_writable() {
+            Ok(()) => json!({"writable": true, "error": null}),
+            Err(e) => json!({"writable": false, "error": e.to_string()}),
+        };
         Ok(json!({
             "server_name": self.info.name,
             "server_version": self.info.version,
@@ -645,6 +664,7 @@ impl CommandHandler {
             "features": self.info.features,
             "max_frame_bytes": self.info.max_frame_bytes,
             "max_batch_ops": self.info.max_batch_ops,
+            "wal": wal,
         }))
     }
 
@@ -1569,6 +1589,8 @@ mod tests {
         let result = response.result.unwrap();
         assert_eq!(result["server_name"], "rstmdb");
         assert!(result["features"].as_array().is_some());
+        assert_eq!(result["wal"]["writable"], true);
+        assert!(result["wal"]["error"].is_null());
     }
 
     #[test]

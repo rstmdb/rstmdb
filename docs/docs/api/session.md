@@ -169,7 +169,8 @@ Returns server information and capabilities.
     "protocol_version": 1,
     "features": ["idempotency", "batch", "wal_read"],
     "max_frame_bytes": 16777216,
-    "max_batch_ops": 100
+    "max_batch_ops": 100,
+    "wal": {"writable": true, "error": null}
   }
 }
 ```
@@ -182,6 +183,8 @@ Returns server information and capabilities.
 | `features` | Available features |
 | `max_frame_bytes` | Maximum frame payload size |
 | `max_batch_ops` | Maximum operations per batch |
+| `wal.writable` | `false` once the open WAL segment was deleted or replaced on disk; the server then refuses every write until it is restarted (see [WAL: detached segment](../concepts/wal.md#detached-segment)) |
+| `wal.error` | Why the WAL is not writable, naming the segment path (`null` when writable) |
 
 ---
 

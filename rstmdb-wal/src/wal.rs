@@ -148,6 +148,9 @@ pub struct Wal {
     writes_since_sync: AtomicU64,
     /// Is the WAL closed?
     closed: AtomicBool,
+    /// Set once the open segment is found deleted or replaced on disk:
+    /// `(path, reason)`. Every append is refused from then on.
+    detached: std::sync::OnceLock<(String, String)>,
     /// I/O statistics counters.
     stats_bytes_written: AtomicU64,
     stats_bytes_read: AtomicU64,
@@ -197,6 +200,7 @@ impl Wal {
             next_sequence: AtomicU64::new(1),
             writes_since_sync: AtomicU64::new(0),
             closed: AtomicBool::new(false),
+            detached: std::sync::OnceLock::new(),
             stats_bytes_written: AtomicU64::new(0),
             stats_bytes_read: AtomicU64::new(0),
             stats_writes: AtomicU64::new(0),
@@ -305,6 +309,9 @@ impl Wal {
         if self.closed.load(Ordering::Acquire) {
             return Err(WalError::Closed);
         }
+        if let Some(err) = self.detached_error() {
+            return Err(err);
+        }
 
         let payload = serde_json::to_vec(entry)?;
         let sequence = self.next_sequence.fetch_add(1, Ordering::SeqCst);
@@ -326,6 +333,13 @@ impl Wal {
         let record_size = record.disk_size();
 
         let mut current = self.current_segment.lock();
+
+        // Fail closed: never acknowledge a write into a segment that is no
+        // longer the file at its path (it would be lost on restart). Checked
+        // under the segment lock, right before the write: one stat per append.
+        if let Some(segment) = current.as_ref() {
+            self.verify_segment(segment)?;
+        }
 
         // Check if we need to rotate
         if current.is_none() || !current.as_ref().unwrap().can_fit(record_size) {
@@ -360,6 +374,55 @@ impl Wal {
         }
 
         Ok((sequence, WalOffset::new(segment_id, offset)))
+    }
+
+    /// Returns the sticky error once the WAL has been detached.
+    fn detached_error(&self) -> Option<WalError> {
+        self.detached
+            .get()
+            .map(|(path, reason)| WalError::SegmentDetached {
+                path: path.clone(),
+                reason: reason.clone(),
+            })
+    }
+
+    /// Verifies that `segment` is still the file at its path; on the first
+    /// mismatch, records it (logging an error naming the path) so every later
+    /// append is refused.
+    fn verify_segment(&self, segment: &Segment) -> Result<(), WalError> {
+        if let Some(err) = self.detached_error() {
+            return Err(err);
+        }
+        if let Err(reason) = segment.verify_on_disk() {
+            let path = segment.path().display().to_string();
+            if self.detached.set((path.clone(), reason.clone())).is_ok() {
+                tracing::error!(
+                    "WAL segment {} is no longer the file this server writes to ({}); \
+                     refusing all writes until restart. Writes acknowledged so far are in \
+                     memory; restore the WAL directory before restarting.",
+                    path,
+                    reason
+                );
+            }
+            return Err(self
+                .detached_error()
+                .unwrap_or(WalError::SegmentDetached { path, reason }));
+        }
+        Ok(())
+    }
+
+    /// Checks now whether the WAL can accept writes: `Err(SegmentDetached)`
+    /// if the open segment was deleted or replaced on disk (checked with one
+    /// stat, and sticky once found).
+    pub fn check_writable(&self) -> Result<(), WalError> {
+        if let Some(err) = self.detached_error() {
+            return Err(err);
+        }
+        let current = self.current_segment.lock();
+        match current.as_ref() {
+            Some(segment) => self.verify_segment(segment),
+            None => Ok(()),
+        }
     }
 
     /// Forces a sync to disk.
@@ -584,6 +647,7 @@ impl WalReader {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::segment::segment_filename;
     use std::path::Path;
     use tempfile::TempDir;
 
@@ -787,6 +851,122 @@ mod tests {
 
         let ids = wal.segment_ids();
         assert!(!ids.is_empty(), "Should have at least one segment");
+    }
+
+    fn tick(n: u64) -> WalEntry {
+        WalEntry::ApplyEvent {
+            instance_id: "i-1".to_string(),
+            event: format!("E{}", n),
+            from_state: "a".to_string(),
+            to_state: "a".to_string(),
+            payload: serde_json::json!({"n": n, "pad": "p".repeat(100)}),
+            ctx: serde_json::json!({}),
+            event_id: None,
+            idempotency_key: None,
+        }
+    }
+
+    fn assert_detached(result: Result<(u64, WalOffset), WalError>, path: &Path, reason: &str) {
+        match result {
+            Err(err @ WalError::SegmentDetached { .. }) => {
+                let msg = err.to_string();
+                assert!(msg.contains(&path.display().to_string()), "{}", msg);
+                assert!(msg.contains(reason), "{}", msg);
+                assert!(!err.is_retryable());
+            }
+            other => panic!("expected SegmentDetached, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_append_refused_after_segment_file_deleted() {
+        let dir = TempDir::new().unwrap();
+        let wal = Wal::open(test_config(dir.path())).unwrap();
+        for n in 0..3 {
+            wal.append(&tick(n)).unwrap();
+        }
+        let segment = dir.path().join(segment_filename(wal.segment_ids()[0]));
+        std::fs::remove_file(&segment).unwrap();
+
+        // INFO-style check sees it before any write...
+        assert!(matches!(
+            wal.check_writable(),
+            Err(WalError::SegmentDetached { .. })
+        ));
+        // ...and every later append is refused without writing.
+        let seq = wal.next_sequence();
+        assert_detached(wal.append(&tick(3)), &segment, "deleted");
+        assert_detached(wal.append(&tick(4)), &segment, "deleted");
+        assert_eq!(
+            wal.next_sequence(),
+            seq,
+            "a refused append takes no sequence"
+        );
+        assert_eq!(wal.stats().writes, 3);
+    }
+
+    #[test]
+    fn test_append_refused_after_wal_directory_deleted() {
+        let parent = TempDir::new().unwrap();
+        let dir = parent.path().join("wal");
+        let wal = Wal::open(test_config(&dir)).unwrap();
+        wal.append(&tick(0)).unwrap();
+        let segment = dir.join(segment_filename(wal.segment_ids()[0]));
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        assert_detached(wal.append(&tick(1)), &segment, "deleted");
+    }
+
+    #[test]
+    fn test_append_refused_after_segment_file_replaced() {
+        // A byte copy put in place of the open file (a different inode), as
+        // when a data directory is restored while the server runs.
+        let dir = TempDir::new().unwrap();
+        {
+            let wal = Wal::open(test_config(dir.path())).unwrap();
+            for n in 0..3 {
+                wal.append(&tick(n)).unwrap();
+            }
+            let segment = dir.path().join(segment_filename(wal.segment_ids()[0]));
+            let copy = dir.path().join("copy.tmp");
+            std::fs::copy(&segment, &copy).unwrap();
+            std::fs::rename(&copy, &segment).unwrap();
+
+            let first = wal.append(&tick(3));
+            #[cfg(unix)]
+            assert_detached(first, &segment, "replaced");
+            #[cfg(not(unix))]
+            let _ = first;
+        }
+
+        // Nothing acknowledged is lost: the copy holds every acknowledged entry.
+        let wal = Wal::open(test_config(dir.path())).unwrap();
+        let entries = wal.read_from(WalOffset::from_u64(0), None).unwrap();
+        assert_eq!(entries.len(), 3);
+        // The reopened WAL accepts writes again.
+        wal.append(&tick(4)).unwrap();
+    }
+
+    #[test]
+    fn test_rotation_and_compaction_do_not_detach() {
+        let dir = TempDir::new().unwrap();
+        let wal = Wal::open(test_config(dir.path())).unwrap();
+        let mut last = WalOffset::from_u64(0);
+        for n in 0..200 {
+            let (_, offset) = wal.append(&tick(n)).unwrap();
+            last = offset;
+        }
+        assert!(wal.segment_ids().len() >= 4, "expected several rotations");
+        wal.check_writable().unwrap();
+
+        // Compaction deletes every segment before the current one.
+        let deleted = wal.compact_before(last).unwrap();
+        assert!(deleted >= 3);
+        wal.check_writable().unwrap();
+        for n in 200..260 {
+            wal.append(&tick(n)).unwrap();
+        }
+        wal.check_writable().unwrap();
     }
 
     #[test]
