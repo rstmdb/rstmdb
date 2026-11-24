@@ -306,7 +306,7 @@ impl<'a> Parser<'a> {
             }
         }
 
-        let field = self.input.get(start + 4..self.pos).unwrap_or("");
+        let field = self.slice(start + 4..self.pos)?;
         if field.is_empty() {
             return Err(CoreError::InvalidGuard {
                 reason: "empty field name".to_string(),
@@ -320,7 +320,7 @@ impl<'a> Parser<'a> {
         self.skip_whitespace();
 
         // Try to parse as JSON value
-        let rest = self.input.get(self.pos..).unwrap_or("");
+        let rest = self.rest()?;
 
         // Boolean
         if rest.starts_with("true") {
@@ -357,7 +357,7 @@ impl<'a> Parser<'a> {
         let start = self.pos;
         while let Some(c) = self.peek_char() {
             if c == '"' {
-                let s = self.input.get(start..self.pos).unwrap_or("");
+                let s = self.slice(start..self.pos)?;
                 self.pos += 1;
                 return Ok(Value::String(s.to_string()));
             }
@@ -408,7 +408,7 @@ impl<'a> Parser<'a> {
             }
         }
 
-        let num_str = self.input.get(start..self.pos).unwrap_or("");
+        let num_str = self.slice(start..self.pos)?;
         num_str.parse::<f64>().map_err(|_| CoreError::InvalidGuard {
             reason: format!("invalid number: '{}'", num_str),
         })
@@ -422,6 +422,22 @@ impl<'a> Parser<'a> {
                 break;
             }
         }
+    }
+
+    fn slice(&self, range: std::ops::Range<usize>) -> Result<&'a str, CoreError> {
+        self.input
+            .get(range)
+            .ok_or_else(|| CoreError::InvalidGuard {
+                reason: "internal parser error: slice not on UTF-8 char boundary".to_string(),
+            })
+    }
+
+    fn rest(&self) -> Result<&'a str, CoreError> {
+        self.input
+            .get(self.pos..)
+            .ok_or_else(|| CoreError::InvalidGuard {
+                reason: "internal parser error: cursor not on UTF-8 char boundary".to_string(),
+            })
     }
 
     fn peek_char(&self) -> Option<char> {
@@ -487,8 +503,28 @@ mod tests {
         // Multi-byte field name (is_alphanumeric is true for 'é'):
         let guard = GuardExpr::parse("ctx.café == 1").unwrap();
         assert!(guard.evaluate(&json!({"café": 1})));
-        // Multi-byte whitespace (U+00A0) must not panic; it parses or errors:
-        let _ = GuardExpr::parse("ctx.a\u{00A0}==\u{00A0}1");
+        // Multi-byte whitespace (U+00A0) parses and evaluates cleanly:
+        let guard = GuardExpr::parse("ctx.a\u{00A0}==\u{00A0}1").unwrap();
+        assert!(guard.evaluate(&json!({ "a": 1 })));
+        assert!(!guard.evaluate(&json!({ "a": 2 })));
+        // Multi-byte char after backslash escape does not land mid-char:
+        let guard = GuardExpr::parse("ctx.s == \"a\\éb\"").unwrap();
+        assert!(guard.evaluate(&json!({ "s": "a\\éb" })));
+        let guard = GuardExpr::parse("ctx.s == \"a\\🎉b\"").unwrap();
+        assert!(guard.evaluate(&json!({ "s": "a\\🎉b" })));
+        // Trailing backslash at EOF is rejected cleanly without panicking:
+        assert!(GuardExpr::parse("ctx.s == \"abc\\").is_err());
+    }
+
+    #[test]
+    fn test_mid_char_cursor_returns_invalid_guard() {
+        let mut parser = Parser::new("é");
+        parser.pos = 1;
+        assert!(matches!(parser.rest(), Err(CoreError::InvalidGuard { .. })));
+        assert!(matches!(
+            parser.slice(1..2),
+            Err(CoreError::InvalidGuard { .. })
+        ));
     }
 
     #[test]
