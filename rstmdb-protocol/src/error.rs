@@ -64,6 +64,8 @@ pub enum ErrorCode {
     // State machine errors
     InvalidTransition,
     GuardFailed,
+    /// Strict guard mode: the guard references a context field that is missing.
+    GuardUnknown,
     Conflict,
 
     // System errors
@@ -105,6 +107,7 @@ impl fmt::Display for ErrorCode {
             ErrorCode::InstanceExists => write!(f, "INSTANCE_EXISTS"),
             ErrorCode::InvalidTransition => write!(f, "INVALID_TRANSITION"),
             ErrorCode::GuardFailed => write!(f, "GUARD_FAILED"),
+            ErrorCode::GuardUnknown => write!(f, "GUARD_UNKNOWN"),
             ErrorCode::Conflict => write!(f, "CONFLICT"),
             ErrorCode::WalIoError => write!(f, "WAL_IO_ERROR"),
             ErrorCode::InternalError => write!(f, "INTERNAL_ERROR"),
@@ -132,6 +135,7 @@ mod tests {
         assert!(!ErrorCode::NotFound.is_retryable());
         assert!(!ErrorCode::InvalidTransition.is_retryable());
         assert!(!ErrorCode::GuardFailed.is_retryable());
+        assert!(!ErrorCode::GuardUnknown.is_retryable());
         assert!(!ErrorCode::Conflict.is_retryable());
         assert!(!ErrorCode::Unauthorized.is_retryable());
         assert!(!ErrorCode::AuthFailed.is_retryable());
@@ -174,6 +178,7 @@ mod tests {
             "INVALID_TRANSITION"
         );
         assert_eq!(format!("{}", ErrorCode::GuardFailed), "GUARD_FAILED");
+        assert_eq!(format!("{}", ErrorCode::GuardUnknown), "GUARD_UNKNOWN");
         assert_eq!(format!("{}", ErrorCode::Conflict), "CONFLICT");
         assert_eq!(format!("{}", ErrorCode::WalIoError), "WAL_IO_ERROR");
         assert_eq!(format!("{}", ErrorCode::InternalError), "INTERNAL_ERROR");
@@ -197,6 +202,9 @@ mod tests {
 
         let parsed: ErrorCode = serde_json::from_str("\"CONFLICT\"").unwrap();
         assert_eq!(parsed, ErrorCode::Conflict);
+
+        let json = serde_json::to_string(&ErrorCode::GuardUnknown).unwrap();
+        assert_eq!(json, "\"GUARD_UNKNOWN\"");
     }
 
     #[test]

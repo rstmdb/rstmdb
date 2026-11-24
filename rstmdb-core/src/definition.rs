@@ -13,6 +13,11 @@
 //!   ]
 //! }
 //! ```
+//!
+//! Setting the optional `"strict_guards": true` makes every guard of the machine
+//! fail closed on a missing context field: an event whose guard references a
+//! path absent from the instance context is rejected with `GUARD_UNKNOWN`
+//! instead of reading the path as `null`.
 
 use crate::error::CoreError;
 use crate::guard::GuardExpr;
@@ -113,6 +118,13 @@ pub struct MachineDefinitionRaw {
 
     /// Transitions.
     pub transitions: Vec<Transition>,
+
+    /// Strict guard mode. When true, a guard that references a context path the
+    /// instance does not have is rejected with `GUARD_UNKNOWN` instead of reading
+    /// the path as `null`. Omitted from the serialized form when false, so the
+    /// checksum of a definition without the flag is unchanged.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub strict_guards: bool,
 
     /// Optional metadata.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -260,6 +272,11 @@ impl MachineDefinition {
             .map(|(to, guard)| (to, guard.as_ref()))
     }
 
+    /// Returns true if guards of this machine fail closed on missing fields.
+    pub fn strict_guards(&self) -> bool {
+        self.raw.strict_guards
+    }
+
     /// Returns true if the given state is valid for this machine.
     pub fn has_state(&self, state: &State) -> bool {
         self.states.contains(state)
@@ -340,6 +357,26 @@ mod tests {
             .get_transition(&State::from("shipped"), "REFUND")
             .unwrap();
         assert_eq!(to.as_str(), "refunded");
+    }
+
+    #[test]
+    fn test_strict_guards_flag() {
+        let def = MachineDefinition::from_json("order", 1, &sample_definition()).unwrap();
+        assert!(!def.strict_guards());
+        // The flag is not serialized when false: the stored form and checksum of
+        // existing definitions do not change.
+        assert!(def.to_json().get("strict_guards").is_none());
+
+        let mut json = sample_definition();
+        json["strict_guards"] = serde_json::json!(true);
+        let strict = MachineDefinition::from_json("order", 1, &json).unwrap();
+        assert!(strict.strict_guards());
+        assert_eq!(strict.to_json()["strict_guards"], true);
+        assert_ne!(strict.checksum, def.checksum);
+
+        json["strict_guards"] = serde_json::json!(false);
+        let explicit_false = MachineDefinition::from_json("order", 1, &json).unwrap();
+        assert_eq!(explicit_false.checksum, def.checksum);
     }
 
     #[test]

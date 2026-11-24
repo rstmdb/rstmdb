@@ -167,6 +167,7 @@ Client                              Server
 | `INSTANCE_EXISTS`        | Resource    | No        | Instance already exists      |
 | `INVALID_TRANSITION`     | State       | No        | Transition not allowed       |
 | `GUARD_FAILED`           | State       | No        | Guard condition failed       |
+| `GUARD_UNKNOWN`          | State       | No        | Strict guard read a missing field |
 | `CONFLICT`               | Concurrency | No        | State/offset mismatch        |
 | `WAL_IO_ERROR`           | System      | Yes       | WAL I/O failure              |
 | `INTERNAL_ERROR`         | System      | Yes       | Server error                 |

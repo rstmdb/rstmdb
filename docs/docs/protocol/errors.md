@@ -99,6 +99,7 @@ Errors related to state transitions.
 |------|-----------|-------------|
 | `INVALID_TRANSITION` | No | No valid transition for event from current state |
 | `GUARD_FAILED` | No | Guard condition evaluated to false |
+| `GUARD_UNKNOWN` | No | Machine has `strict_guards` and the guard references a missing context field (the message names the path) |
 
 **Example: Invalid Transition**
 ```json

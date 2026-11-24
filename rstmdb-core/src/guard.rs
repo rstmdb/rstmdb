@@ -22,6 +22,11 @@
 //! - `(ctx.a || ctx.b) && ctx.c` - grouping to change precedence
 //! - `!ctx.disabled` - negation
 //! - `ctx.status == "active"` - string comparison
+//!
+//! Missing fields: [`GuardExpr::evaluate`] reads a path that does not exist in the
+//! context as `null` (so `!ctx.missing` is true). Machines that set
+//! `strict_guards` use [`GuardExpr::first_missing_path`] first, and the engine
+//! rejects the event with `GUARD_UNKNOWN` instead of evaluating the guard.
 
 use crate::error::CoreError;
 use serde_json::Value;
@@ -106,6 +111,59 @@ impl GuardExpr {
             GuardExpr::Not(inner) => !inner.evaluate(ctx),
         }
     }
+
+    /// Returns every context path the expression references, in source order
+    /// (without the `ctx.` prefix). A path referenced twice is listed twice.
+    pub fn referenced_paths(&self) -> Vec<&str> {
+        let mut paths = Vec::new();
+        self.collect_paths(&mut paths);
+        paths
+    }
+
+    /// Returns the first referenced path (in source order, without the `ctx.`
+    /// prefix) that is absent from `ctx`, or `None` if every path is present.
+    ///
+    /// All referenced paths are checked, not only the ones a short-circuiting
+    /// evaluation would read, so the result does not depend on evaluation order.
+    /// A key that is present with an explicit `null` value counts as present.
+    pub fn first_missing_path(&self, ctx: &Value) -> Option<&str> {
+        self.referenced_paths()
+            .into_iter()
+            .find(|path| !has_field(ctx, path))
+    }
+
+    fn collect_paths<'a>(&'a self, out: &mut Vec<&'a str>) {
+        match self {
+            GuardExpr::Truthy(field)
+            | GuardExpr::Falsy(field)
+            | GuardExpr::Eq(field, _)
+            | GuardExpr::Ne(field, _)
+            | GuardExpr::Gt(field, _)
+            | GuardExpr::Ge(field, _)
+            | GuardExpr::Lt(field, _)
+            | GuardExpr::Le(field, _) => out.push(field.as_str()),
+            GuardExpr::And(left, right) | GuardExpr::Or(left, right) => {
+                left.collect_paths(out);
+                right.collect_paths(out);
+            }
+            GuardExpr::Not(inner) => inner.collect_paths(out),
+        }
+    }
+}
+
+/// Returns true if every segment of the dotted `field` path exists in `ctx`.
+fn has_field(ctx: &Value, field: &str) -> bool {
+    let mut current = ctx;
+    for part in field.split('.') {
+        match current {
+            Value::Object(map) => match map.get(part) {
+                Some(next) => current = next,
+                None => return false,
+            },
+            _ => return false,
+        }
+    }
+    true
 }
 
 fn get_field(ctx: &Value, field: &str) -> Value {
@@ -352,14 +410,18 @@ impl<'a> Parser<'a> {
                 reason: "expected string".to_string(),
             });
         }
+        let quote_start = self.pos;
         self.pos += 1;
 
-        let start = self.pos;
         while let Some(c) = self.peek_char() {
             if c == '"' {
-                let s = self.slice(start..self.pos)?;
+                let raw = self.slice(quote_start..self.pos + 1)?;
                 self.pos += 1;
-                return Ok(Value::String(s.to_string()));
+                let decoded =
+                    serde_json::from_str::<String>(raw).map_err(|e| CoreError::InvalidGuard {
+                        reason: format!("invalid string literal: {}", e),
+                    })?;
+                return Ok(Value::String(decoded));
             }
             if c == '\\' {
                 // skip the backslash, then the escaped char by its width, so a
@@ -507,13 +569,41 @@ mod tests {
         let guard = GuardExpr::parse("ctx.a\u{00A0}==\u{00A0}1").unwrap();
         assert!(guard.evaluate(&json!({ "a": 1 })));
         assert!(!guard.evaluate(&json!({ "a": 2 })));
-        // Multi-byte char after backslash escape does not land mid-char:
-        let guard = GuardExpr::parse("ctx.s == \"a\\éb\"").unwrap();
+        // Multi-byte char after backslash escape does not land mid-char;
+        // unrecognized escapes fail loudly without panicking.
+        assert!(matches!(
+            GuardExpr::parse("ctx.s == \"a\\éb\""),
+            Err(CoreError::InvalidGuard { .. })
+        ));
+        assert!(matches!(
+            GuardExpr::parse("ctx.s == \"a\\🎉b\""),
+            Err(CoreError::InvalidGuard { .. })
+        ));
+        // Valid escaped backslash followed by multi-byte char decodes properly:
+        let guard = GuardExpr::parse("ctx.s == \"a\\\\éb\"").unwrap();
         assert!(guard.evaluate(&json!({ "s": "a\\éb" })));
-        let guard = GuardExpr::parse("ctx.s == \"a\\🎉b\"").unwrap();
+        let guard = GuardExpr::parse("ctx.s == \"a\\\\🎉b\"").unwrap();
         assert!(guard.evaluate(&json!({ "s": "a\\🎉b" })));
         // Trailing backslash at EOF is rejected cleanly without panicking:
         assert!(GuardExpr::parse("ctx.s == \"abc\\").is_err());
+    }
+
+    #[test]
+    fn test_string_literal_escape_decoding() {
+        let guard = GuardExpr::parse(r#"ctx.s == "a\"b\\c\nd\te""#).unwrap();
+        assert!(guard.evaluate(&json!({ "s": "a\"b\\c\nd\te" })));
+
+        let guard = GuardExpr::parse(r#"ctx.s == "caf\u00E9""#).unwrap();
+        assert!(guard.evaluate(&json!({ "s": "café" })));
+
+        assert!(matches!(
+            GuardExpr::parse(r#"ctx.s == "\q""#),
+            Err(CoreError::InvalidGuard { .. })
+        ));
+        assert!(matches!(
+            GuardExpr::parse(r#"ctx.s == "\u12""#),
+            Err(CoreError::InvalidGuard { .. })
+        ));
     }
 
     #[test]
@@ -787,6 +877,39 @@ mod tests {
         // String value should fail numeric comparison
         assert!(!guard.evaluate(&json!({"value": "not a number"})));
         assert!(!guard.evaluate(&json!({"value": null})));
+    }
+
+    #[test]
+    fn test_referenced_paths_in_source_order() {
+        let guard = GuardExpr::parse("(ctx.a || !ctx.b.c) && ctx.d != \"x\" && ctx.e > 1").unwrap();
+        assert_eq!(guard.referenced_paths(), vec!["a", "b.c", "d", "e"]);
+    }
+
+    #[test]
+    fn test_first_missing_path() {
+        let guard = GuardExpr::parse("!ctx.blocked").unwrap();
+        assert_eq!(guard.first_missing_path(&json!({})), Some("blocked"));
+        assert_eq!(guard.first_missing_path(&json!({"blocked": false})), None);
+        // An explicit null is present, not missing.
+        assert_eq!(guard.first_missing_path(&json!({"blocked": null})), None);
+        // A non-object context has no fields.
+        assert_eq!(guard.first_missing_path(&json!(null)), Some("blocked"));
+
+        // Nested: a missing intermediate, or a non-object intermediate, is missing.
+        let guard = GuardExpr::parse("ctx.order.paid").unwrap();
+        assert_eq!(guard.first_missing_path(&json!({})), Some("order.paid"));
+        assert_eq!(
+            guard.first_missing_path(&json!({"order": 5})),
+            Some("order.paid")
+        );
+        assert_eq!(
+            guard.first_missing_path(&json!({"order": {"paid": true}})),
+            None
+        );
+
+        // Every path is checked, even one a short-circuit would skip.
+        let guard = GuardExpr::parse("ctx.a || ctx.b").unwrap();
+        assert_eq!(guard.first_missing_path(&json!({"a": true})), Some("b"));
     }
 
     #[test]

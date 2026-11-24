@@ -74,6 +74,7 @@ impl ServerError {
                 "INSTANCE_EXISTS" => ErrorCode::InstanceExists,
                 "INVALID_TRANSITION" => ErrorCode::InvalidTransition,
                 "GUARD_FAILED" => ErrorCode::GuardFailed,
+                "GUARD_UNKNOWN" => ErrorCode::GuardUnknown,
                 "CONFLICT" => ErrorCode::Conflict,
                 "BAD_REQUEST" => ErrorCode::BadRequest,
                 "WAL_IO_ERROR" => ErrorCode::WalIoError,
