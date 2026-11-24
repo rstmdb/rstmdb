@@ -391,7 +391,7 @@ mod tests {
                 json!({"paid": true}),
                 None,
                 None,
-                Some("e-1"),
+                None,
                 Some("pay"),
             )
             .unwrap();

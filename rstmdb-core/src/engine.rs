@@ -33,6 +33,10 @@ struct CachedApply {
 
 /// Recursively sorts JSON object keys so semantically identical objects yield the
 /// exact same serialized bytes regardless of map insertion order.
+///
+/// `serde_json::Map` uses `BTreeMap` by default today (without `preserve_order`),
+/// so this explicit recursive sort is a safeguard in case `preserve_order` is ever
+/// enabled anywhere in the workspace.
 fn canonical_value(value: &Value) -> Value {
     match value {
         Value::Array(items) => Value::Array(items.iter().map(canonical_value).collect()),
@@ -60,10 +64,14 @@ fn sha256_canonical(value: &Value) -> String {
 }
 
 /// Deterministic SHA-256 fingerprint of an `APPLY_EVENT` request.
-pub fn request_fingerprint(event: &str, payload: &Value, event_id: Option<&str>) -> String {
+///
+/// Hashes only `(event, canonical_json(payload))` — per-attempt metadata like
+/// `event_id` is intentionally excluded so retries with fresh event IDs succeed.
+/// Note: JSON numbers `10` and `10.0` serialize differently (`serde_json` integer
+/// vs float) and therefore produce distinct fingerprints.
+pub fn request_fingerprint(event: &str, payload: &Value) -> String {
     sha256_canonical(&serde_json::json!({
         "event": event,
-        "event_id": event_id,
         "payload": payload,
     }))
 }
@@ -494,7 +502,7 @@ impl StateMachineEngine {
                 if let Some(instance_lock) = self.instances.get(&instance_id) {
                     let mut instance = instance_lock.write();
                     if let Some(key) = idempotency_key {
-                        let hash = request_fingerprint(&event, &payload, event_id.as_deref());
+                        let hash = request_fingerprint(&event, &payload);
                         self.idempotency_cache
                             .entry(instance_id.clone())
                             .or_default()
@@ -875,7 +883,7 @@ impl StateMachineEngine {
         // requests with the same key cannot both apply. A replay with the
         // same request returns `applied: false`; a different request with the
         // same key fails with `IdempotencyConflict`.
-        let incoming_hash = idempotency_key.map(|_| request_fingerprint(event, &payload, event_id));
+        let incoming_hash = idempotency_key.map(|_| request_fingerprint(event, &payload));
         if let (Some(key), Some(hash)) = (idempotency_key, incoming_hash.as_deref()) {
             if let Some(cached) = self
                 .idempotency_cache
@@ -1749,7 +1757,7 @@ mod tests {
         // SHIP carried no event_id, so (as in live apply) it cleared e-1.
         assert_eq!(i.last_event_id, None);
         for (key, event, payload, evt_id) in [
-            ("pay", "PAY", json!({"items_ready": true}), Some("e-1")),
+            ("pay", "PAY", json!({"items_ready": true}), None),
             ("ship", "SHIP", json!({}), None),
         ] {
             let r = engine
@@ -2999,8 +3007,8 @@ mod tests {
                 .unwrap_err();
             assert!(matches!(err_payload, CoreError::IdempotencyConflict { .. }));
 
-            // Same event + payload + different event_id is rejected.
-            let err_evt_id = engine
+            // Same event + payload + different event_id replays cleanly (event_id excluded).
+            let retry_evt_id = engine
                 .apply_event(
                     "i-1",
                     "PAY",
@@ -3010,8 +3018,9 @@ mod tests {
                     Some("evt-2"),
                     Some("k-1"),
                 )
-                .unwrap_err();
-            assert!(matches!(err_evt_id, CoreError::IdempotencyConflict { .. }));
+                .unwrap();
+            assert!(!retry_evt_id.applied);
+            assert_eq!(retry_evt_id.wal_offset, first.wal_offset);
 
             saved_snapshot = snapshot_of(&engine, "i-1");
             assert!(saved_snapshot.idempotency[0].request_hash.is_some());
