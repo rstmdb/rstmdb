@@ -8,8 +8,10 @@ use dashmap::DashMap;
 use parking_lot::RwLock;
 use rstmdb_wal::{Wal, WalConfig, WalEntry};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
-use std::collections::{HashMap, VecDeque};
+use serde_json::{Map, Value};
+use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::fmt::Write as _;
 use std::sync::Arc;
 
 /// Result of applying an event.
@@ -23,6 +25,65 @@ pub struct ApplyResult {
     pub applied: bool,
 }
 
+#[derive(Debug, Clone)]
+struct CachedApply {
+    result: ApplyResult,
+    request_hash: Option<String>,
+}
+
+/// Recursively sorts JSON object keys so semantically identical objects yield the
+/// exact same serialized bytes regardless of map insertion order.
+///
+/// `serde_json::Map` uses `BTreeMap` by default today (without `preserve_order`),
+/// so this explicit recursive sort is a safeguard in case `preserve_order` is ever
+/// enabled anywhere in the workspace.
+fn canonical_value(value: &Value) -> Value {
+    match value {
+        Value::Array(items) => Value::Array(items.iter().map(canonical_value).collect()),
+        Value::Object(map) => {
+            let sorted: BTreeMap<&String, Value> =
+                map.iter().map(|(k, v)| (k, canonical_value(v))).collect();
+            let mut out = Map::with_capacity(sorted.len());
+            for (k, v) in sorted {
+                out.insert(k.clone(), v);
+            }
+            Value::Object(out)
+        }
+        other => other.clone(),
+    }
+}
+
+fn sha256_canonical(value: &Value) -> String {
+    let encoded = serde_json::to_string(&canonical_value(value)).unwrap_or_default();
+    let digest = Sha256::digest(encoded.as_bytes());
+    let mut hex = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        let _ = write!(&mut hex, "{byte:02x}");
+    }
+    hex
+}
+
+/// Deterministic SHA-256 fingerprint of an `APPLY_EVENT` request.
+///
+/// Hashes only `(event, canonical_json(payload))` — per-attempt metadata like
+/// `event_id` is intentionally excluded so retries with fresh event IDs succeed.
+/// Note: JSON numbers `10` and `10.0` serialize differently (`serde_json` integer
+/// vs float) and therefore produce distinct fingerprints.
+pub fn request_fingerprint(event: &str, payload: &Value) -> String {
+    sha256_canonical(&serde_json::json!({
+        "event": event,
+        "payload": payload,
+    }))
+}
+
+fn create_request_fingerprint(machine: &str, version: u32, initial_ctx: &Value) -> String {
+    sha256_canonical(&serde_json::json!({
+        "machine": machine,
+        "version": version,
+        "initial_ctx": initial_ctx,
+    }))
+}
+
 /// Cached `APPLY_EVENT` results of one instance, keyed by idempotency key.
 ///
 /// `order` holds the keys in insertion order, which is WAL order on every
@@ -30,20 +91,20 @@ pub struct ApplyResult {
 /// written), so its front is always the oldest key.
 #[derive(Debug, Default)]
 struct IdempotencyScope {
-    results: HashMap<String, ApplyResult>,
+    results: HashMap<String, CachedApply>,
     order: VecDeque<String>,
 }
 
 impl IdempotencyScope {
-    fn get(&self, key: &str) -> Option<&ApplyResult> {
+    fn get(&self, key: &str) -> Option<&CachedApply> {
         self.results.get(key)
     }
 
     /// Inserts a result, then evicts the oldest keys beyond `max`
     /// (0 = unlimited). Re-inserting a present key replaces its result and
     /// moves it to the newest position.
-    fn insert(&mut self, key: String, result: ApplyResult, max: usize) {
-        if self.results.insert(key.clone(), result).is_some() {
+    fn insert(&mut self, key: String, entry: CachedApply, max: usize) {
+        if self.results.insert(key.clone(), entry).is_some() {
             self.order.retain(|k| k != &key);
         }
         self.order.push_back(key);
@@ -288,13 +349,16 @@ impl StateMachineEngine {
                 for r in &snapshot.idempotency {
                     scope.insert(
                         r.key.clone(),
-                        ApplyResult {
-                            from_state: r.from_state.clone(),
-                            to_state: r.to_state.clone(),
-                            ctx: r.ctx.clone(),
-                            wal_offset: r.wal_offset,
-                            sequence: r.sequence,
-                            applied: true,
+                        CachedApply {
+                            result: ApplyResult {
+                                from_state: r.from_state.clone(),
+                                to_state: r.to_state.clone(),
+                                ctx: r.ctx.clone(),
+                                wal_offset: r.wal_offset,
+                                sequence: r.sequence,
+                                applied: true,
+                            },
+                            request_hash: r.request_hash.clone(),
                         },
                         self.max_idempotency_keys,
                     );
@@ -405,6 +469,9 @@ impl StateMachineEngine {
                 if should_create {
                     // Older WALs may hold `null` contexts; heal them on replay.
                     let initial_ctx = normalize_ctx(initial_ctx).unwrap_or_else(empty_ctx);
+                    let create_request_hash = idempotency_key
+                        .as_ref()
+                        .map(|_| create_request_fingerprint(&machine, version, &initial_ctx));
                     let mut instance = Instance::new(
                         instance_id.clone(),
                         machine,
@@ -414,6 +481,7 @@ impl StateMachineEngine {
                         offset,
                     );
                     instance.create_idempotency_key = idempotency_key;
+                    instance.create_request_hash = create_request_hash;
                     // A (re)created instance starts with a fresh idempotency scope.
                     self.idempotency_cache.remove(&instance_id);
                     self.instances
@@ -423,28 +491,33 @@ impl StateMachineEngine {
 
             WalEntry::ApplyEvent {
                 instance_id,
+                event,
                 from_state,
                 to_state,
+                payload,
                 ctx,
                 event_id,
                 idempotency_key,
-                ..
             } => {
                 if let Some(instance_lock) = self.instances.get(&instance_id) {
                     let mut instance = instance_lock.write();
                     if let Some(key) = idempotency_key {
+                        let hash = request_fingerprint(&event, &payload);
                         self.idempotency_cache
                             .entry(instance_id.clone())
                             .or_default()
                             .insert(
                                 key,
-                                ApplyResult {
-                                    from_state,
-                                    to_state: to_state.clone(),
-                                    ctx: ctx.clone(),
-                                    wal_offset: offset,
-                                    sequence,
-                                    applied: true,
+                                CachedApply {
+                                    result: ApplyResult {
+                                        from_state,
+                                        to_state: to_state.clone(),
+                                        ctx: ctx.clone(),
+                                        wal_offset: offset,
+                                        sequence,
+                                        applied: true,
+                                    },
+                                    request_hash: Some(hash),
                                 },
                                 self.max_idempotency_keys,
                             );
@@ -662,16 +735,27 @@ impl StateMachineEngine {
         })?;
 
         // Idempotent retry: the live instance was created by a request with
-        // the same key (and the same machine/version).
-        if let Some(key) = idempotency_key {
+        // the same key; reject if machine/version/initial_ctx differs.
+        let create_hash =
+            idempotency_key.map(|_| create_request_fingerprint(machine, version, &initial_ctx));
+        if let (Some(key), Some(incoming_hash)) = (idempotency_key, create_hash.as_deref()) {
             if let Some(instance_lock) = self.instances.get(instance_id) {
                 let instance = instance_lock.read();
-                if !instance.is_deleted()
-                    && instance.create_idempotency_key.as_deref() == Some(key)
-                    && instance.machine == machine
-                    && instance.version == version
+                if !instance.is_deleted() && instance.create_idempotency_key.as_deref() == Some(key)
                 {
-                    return Ok((instance.clone(), instance.last_wal_offset));
+                    let matches = instance.machine == machine
+                        && instance.version == version
+                        && instance
+                            .create_request_hash
+                            .as_deref()
+                            .is_none_or(|h| h == incoming_hash);
+                    if matches {
+                        return Ok((instance.clone(), instance.last_wal_offset));
+                    }
+                    return Err(CoreError::IdempotencyConflict {
+                        instance_id: instance_id.to_string(),
+                        key: key.to_string(),
+                    });
                 }
             }
         }
@@ -714,6 +798,7 @@ impl StateMachineEngine {
             offset.as_u64(),
         );
         instance.create_idempotency_key = idempotency_key.map(|s| s.to_string());
+        instance.create_request_hash = create_hash;
 
         // A (re)created instance starts with a fresh idempotency scope.
         self.idempotency_cache.remove(instance_id);
@@ -795,17 +880,29 @@ impl StateMachineEngine {
         let mut instance = instance_lock.write();
 
         // Check idempotency cache under the instance lock, so two concurrent
-        // requests with the same key cannot both apply. A replay reports
-        // `applied: false` (the event was not applied again).
-        if let Some(key) = idempotency_key {
+        // requests with the same key cannot both apply. A replay with the
+        // same request returns `applied: false`; a different request with the
+        // same key fails with `IdempotencyConflict`.
+        let incoming_hash = idempotency_key.map(|_| request_fingerprint(event, &payload));
+        if let (Some(key), Some(hash)) = (idempotency_key, incoming_hash.as_deref()) {
             if let Some(cached) = self
                 .idempotency_cache
                 .get(instance_id)
                 .and_then(|m| m.get(key).cloned())
             {
+                if cached
+                    .request_hash
+                    .as_deref()
+                    .is_some_and(|recorded| recorded != hash)
+                {
+                    return Err(CoreError::IdempotencyConflict {
+                        instance_id: instance_id.to_string(),
+                        key: key.to_string(),
+                    });
+                }
                 return Ok(ApplyResult {
                     applied: false,
-                    ..cached
+                    ..cached.result
                 });
             }
         }
@@ -900,7 +997,14 @@ impl StateMachineEngine {
             self.idempotency_cache
                 .entry(instance_id.to_string())
                 .or_default()
-                .insert(key.to_string(), result.clone(), self.max_idempotency_keys);
+                .insert(
+                    key.to_string(),
+                    CachedApply {
+                        result: result.clone(),
+                        request_hash: incoming_hash,
+                    },
+                    self.max_idempotency_keys,
+                );
         }
 
         Ok(result)
@@ -1062,13 +1166,14 @@ impl StateMachineEngine {
                     .order
                     .iter()
                     .filter_map(|key| {
-                        scope.get(key).map(|r| IdempotencyRecord {
+                        scope.get(key).map(|entry| IdempotencyRecord {
                             key: key.clone(),
-                            from_state: r.from_state.clone(),
-                            to_state: r.to_state.clone(),
-                            ctx: r.ctx.clone(),
-                            wal_offset: r.wal_offset,
-                            sequence: r.sequence,
+                            from_state: entry.result.from_state.clone(),
+                            to_state: entry.result.to_state.clone(),
+                            ctx: entry.result.ctx.clone(),
+                            wal_offset: entry.result.wal_offset,
+                            sequence: entry.result.sequence,
+                            request_hash: entry.request_hash.clone(),
                         })
                     })
                     .collect()
@@ -1651,10 +1756,12 @@ mod tests {
         assert_eq!(i.state, "shipped");
         // SHIP carried no event_id, so (as in live apply) it cleared e-1.
         assert_eq!(i.last_event_id, None);
-        for key in ["pay", "ship"] {
-            let event = if key == "pay" { "PAY" } else { "SHIP" };
+        for (key, event, payload, evt_id) in [
+            ("pay", "PAY", json!({"items_ready": true}), None),
+            ("ship", "SHIP", json!({}), None),
+        ] {
             let r = engine
-                .apply_event("i-1", event, json!({}), None, None, None, Some(key))
+                .apply_event("i-1", event, payload, None, None, evt_id, Some(key))
                 .unwrap();
             assert!(!r.applied, "{key} must be remembered");
         }
@@ -2797,5 +2904,224 @@ mod tests {
             tick(&engine, "i-1", &format!("k{i}"));
         }
         assert_eq!(engine.idempotency_records("i-1").len(), 20);
+    }
+
+    #[test]
+    fn test_idempotency_reuse_conflicts_on_different_event_or_payload_and_survives_recovery() {
+        let dir = TempDir::new().unwrap();
+        let wal_dir = dir.path().join("wal");
+        let wal_cfg = || WalConfig::new(&wal_dir).with_fsync_policy(rstmdb_wal::FsyncPolicy::Never);
+        let def = json!({
+            "states": ["created", "paid", "cancelled"],
+            "initial": "created",
+            "transitions": [
+                {"from": "created", "event": "PAY", "to": "paid"},
+                {"from": "created", "event": "CANCEL", "to": "cancelled"}
+            ]
+        });
+
+        let saved_snapshot;
+        let machine_records;
+        {
+            let engine = StateMachineEngine::new(wal_cfg()).unwrap();
+            engine.put_machine("order", 1, &def).unwrap();
+            engine
+                .create_instance("i-1", "order", 1, json!({"tag": "orig"}), Some("create-k1"))
+                .unwrap();
+
+            // Same create_instance idempotency key with different initial_ctx is rejected.
+            let create_conflict = engine
+                .create_instance(
+                    "i-1",
+                    "order",
+                    1,
+                    json!({"tag": "other"}),
+                    Some("create-k1"),
+                )
+                .unwrap_err();
+            assert!(
+                matches!(create_conflict, CoreError::IdempotencyConflict { .. }),
+                "{create_conflict:?}"
+            );
+
+            // Apply PAY with two-key payload under k-1.
+            let first = engine
+                .apply_event(
+                    "i-1",
+                    "PAY",
+                    json!({"amount": 10, "currency": "EUR"}),
+                    None,
+                    None,
+                    Some("evt-1"),
+                    Some("k-1"),
+                )
+                .unwrap();
+            assert!(first.applied);
+
+            // Identical request with reordered JSON keys replays cleanly.
+            let mut reordered = serde_json::Map::new();
+            reordered.insert("currency".to_string(), json!("EUR"));
+            reordered.insert("amount".to_string(), json!(10));
+            let replay = engine
+                .apply_event(
+                    "i-1",
+                    "PAY",
+                    Value::Object(reordered),
+                    None,
+                    None,
+                    Some("evt-1"),
+                    Some("k-1"),
+                )
+                .unwrap();
+            assert!(!replay.applied);
+            assert_eq!(replay.to_state, "paid");
+
+            // Different event with same key is rejected and state stays unchanged.
+            let err_event = engine
+                .apply_event(
+                    "i-1",
+                    "CANCEL",
+                    json!({"amount": 10, "currency": "EUR"}),
+                    None,
+                    None,
+                    Some("evt-1"),
+                    Some("k-1"),
+                )
+                .unwrap_err();
+            assert!(
+                matches!(err_event, CoreError::IdempotencyConflict { .. }),
+                "{err_event:?}"
+            );
+
+            // Same event + different payload is rejected.
+            let err_payload = engine
+                .apply_event(
+                    "i-1",
+                    "PAY",
+                    json!({"amount": 20, "currency": "EUR"}),
+                    None,
+                    None,
+                    Some("evt-1"),
+                    Some("k-1"),
+                )
+                .unwrap_err();
+            assert!(matches!(err_payload, CoreError::IdempotencyConflict { .. }));
+
+            // Same event + payload + different event_id replays cleanly (event_id excluded).
+            let retry_evt_id = engine
+                .apply_event(
+                    "i-1",
+                    "PAY",
+                    json!({"amount": 10, "currency": "EUR"}),
+                    None,
+                    None,
+                    Some("evt-2"),
+                    Some("k-1"),
+                )
+                .unwrap();
+            assert!(!retry_evt_id.applied);
+            assert_eq!(retry_evt_id.wal_offset, first.wal_offset);
+
+            saved_snapshot = snapshot_of(&engine, "i-1");
+            assert!(saved_snapshot.idempotency[0].request_hash.is_some());
+            machine_records = engine.machine_records().unwrap();
+        }
+
+        // Reopen from WAL replay (recomputes fingerprint).
+        let replayed = StateMachineEngine::new(wal_cfg()).unwrap();
+        let replay_conflict = replayed
+            .apply_event("i-1", "CANCEL", json!({}), None, None, None, Some("k-1"))
+            .unwrap_err();
+        assert!(matches!(
+            replay_conflict,
+            CoreError::IdempotencyConflict { .. }
+        ));
+        let replay_create_conflict = replayed
+            .create_instance(
+                "i-1",
+                "order",
+                1,
+                json!({"tag": "other"}),
+                Some("create-k1"),
+            )
+            .unwrap_err();
+        assert!(matches!(
+            replay_create_conflict,
+            CoreError::IdempotencyConflict { .. }
+        ));
+
+        // Reopen purely from snapshot (no WAL) -> preserves request_hash.
+        let snap_dir = TempDir::new().unwrap();
+        let snap_engine = StateMachineEngine::new_with_recovery(
+            WalConfig::new(snap_dir.path()).with_fsync_policy(rstmdb_wal::FsyncPolicy::Never),
+            RecoveryState {
+                machines: machine_records,
+                machines_wal_offset: 100,
+                snapshots: vec![saved_snapshot],
+            },
+        )
+        .unwrap();
+        let snap_conflict = snap_engine
+            .apply_event(
+                "i-1",
+                "PAY",
+                json!({"amount": 99}),
+                None,
+                None,
+                Some("evt-1"),
+                Some("k-1"),
+            )
+            .unwrap_err();
+        assert!(matches!(
+            snap_conflict,
+            CoreError::IdempotencyConflict { .. }
+        ));
+    }
+
+    #[test]
+    fn test_legacy_snapshot_without_request_hash_replays_cleanly() {
+        let dir = TempDir::new().unwrap();
+        let legacy_snap_json = r#"{
+            "snapshot_id": "snap-legacy",
+            "instance_id": "i-legacy",
+            "machine": "loop",
+            "version": 1,
+            "state": "open",
+            "ctx": {},
+            "wal_offset": 2,
+            "created_at": 0,
+            "idempotency": [{
+                "key": "k-old",
+                "from_state": "open",
+                "to_state": "open",
+                "ctx": {},
+                "wal_offset": 2,
+                "sequence": 2
+            }]
+        }"#;
+        let snapshot: InstanceSnapshot = serde_json::from_str(legacy_snap_json).unwrap();
+        assert!(snapshot.idempotency[0].request_hash.is_none());
+
+        let engine = StateMachineEngine::new_with_recovery(
+            WalConfig::new(dir.path()).with_fsync_policy(rstmdb_wal::FsyncPolicy::Never),
+            RecoveryState {
+                machines: vec![],
+                machines_wal_offset: 0,
+                snapshots: vec![snapshot],
+            },
+        )
+        .unwrap();
+        let res = engine
+            .apply_event(
+                "i-legacy",
+                "TICK",
+                json!({}),
+                None,
+                None,
+                None,
+                Some("k-old"),
+            )
+            .unwrap();
+        assert!(!res.applied);
     }
 }

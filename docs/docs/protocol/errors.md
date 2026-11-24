@@ -137,6 +137,7 @@ Errors related to concurrent operations.
 | Code | Retryable | Description |
 |------|-----------|-------------|
 | `CONFLICT` | No | Concurrent modification detected (expected_state mismatch) |
+| `IDEMPOTENCY_CONFLICT` | No | Idempotency key was already used for a different request |
 
 **Example:**
 ```json

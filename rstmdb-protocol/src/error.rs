@@ -65,6 +65,7 @@ pub enum ErrorCode {
     InvalidTransition,
     GuardFailed,
     Conflict,
+    IdempotencyConflict,
 
     // System errors
     WalIoError,
@@ -106,6 +107,7 @@ impl fmt::Display for ErrorCode {
             ErrorCode::InvalidTransition => write!(f, "INVALID_TRANSITION"),
             ErrorCode::GuardFailed => write!(f, "GUARD_FAILED"),
             ErrorCode::Conflict => write!(f, "CONFLICT"),
+            ErrorCode::IdempotencyConflict => write!(f, "IDEMPOTENCY_CONFLICT"),
             ErrorCode::WalIoError => write!(f, "WAL_IO_ERROR"),
             ErrorCode::InternalError => write!(f, "INTERNAL_ERROR"),
             ErrorCode::RateLimited => write!(f, "RATE_LIMITED"),
@@ -133,6 +135,7 @@ mod tests {
         assert!(!ErrorCode::InvalidTransition.is_retryable());
         assert!(!ErrorCode::GuardFailed.is_retryable());
         assert!(!ErrorCode::Conflict.is_retryable());
+        assert!(!ErrorCode::IdempotencyConflict.is_retryable());
         assert!(!ErrorCode::Unauthorized.is_retryable());
         assert!(!ErrorCode::AuthFailed.is_retryable());
 
@@ -175,6 +178,10 @@ mod tests {
         );
         assert_eq!(format!("{}", ErrorCode::GuardFailed), "GUARD_FAILED");
         assert_eq!(format!("{}", ErrorCode::Conflict), "CONFLICT");
+        assert_eq!(
+            format!("{}", ErrorCode::IdempotencyConflict),
+            "IDEMPOTENCY_CONFLICT"
+        );
         assert_eq!(format!("{}", ErrorCode::WalIoError), "WAL_IO_ERROR");
         assert_eq!(format!("{}", ErrorCode::InternalError), "INTERNAL_ERROR");
         assert_eq!(format!("{}", ErrorCode::RateLimited), "RATE_LIMITED");
