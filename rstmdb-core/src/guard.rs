@@ -352,14 +352,18 @@ impl<'a> Parser<'a> {
                 reason: "expected string".to_string(),
             });
         }
+        let quote_start = self.pos;
         self.pos += 1;
 
-        let start = self.pos;
         while let Some(c) = self.peek_char() {
             if c == '"' {
-                let s = self.slice(start..self.pos)?;
+                let raw = self.slice(quote_start..self.pos + 1)?;
                 self.pos += 1;
-                return Ok(Value::String(s.to_string()));
+                let decoded =
+                    serde_json::from_str::<String>(raw).map_err(|e| CoreError::InvalidGuard {
+                        reason: format!("invalid string literal: {}", e),
+                    })?;
+                return Ok(Value::String(decoded));
             }
             if c == '\\' {
                 // skip the backslash, then the escaped char by its width, so a
@@ -507,13 +511,41 @@ mod tests {
         let guard = GuardExpr::parse("ctx.a\u{00A0}==\u{00A0}1").unwrap();
         assert!(guard.evaluate(&json!({ "a": 1 })));
         assert!(!guard.evaluate(&json!({ "a": 2 })));
-        // Multi-byte char after backslash escape does not land mid-char:
-        let guard = GuardExpr::parse("ctx.s == \"a\\éb\"").unwrap();
+        // Multi-byte char after backslash escape does not land mid-char;
+        // unrecognized escapes fail loudly without panicking.
+        assert!(matches!(
+            GuardExpr::parse("ctx.s == \"a\\éb\""),
+            Err(CoreError::InvalidGuard { .. })
+        ));
+        assert!(matches!(
+            GuardExpr::parse("ctx.s == \"a\\🎉b\""),
+            Err(CoreError::InvalidGuard { .. })
+        ));
+        // Valid escaped backslash followed by multi-byte char decodes properly:
+        let guard = GuardExpr::parse("ctx.s == \"a\\\\éb\"").unwrap();
         assert!(guard.evaluate(&json!({ "s": "a\\éb" })));
-        let guard = GuardExpr::parse("ctx.s == \"a\\🎉b\"").unwrap();
+        let guard = GuardExpr::parse("ctx.s == \"a\\\\🎉b\"").unwrap();
         assert!(guard.evaluate(&json!({ "s": "a\\🎉b" })));
         // Trailing backslash at EOF is rejected cleanly without panicking:
         assert!(GuardExpr::parse("ctx.s == \"abc\\").is_err());
+    }
+
+    #[test]
+    fn test_string_literal_escape_decoding() {
+        let guard = GuardExpr::parse(r#"ctx.s == "a\"b\\c\nd\te""#).unwrap();
+        assert!(guard.evaluate(&json!({ "s": "a\"b\\c\nd\te" })));
+
+        let guard = GuardExpr::parse(r#"ctx.s == "caf\u00E9""#).unwrap();
+        assert!(guard.evaluate(&json!({ "s": "café" })));
+
+        assert!(matches!(
+            GuardExpr::parse(r#"ctx.s == "\q""#),
+            Err(CoreError::InvalidGuard { .. })
+        ));
+        assert!(matches!(
+            GuardExpr::parse(r#"ctx.s == "\u12""#),
+            Err(CoreError::InvalidGuard { .. })
+        ));
     }
 
     #[test]
