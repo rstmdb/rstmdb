@@ -540,6 +540,7 @@ impl CommandHandler {
             ErrorCode::ReadOnlyMode => "READ_ONLY_MODE",
             ErrorCode::ReplicationTimeout => "REPLICATION_TIMEOUT",
             ErrorCode::ReplicationError => "REPLICATION_ERROR",
+            _ => "UNKNOWN",
         }
     }
 

@@ -43,6 +43,7 @@ pub enum ProtocolError {
 /// These codes are part of the protocol contract and must remain stable
 /// across versions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[non_exhaustive]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum ErrorCode {
     // Protocol errors
@@ -75,6 +76,10 @@ pub enum ErrorCode {
     ReadOnlyMode,
     ReplicationTimeout,
     ReplicationError,
+
+    /// Forward-compatibility fallback for unrecognized error codes sent by newer servers.
+    #[serde(other)]
+    Unknown,
 }
 
 impl ErrorCode {
@@ -112,6 +117,7 @@ impl fmt::Display for ErrorCode {
             ErrorCode::ReadOnlyMode => write!(f, "READ_ONLY_MODE"),
             ErrorCode::ReplicationTimeout => write!(f, "REPLICATION_TIMEOUT"),
             ErrorCode::ReplicationError => write!(f, "REPLICATION_ERROR"),
+            ErrorCode::Unknown => write!(f, "UNKNOWN"),
         }
     }
 }
@@ -197,6 +203,34 @@ mod tests {
 
         let parsed: ErrorCode = serde_json::from_str("\"CONFLICT\"").unwrap();
         assert_eq!(parsed, ErrorCode::Conflict);
+    }
+
+    #[test]
+    fn test_unknown_error_code_deserializes_gracefully() {
+        fn assert_copy<T: Copy>() {}
+        assert_copy::<ErrorCode>();
+
+        let parsed: ErrorCode = serde_json::from_str("\"FUTURE_ERROR_CODE\"").unwrap();
+        assert_eq!(parsed, ErrorCode::Unknown);
+        assert!(!parsed.is_retryable());
+        assert_eq!(format!("{parsed}"), "UNKNOWN");
+        assert_eq!(
+            serde_json::to_string(&ErrorCode::Unknown).unwrap(),
+            "\"UNKNOWN\""
+        );
+
+        let frame_json = serde_json::json!({
+            "type": "response",
+            "id": "req-1",
+            "status": "error",
+            "error": {
+                "code": "IDEMPOTENCY_CONFLICT",
+                "message": "idempotency key reused",
+                "retryable": false
+            }
+        });
+        let resp: crate::Response = serde_json::from_value(frame_json).unwrap();
+        assert_eq!(resp.error.unwrap().code, ErrorCode::Unknown);
     }
 
     #[test]
