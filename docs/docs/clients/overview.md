@@ -14,7 +14,7 @@ Overview of rstmdb client libraries and protocol integration options.
 
 ```toml
 [dependencies]
-rstmdb-client = "0.1"
+rstmdb-client = "0.3"
 ```
 
 [Full documentation →](./rust)
@@ -35,6 +35,8 @@ Features:
 
 [PyPI Package →](https://pypi.org/project/rstmdb/)
 
+[Full documentation →](./python)
+
 ### Node.js/TypeScript Client
 
 **Status:** ✅ Available
@@ -50,6 +52,8 @@ Features:
 - Connection pooling
 
 [npm Package →](https://www.npmjs.com/package/@rstmdb/client)
+
+[Full documentation →](./typescript)
 
 ### Go Client
 
@@ -115,6 +119,30 @@ Features:
 [Maven Central →](https://central.sonatype.com/artifact/com.rstmdb/rstmdb-client)
 
 [Full documentation →](./java)
+
+## Server–Client Compatibility Matrix
+
+All official SDKs speak RCP `protocol_version = 1`. Upgrading an SDK to a current release is recommended when connecting to rstmdb `0.3.x` or `1.0+`:
+
+| Client | Package | Compatible With 0.2.x | Compatible With 0.3.x | Forward-Compatible With 1.0+ |
+|--------|---------|------------------------|------------------------|-------------------------------|
+| Rust (`rstmdb-client`) | Crates / workspace | `0.1.x` – `0.3.x` | `0.3.x` | Open `ErrorCode::Unknown`, `applied: false`, `idempotency_key` |
+| Python (`rstmdb`) | `rstmdb` (PyPI) | `0.2.x` | `> 0.2.1` | `ErrorCode \| str` fallback, v0.3+ replication & backup support |
+| Node.js / TS (`@rstmdb/client`) | `@rstmdb/client` (npm) | `0.2.x` | `> 0.2.1` | Open `ErrorCode` fallback (`ServerError`), v0.3+ & v1.0 error codes |
+| Go (`rstmdb-go`) | `github.com/rstmdb/rstmdb-go` | `0.2.x` | `> 0.2.1` | Open `ErrorCode string`, `NegotiatedFeatures`, hot backup & replication |
+| Java (`rstmdb-client`) | `com.rstmdb:rstmdb-client` | `0.1.0` | `> 0.1.0` | Open `String errorCode`, v0.3+ & v1.0 `ErrorCodes` constants & helpers |
+| C# / .NET (`Rstmdb.Client`) | `Rstmdb.Client` (NuGet) | `0.2.x` | `> 0.2.1` | Open `string ErrorCode`, v0.3+ & v1.0 constants, backup & replication |
+
+> **Closed-enum note for older Rust (`<= 0.3.0`) and Python (`<= 0.2.1`) releases:** Earlier Rust (`ErrorCode` without `#[serde(other)]`) and Python (`ErrorCode(str, Enum)` Pydantic field) releases fail deserialization when a newer server emits a newly introduced `error.code` such as `READ_ONLY_MODE`, `REPLICATION_TIMEOUT`, `REPLICATION_ERROR`, `IDEMPOTENCY_CONFLICT`, or `GUARD_UNKNOWN`. Upgrade to a forward-compatible release before deploying against `1.0` servers.
+
+### Server Behavior Changes Since 0.3.0
+
+Clients integrating with `0.3.x` and `1.0+` servers should account for the following protocol and error semantics:
+
+- **Idempotent retries (`applied`):** Retrying `APPLY_EVENT` or `CREATE_INSTANCE` with the same `idempotency_key` returns the original result with `applied: false`.
+- **Validation & `initial_ctx` errors:** Validation failures (including non-object `initial_ctx` payloads and exceeded per-instance idempotency key limits) return non-retryable `BAD_REQUEST`.
+- **Replica writes:** Followers/replicas run read-only and reject mutating operations with `READ_ONLY_MODE` (also `REPLICATION_TIMEOUT` and `REPLICATION_ERROR` for replication failures).
+- **Upcoming 1.0 parity:** Reusing an `idempotency_key` with a different request fails with `IDEMPOTENCY_CONFLICT`, strict guard checks return `GUARD_UNKNOWN`, `BATCH` executes atomically, and `HELLO` advertises `durable_idempotency`.
 
 ## Protocol Integration
 

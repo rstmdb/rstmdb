@@ -371,6 +371,8 @@ try {
 }
 ```
 
+> Unknown future server `error.code` values fall back safely to `ServerError` (including `READ_ONLY_MODE`, `REPLICATION_TIMEOUT`, `REPLICATION_ERROR`, `IDEMPOTENCY_CONFLICT`, and `GUARD_UNKNOWN`). Replayed idempotent `applyEvent` / `createInstance` responses carry `applied: false`.
+
 ## TypeScript Types
 
 ```typescript
