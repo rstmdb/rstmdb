@@ -283,6 +283,10 @@ match client.apply_event("order-001", "PAY", json!({})).await {
             ErrorCode::GuardFailed => {
                 println!("Guard condition not met");
             }
+            ErrorCode::Unknown(raw) => {
+                // Forward-compatible catch-all for newer server error codes
+                println!("Unhandled error code {}: {}", raw, message);
+            }
             _ => {
                 println!("Error: {}", message);
             }
@@ -293,6 +297,8 @@ match client.apply_event("order-001", "PAY", json!({})).await {
     }
 }
 ```
+
+> Unknown server error codes deserialize into `ErrorCode::Unknown(String)` (including v0.3+ codes like `READ_ONLY_MODE`, `REPLICATION_TIMEOUT`, `REPLICATION_ERROR`, and v1.0 codes such as `IDEMPOTENCY_CONFLICT` and `GUARD_UNKNOWN`). Check `result.applied` on idempotent retries (`false` when replayed).
 
 ### Retry with Backoff
 

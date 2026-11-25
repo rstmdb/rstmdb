@@ -21,7 +21,8 @@ go get github.com/rstmdb/rstmdb-go
 ## Features
 
 - Full RCP protocol: RCPX binary framing with CRC32C checksums
-- All 22 operations and 16 error codes
+- Full RCP v1 operations (including `REPLICATION_STATUS` and hot backup) and 21 error codes with forward-compatible unknown-code handling
+- `HELLO` capability negotiation (`NegotiatedFeatures` / `ServerInfo`) and idempotent retry metadata (`applied: false`)
 - Request/response multiplexing on a single TCP connection
 - Async subscription streaming via channels
 - TLS/mTLS support
@@ -437,7 +438,7 @@ if err != nil {
 }
 ```
 
-Error codes: `UNSUPPORTED_PROTOCOL`, `BAD_REQUEST`, `UNAUTHORIZED`, `AUTH_FAILED`, `NOT_FOUND`, `MACHINE_NOT_FOUND`, `MACHINE_VERSION_EXISTS`, `MACHINE_VERSION_LIMIT_EXCEEDED`, `INSTANCE_NOT_FOUND`, `INSTANCE_EXISTS`, `INVALID_TRANSITION`, `GUARD_FAILED`, `CONFLICT`, `WAL_IO_ERROR`, `INTERNAL_ERROR`, `RATE_LIMITED`.
+Error codes: `UNSUPPORTED_PROTOCOL`, `BAD_REQUEST`, `UNAUTHORIZED`, `AUTH_FAILED`, `NOT_FOUND`, `MACHINE_NOT_FOUND`, `MACHINE_VERSION_EXISTS`, `MACHINE_VERSION_LIMIT_EXCEEDED`, `INSTANCE_NOT_FOUND`, `INSTANCE_EXISTS`, `INVALID_TRANSITION`, `GUARD_FAILED`, `GUARD_UNKNOWN`, `CONFLICT`, `IDEMPOTENCY_CONFLICT`, `WAL_IO_ERROR`, `INTERNAL_ERROR`, `RATE_LIMITED`, `READ_ONLY_MODE`, `REPLICATION_TIMEOUT`, `REPLICATION_ERROR`.
 
 ## Examples
 

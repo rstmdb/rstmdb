@@ -283,6 +283,17 @@ Events are pushed asynchronously and can interleave with request/response pairs.
 | Idle timeout | 300 seconds |
 | Max request id length | 256 bytes |
 
+## Protocol v1 Stability & Evolution Rules
+
+`PROTOCOL_VERSION = 1` is the frozen wire contract for the 1.x release series:
+
+- **Stable v1 surface:** Binary (`RCPX`) and `JSONL` framing, the request/response/event JSON envelope (`type`, `id`, `op`, `status`, `result`, `error`, `meta`), core operations, and `HELLO` capability negotiation remain backward-compatible within `protocol_version = 1`.
+- **Additive changes (non-breaking within v1):**
+  - **Optional fields:** Servers and clients MUST ignore unrecognized optional fields in requests, responses, and events.
+  - **Feature flags:** New operations or behavioral extensions are advertised through `HELLO` `features` negotiation (such as `idempotency`, `durable_idempotency`, `batch`, and `wal_read`) so clients can detect server capabilities cleanly.
+  - **New error codes:** Error codes are an open string set. Clients MUST preserve unknown server `error.code` strings without failing deserialization or crashing.
+- **Breaking changes (require `PROTOCOL_VERSION = 2`):** Removing or renaming required envelope/operation fields, altering frame header layout or checksum semantics, or changing the meaning of an existing operation or error code in a non-backward-compatible way without feature gating.
+
 ## TLS
 
 For encrypted connections:

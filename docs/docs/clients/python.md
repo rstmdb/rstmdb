@@ -285,6 +285,8 @@ except ConnectionError:
     print("Connection lost")
 ```
 
+> Newer error codes (`READ_ONLY_MODE`, `REPLICATION_TIMEOUT`, `REPLICATION_ERROR`, `IDEMPOTENCY_CONFLICT`, `GUARD_UNKNOWN`) and any future server `error.code` values fall back cleanly to `ErrorCode | str` without raising a Pydantic `ValidationError`. Retried `apply_event` / `create_instance` calls with an existing `idempotency_key` return the cached result with `applied=False`.
+
 ## Examples
 
 ### Order Processing
